@@ -56,7 +56,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 # Zero-infrastructure memory backend: SQLite in .git/ + refs/meta/ for push/fetch
 git-meta-lib = "0.1.9"
 # gix is a transitive dep of git-meta-lib; declared directly to call Session::open()
-gix = { version = "0.81.0", default-features = false }
+gix = { version = "0.83.0", default-features = false }
 
 # Vector extension for SQLite
 sqlite-vec = "0.1"
