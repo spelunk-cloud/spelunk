@@ -79,7 +79,7 @@ RUN_ID="spelunk-${CONDITION}-${TIMESTAMP}"
 
 echo ""
 echo "--- Running Docker evaluation ---"
-python3 -m swebench.harness.run_evaluation \
+uv run --with swebench python3 -m swebench.harness.run_evaluation \
     --dataset_name "$DATASET" \
     --split "$SPLIT" \
     --predictions_path "$PREDICTIONS_FILE" \

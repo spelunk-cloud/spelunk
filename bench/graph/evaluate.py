@@ -6,9 +6,9 @@ measures how well each retrieves the ground-truth set of files containing
 callers/callees/implementers of that symbol.
 
 Conditions:
-    grep           — git grep <symbol> over the repo
+    grep           — git grep -w <symbol> over the repo
     spelunk_search — spelunk search <symbol> (semantic)
-    spelunk_graph  — spelunk graph <symbol> --format json
+    spelunk_graph  — spelunk graph <symbol> --format json (flat edge list)
 
 Metrics: precision@k, recall@k, F1. No LLM, no API costs.
 
@@ -30,20 +30,18 @@ Task format (JSON):
 
 import argparse
 import json
-import re
 import statistics
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 def run_grep(repo_path: Path, symbol: str, limit: int = 10) -> set[str]:
-    """Return set of file paths containing the symbol via git grep, capped at limit."""
+    """Return set of file paths containing the symbol via git grep -w, capped at limit."""
     try:
         result = subprocess.run(
-            ["git", "grep", "-l", "-E", f"\\b{re.escape(symbol)}\\b"],
+            ["git", "grep", "-l", "-w", symbol],
             cwd=repo_path,
             capture_output=True,
             text=True,
@@ -58,7 +56,7 @@ def run_grep(repo_path: Path, symbol: str, limit: int = 10) -> set[str]:
 
 
 def run_spelunk_search(repo_path: Path, symbol: str, limit: int = 10) -> set[str]:
-    """Return set of file paths from spelunk search results."""
+    """Return set of file paths from spelunk search results (file_path field)."""
     try:
         result = subprocess.run(
             ["spelunk", "search", symbol, "--limit", str(limit), "--format", "json"],
@@ -69,14 +67,14 @@ def run_spelunk_search(repo_path: Path, symbol: str, limit: int = 10) -> set[str
         )
         if result.returncode == 0 and result.stdout.strip():
             results = json.loads(result.stdout)
-            return {r.get("file", "") for r in results if r.get("file")}
+            return {r["file_path"] for r in results if r.get("file_path")}
         return set()
     except Exception:
         return set()
 
 
 def run_spelunk_graph(repo_path: Path, symbol: str, limit: int = 10) -> set[str]:
-    """Return set of file paths from spelunk graph results."""
+    """Return set of file paths from spelunk graph results (flat edge list, source_file field)."""
     try:
         result = subprocess.run(
             ["spelunk", "graph", symbol, "--format", "json"],
@@ -86,25 +84,17 @@ def run_spelunk_graph(repo_path: Path, symbol: str, limit: int = 10) -> set[str]
             timeout=30,
         )
         if result.returncode == 0 and result.stdout.strip():
-            results = json.loads(result.stdout)
+            edges = json.loads(result.stdout)  # flat list of edge dicts
             files_ordered = []
             seen = set()
-            for r in results if isinstance(results, list) else [results]:
-                if "edges" not in r and not isinstance(r, dict):
-                    print(
-                        f"  graph: unexpected shape for {symbol}: {str(r)[:120]}",
-                        file=sys.stderr,
-                    )
-                    continue
-                for edge in r.get("edges", []):
-                    f = edge.get("file") or edge.get("target_file")
-                    if f and f not in seen:
-                        seen.add(f)
-                        files_ordered.append(f)
+            for edge in edges:
+                f = edge.get("source_file", "")
+                if f and f not in seen:
+                    seen.add(f)
+                    files_ordered.append(f)
             return set(files_ordered[:limit])
         return set()
-    except Exception as e:
-        print(f"  graph: parse failed for {symbol}: {e}", file=sys.stderr)
+    except Exception:
         return set()
 
 
