@@ -19,8 +19,12 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 TASKS_FILE = SCRIPT_DIR / "tasks_50.json"
-REPOS_DIR = Path.home() / "opensource" / "spelunk-bench" / "repos"
 AGENT_SCRIPT = SCRIPT_DIR / "agent.py"
+_DEFAULT_REPOS = (
+    Path.home() / "opensource" / "spelunk-bench" / "repos"
+    if (Path.home() / "opensource" / "spelunk-bench" / "repos").is_dir()
+    else SCRIPT_DIR.parent / "repos"
+)
 
 
 def load_task_ids(limit: int) -> list[str]:
@@ -39,8 +43,9 @@ def run_task(
     api_key: str,
     max_turns: int,
     seed: int,
+    repos_dir: Path,
 ) -> dict | None:
-    repo_path = REPOS_DIR / task_id
+    repo_path = repos_dir / task_id
     issue_file = repo_path / "ISSUE.txt"
 
     if not repo_path.is_dir():
@@ -113,6 +118,11 @@ def main():
     parser.add_argument("--api-base-url", default="https://api.deepseek.com/v1")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--max-turns", type=int, default=20)
+    parser.add_argument(
+        "--repos-dir",
+        default=str(_DEFAULT_REPOS),
+        help="Directory containing per-task repo checkouts.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
@@ -156,6 +166,7 @@ def main():
             api_key,
             args.max_turns,
             args.seed,
+            Path(args.repos_dir),
         )
 
         elapsed = time.monotonic() - start
