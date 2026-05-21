@@ -516,17 +516,18 @@ def main() -> None:
     patch_path = None
     if args.save_patch:
         try:
-            # Stage all changes excluding spelunk artifacts and ISSUE.txt.
+            # Stage all changes. .spelunk/ is globally gitignored.
             subprocess.run(
-                ["git", "add", "-A", "--", ":!.spelunk", ":!ISSUE.txt"],
+                ["git", "add", "-A"],
                 cwd=repo_path,
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=True,
             )
+            # Diff excluding spelunk/ and ISSUE.txt (agent setup artifacts).
             diff = subprocess.run(
-                ["git", "diff", "--cached", "HEAD"],
+                ["git", "diff", "--cached", "HEAD", "--", ":!.spelunk", ":!ISSUE.txt"],
                 cwd=repo_path,
                 capture_output=True,
                 text=True,
