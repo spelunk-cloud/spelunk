@@ -516,10 +516,9 @@ def main() -> None:
     patch_path = None
     if args.save_patch:
         try:
-            # Stage all changes (including untracked files from write_file)
-            # then diff against HEAD to capture everything.
+            # Stage all changes excluding spelunk artifacts and ISSUE.txt.
             subprocess.run(
-                ["git", "add", "-A"],
+                ["git", "add", "-A", "--", ":!.spelunk", ":!ISSUE.txt"],
                 cwd=repo_path,
                 capture_output=True,
                 text=True,
