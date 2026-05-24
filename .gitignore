@@ -10,3 +10,10 @@
 .claude/settings.local.json
 .claude/worktrees/
 .env.local
+
+# SWE-bench harness artifacts
+deepseek-v4-flash.*.json
+gold-patch.*.json
+cleaned-requests.*.json
+logs/
+swebench_eval_outputs/
