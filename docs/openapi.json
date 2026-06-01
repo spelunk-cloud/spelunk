@@ -205,6 +205,77 @@
         ]
       }
     },
+    "/v1/projects/{project_id}/llm/complete": {
+      "post": {
+        "tags": [
+          "inference"
+        ],
+        "summary": "Run a single LLM completion over caller-supplied messages. Streams tokens as SSE events.",
+        "description": "The server performs **no orchestration**, adds **no system prompt**, and stores **nothing**.\nPrompt content is entirely the caller's responsibility.\n\nResponse events (one per `data:` line):\n- `{\"kind\":\"token\",\"content\":\"...\"}` — one streamed token fragment\n- `{\"kind\":\"done\"}` — terminal success event\n- `{\"kind\":\"error\",\"code\":\"...\",\"message\":\"...\"}` — terminal failure event\n\nReturns **400** when `messages` is empty or `max_tokens` ≤ 0.\nReturns **503** when no LLM backend is configured on this server.",
+        "operationId": "llm_complete",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project slug (e.g. `usercise/spelunk`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LlmCompleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SSE stream: token/done/error events"
+          },
+          "400": {
+            "description": "Bad request (empty messages or invalid max_tokens)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No LLM configured on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/projects/{project_id}/memory": {
       "get": {
         "tags": [
@@ -1314,6 +1385,50 @@
             "type": "integer",
             "description": "Maximum number of results to return (default: 20).",
             "minimum": 0
+          }
+        }
+      },
+      "LlmCompleteRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/projects/{project_id}/llm/complete`.",
+        "required": [
+          "messages",
+          "max_tokens"
+        ],
+        "properties": {
+          "json_schema": {
+            "description": "Optional OpenAI-style `response_format.json_schema` for structured output.\nBackends that do not support structured output silently ignore this field."
+          },
+          "max_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum tokens to generate. The server clamps this to its configured ceiling.",
+            "minimum": 0
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LlmMessage"
+            },
+            "description": "Ordered list of chat messages. Must be non-empty."
+          }
+        }
+      },
+      "LlmMessage": {
+        "type": "object",
+        "description": "A single chat message in the completion request.",
+        "required": [
+          "role",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "Text content of the message."
+          },
+          "role": {
+            "type": "string",
+            "description": "Role of the message author: `system`, `user`, or `assistant`."
           }
         }
       },

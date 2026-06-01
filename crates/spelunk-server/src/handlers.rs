@@ -131,6 +131,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     }
     if state.llm.is_some() {
         capabilities.push("explore".to_string());
+        capabilities.push("llm.complete".to_string());
     }
     Json(HealthResponse {
         status: "ok",
@@ -770,6 +771,157 @@ pub async fn index_embed(
 
     // Data promise: vectors are NOT stored on the server. We return them directly.
     Ok(Json(EmbedResponse { chunks: out_chunks }).into_response())
+}
+
+// ── LLM complete (SSE) ───────────────────────────────────────────────────────
+
+/// A single chat message in the completion request.
+#[derive(Deserialize, ToSchema)]
+pub struct LlmMessage {
+    /// Role of the message author: `system`, `user`, or `assistant`.
+    pub role: String,
+    /// Text content of the message.
+    pub content: String,
+}
+
+/// Request body for `POST /v1/projects/{project_id}/llm/complete`.
+#[derive(Deserialize, ToSchema)]
+pub struct LlmCompleteRequest {
+    /// Ordered list of chat messages. Must be non-empty.
+    pub messages: Vec<LlmMessage>,
+    /// Maximum tokens to generate. The server clamps this to its configured ceiling.
+    pub max_tokens: u32,
+    /// Optional OpenAI-style `response_format.json_schema` for structured output.
+    /// Backends that do not support structured output silently ignore this field.
+    #[serde(default)]
+    pub json_schema: Option<serde_json::Value>,
+}
+
+/// Server-side ceiling for `max_tokens` on `llm/complete` requests.
+const LLM_COMPLETE_MAX_TOKENS: u32 = 8192;
+
+/// Run a single LLM completion over caller-supplied messages. Streams tokens as SSE events.
+///
+/// The server performs **no orchestration**, adds **no system prompt**, and stores **nothing**.
+/// Prompt content is entirely the caller's responsibility.
+///
+/// Response events (one per `data:` line):
+/// - `{"kind":"token","content":"..."}` — one streamed token fragment
+/// - `{"kind":"done"}` — terminal success event
+/// - `{"kind":"error","code":"...","message":"..."}` — terminal failure event
+///
+/// Returns **400** when `messages` is empty or `max_tokens` ≤ 0.
+/// Returns **503** when no LLM backend is configured on this server.
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/llm/complete",
+    params(
+        ("project_id" = String, Path, description = "Project slug (e.g. `usercise/spelunk`)")
+    ),
+    request_body = LlmCompleteRequest,
+    responses(
+        (status = 200, description = "SSE stream: token/done/error events"),
+        (status = 400, description = "Bad request (empty messages or invalid max_tokens)", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 503, description = "No LLM configured on this server", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "inference"
+)]
+pub async fn llm_complete(
+    State(state): State<AppState>,
+    Path(_project_id): Path<String>,
+    Json(body): Json<LlmCompleteRequest>,
+) -> Result<Response, AppError> {
+    // Validate inputs before touching the LLM backend.
+    if body.messages.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody::new("bad_request", "messages must not be empty")),
+        )
+            .into_response());
+    }
+    if body.max_tokens == 0 {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody::new(
+                "bad_request",
+                "max_tokens must be greater than 0",
+            )),
+        )
+            .into_response());
+    }
+
+    // Validate roles.
+    for msg in &body.messages {
+        if !matches!(msg.role.as_str(), "system" | "user" | "assistant") {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody::new(
+                    "bad_request",
+                    &format!(
+                        "invalid role {:?}; must be system, user, or assistant",
+                        msg.role
+                    ),
+                )),
+            )
+                .into_response());
+        }
+    }
+
+    // 503 when no LLM is configured — use the llm_unavailable code from ADR-002.
+    let llm = match state.llm.clone() {
+        Some(l) => l,
+        None => {
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody::new(
+                    "llm_unavailable",
+                    "llm.complete requires an LLM backend. \
+                     Configure the chat model on the server.",
+                )),
+            )
+                .into_response());
+        }
+    };
+
+    // Clamp max_tokens to server ceiling.
+    let max_tokens = body.max_tokens.min(LLM_COMPLETE_MAX_TOKENS) as usize;
+
+    // Convert request messages to core Message type.
+    let messages: Vec<spelunk_core::llm::Message> = body
+        .messages
+        .into_iter()
+        .map(|m| spelunk_core::llm::Message {
+            role: m.role,
+            content: m.content,
+        })
+        .collect();
+
+    let (tx, mut rx) = mpsc::channel::<String>(64);
+    let json_schema = body.json_schema;
+
+    // Spawn LLM generation into a background task.
+    tokio::spawn(async move {
+        if let Err(e) = llm.generate(&messages, max_tokens, tx, json_schema).await {
+            tracing::warn!("llm/complete generate error: {e}");
+        }
+    });
+
+    // Stream tokens as SSE events per ADR-002 contract:
+    //   {"kind":"token","content":"..."} per token
+    //   {"kind":"done"} as the terminal event
+    let s = stream! {
+        while let Some(token) = rx.recv().await {
+            let data = serde_json::json!({"kind": "token", "content": token}).to_string();
+            yield Ok::<Event, Infallible>(Event::default().data(data));
+        }
+        yield Ok::<Event, Infallible>(
+            Event::default().data(r#"{"kind":"done"}"#)
+        );
+    };
+
+    Ok(Sse::new(s).keep_alive(KeepAlive::default()).into_response())
 }
 
 // ── Explore (SSE) ─────────────────────────────────────────────────────────────

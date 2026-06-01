@@ -67,6 +67,7 @@ pub fn default_conflict_threshold() -> f32 {
         handlers::memory_stream,
         handlers::index_embed,
         handlers::explore,
+        handlers::llm_complete,
     ),
     components(schemas(
         handlers::AddNoteRequest,
@@ -86,6 +87,8 @@ pub fn default_conflict_threshold() -> f32 {
         handlers::EmbedChunkOut,
         handlers::ExploreRequest,
         handlers::ExploreContextChunk,
+        handlers::LlmCompleteRequest,
+        handlers::LlmMessage,
         ErrorBody,
         ErrorDetail,
         db::Project,
@@ -179,6 +182,10 @@ pub fn router(state: AppState) -> Router {
             post(handlers::index_embed),
         )
         .route("/v1/projects/{project_id}/explore", post(handlers::explore))
+        .route(
+            "/v1/projects/{project_id}/llm/complete",
+            post(handlers::llm_complete),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
