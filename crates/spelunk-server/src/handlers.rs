@@ -13,7 +13,7 @@ use axum::{
     },
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use utoipa::ToSchema;
 
 use super::{AppError, AppState, ErrorBody};
@@ -899,26 +899,48 @@ pub async fn llm_complete(
         .collect();
 
     let (tx, mut rx) = mpsc::channel::<String>(64);
+    let (err_tx, err_rx) = oneshot::channel::<anyhow::Error>();
     let json_schema = body.json_schema;
 
     // Spawn LLM generation into a background task.
+    // On error, forward the error to the SSE stream via err_tx so the client
+    // receives a {"kind":"error",...} event before the stream closes (ADR-002 §109).
     tokio::spawn(async move {
         if let Err(e) = llm.generate(&messages, max_tokens, tx, json_schema).await {
             tracing::warn!("llm/complete generate error: {e}");
+            // Best-effort send — the receiver may have gone away, which is fine.
+            let _ = err_tx.send(e);
         }
     });
 
     // Stream tokens as SSE events per ADR-002 contract:
     //   {"kind":"token","content":"..."} per token
-    //   {"kind":"done"} as the terminal event
+    //   {"kind":"error","code":"...","message":"..."} on LLM failure (terminal)
+    //   {"kind":"done"} as the terminal success event
     let s = stream! {
+        let mut err_rx = err_rx;
         while let Some(token) = rx.recv().await {
             let data = serde_json::json!({"kind": "token", "content": token}).to_string();
             yield Ok::<Event, Infallible>(Event::default().data(data));
         }
-        yield Ok::<Event, Infallible>(
-            Event::default().data(r#"{"kind":"done"}"#)
-        );
+        // After the token channel closes, check whether the background task
+        // ended with an error.  If so, emit the error event instead of done.
+        match err_rx.try_recv() {
+            Ok(e) => {
+                let data = serde_json::json!({
+                    "kind": "error",
+                    "code": "llm_error",
+                    "message": e.to_string(),
+                })
+                .to_string();
+                yield Ok::<Event, Infallible>(Event::default().data(data));
+            }
+            Err(_) => {
+                yield Ok::<Event, Infallible>(
+                    Event::default().data(r#"{"kind":"done"}"#)
+                );
+            }
+        }
     };
 
     Ok(Sse::new(s).keep_alive(KeepAlive::default()).into_response())
@@ -1341,6 +1363,65 @@ mod tests {
             resp.status(),
             http::StatusCode::SERVICE_UNAVAILABLE,
             "explore without LLM must return 503"
+        );
+    }
+
+    /// POST /v1/projects/{slug}/llm/complete with an empty `messages` array must return 400.
+    #[tokio::test]
+    async fn llm_complete_empty_messages_returns_400() {
+        let (app, _) = make_app(0.92);
+        let body = json!({"messages": [], "max_tokens": 256});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/projects/proj/llm/complete")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            http::StatusCode::BAD_REQUEST,
+            "empty messages must return 400"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(
+            json["error"]["code"],
+            json!("bad_request"),
+            "error code must be bad_request; got: {json}"
+        );
+    }
+
+    /// POST /v1/projects/{slug}/llm/complete with a valid body but no LLM configured must return 503.
+    #[tokio::test]
+    async fn llm_complete_without_llm_returns_503() {
+        let (app, _) = make_app(0.92);
+        let body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 256,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/projects/proj/llm/complete")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "llm/complete without LLM must return 503"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(
+            json["error"]["code"],
+            json!("llm_unavailable"),
+            "error code must be llm_unavailable; got: {json}"
         );
     }
 
