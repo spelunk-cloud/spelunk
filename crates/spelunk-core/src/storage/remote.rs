@@ -385,4 +385,8 @@ impl MemoryBackend for RemoteMemoryBackend {
     async fn get_edges(&self, _id: i64) -> Result<(Vec<MemoryEdge>, Vec<MemoryEdge>)> {
         Ok((vec![], vec![]))
     }
+
+    fn backend_kind(&self) -> &'static str {
+        "remote"
+    }
 }

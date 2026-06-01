@@ -265,6 +265,19 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Whether a local embedding model is configured for this CLI.
+    ///
+    /// A local embedder is considered "configured" when the OpenAI-compatible
+    /// `api_base_url` has been set to a non-default endpoint (e.g. the user
+    /// pointed spelunk at their LM Studio / Ollama / vLLM server). On a fresh
+    /// install `api_base_url` keeps its built-in default, so this returns
+    /// `false` and `open_memory_backend()` falls through to the zero-infra
+    /// git-meta backend (see decision #73). Used by `open_memory_backend()` to
+    /// decide between the SQLite (local semantic) and git-meta backends.
+    pub fn local_embedder_configured(&self) -> bool {
+        self.api_base_url != Self::default_api_base_url()
+    }
+
     /// Validate cross-field constraints. Call after `load()`.
     pub fn validate(&self) -> Result<()> {
         if self.server_url.is_some() && self.project_id.is_none() {

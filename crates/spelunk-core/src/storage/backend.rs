@@ -79,6 +79,12 @@ pub trait MemoryBackend: Send {
     async fn add_edge(&self, from_id: i64, to_id: i64, kind: &str) -> Result<()>;
     /// Return `(outgoing, incoming)` edges for a note.
     async fn get_edges(&self, id: i64) -> Result<(Vec<MemoryEdge>, Vec<MemoryEdge>)>;
+
+    /// Stable identifier for the concrete backend implementation, used for
+    /// diagnostics (`spelunk status`/`check`) and to assert the result of
+    /// [`crate::storage::open_memory_backend`]. One of: `"sqlite"`,
+    /// `"git-meta"`, `"git-notes"`, `"remote"`.
+    fn backend_kind(&self) -> &'static str;
 }
 
 // ── Local SQLite backend ──────────────────────────────────────────────────────
@@ -224,5 +230,9 @@ impl MemoryBackend for LocalMemoryBackend {
 
     async fn get_edges(&self, id: i64) -> Result<(Vec<MemoryEdge>, Vec<MemoryEdge>)> {
         self.store.lock().await.get_edges(id)
+    }
+
+    fn backend_kind(&self) -> &'static str {
+        "sqlite"
     }
 }

@@ -335,4 +335,8 @@ impl MemoryBackend for GitNotesBackend {
     async fn get_edges(&self, _id: i64) -> Result<(Vec<MemoryEdge>, Vec<MemoryEdge>)> {
         Err(crate::error::SpelunkError::BackendUnsupported("get_edges".into()).into())
     }
+
+    fn backend_kind(&self) -> &'static str {
+        "git-notes"
+    }
 }

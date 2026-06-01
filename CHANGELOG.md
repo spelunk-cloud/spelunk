@@ -7,6 +7,21 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **Default memory backend is now `git-meta`** — `open_memory_backend()`
+  resolves the backend in this order: an explicit `--backend` flag, then a
+  configured `server_url` (remote), then a configured local embedder (SQLite),
+  and finally `git-meta` as the zero-infrastructure default. Fresh installs no
+  longer require a local embedder or SQLite database to record memory. The
+  `--backend` flag now defaults to `auto`; pass `--backend sqlite` to opt back
+  into the local SQLite backend with semantic search, or `--backend git-meta`
+  to force it explicitly. (#283, #182)
+
+---
+
 ## [0.7.1] — 2026-05-27
 
 ### Added

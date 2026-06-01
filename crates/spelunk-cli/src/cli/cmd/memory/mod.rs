@@ -11,8 +11,11 @@ pub struct MemoryArgs {
     #[arg(long, global = true)]
     pub db: Option<PathBuf>,
 
-    /// Storage backend: sqlite (default), git-meta, or git-notes
-    #[arg(long, global = true, default_value = "sqlite", value_name = "BACKEND")]
+    /// Storage backend: auto (default), git-meta, sqlite, or git-notes.
+    /// `auto` resolves to server_url → local embedder (sqlite) → git-meta.
+    /// Pass `sqlite` to force local semantic search; `git-meta` to force the
+    /// zero-infra git-native backend.
+    #[arg(long, global = true, default_value = "auto", value_name = "BACKEND")]
     pub backend: String,
 }
 
@@ -344,11 +347,18 @@ pub async fn memory(args: MemoryArgs, cfg: crate::config::Config) -> Result<()> 
 }
 
 /// Convert the `--backend` string to a static override token for `open_memory_backend`.
-/// Returns `None` for the default "sqlite" to fall through to config-based dispatch.
+///
+/// Any recognised value produces an explicit override that takes precedence over
+/// config-based dispatch. The clap default is `auto`, which returns `None` so that
+/// `open_memory_backend` runs its full resolution order (server_url → local
+/// embedder → git-meta). `sqlite` is the explicit opt-out for local semantic
+/// search; `git-meta`/`git-notes` force the respective git-native backends.
 fn backend_override(s: &str) -> Option<&'static str> {
     match s {
         "git-meta" => Some("git-meta"),
         "git-notes" => Some("git-notes"),
+        "sqlite" => Some("sqlite"),
+        // "auto" and any unknown value fall through to config-based dispatch.
         _ => None,
     }
 }
