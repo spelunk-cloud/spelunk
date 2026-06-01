@@ -91,6 +91,11 @@ pub async fn check(args: CheckArgs, cfg: Config) -> Result<()> {
                     .unwrap_or(serde_json::Value::Null),
             ),
         };
+        let mem_path = resolve_db(args.db.as_deref(), &cfg.db_path).with_file_name("memory.db");
+        let memory_backend_kind = open_memory_backend(&cfg, &mem_path, None)
+            .ok()
+            .map(|b| b.backend_kind())
+            .unwrap_or("sqlite");
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -101,6 +106,7 @@ pub async fn check(args: CheckArgs, cfg: Config) -> Result<()> {
                 "last_indexed_at": last_indexed,
                 "server_reachable": server_reachable,
                 "server_url": server_url_val,
+                "memory_backend": memory_backend_kind,
             }))?
         );
     } else if fresh {

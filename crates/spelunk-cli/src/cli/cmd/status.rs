@@ -42,6 +42,8 @@ use crate::{
 /// - `has_semantic_search` — `true` when a server with `search.semantic` is reachable
 /// - `last_indexed_at` — ISO-8601 UTC timestamp of the most recently indexed file, or `null`
 /// - `memory_entries` — count of memory entries accessible from this project
+/// - `memory_backend` — stable identifier for the active memory backend: `"sqlite"`,
+///   `"git-meta"`, `"git-notes"`, or `"remote"` (see issue #308)
 ///
 /// Additional fields (`tier`, `server_url`, `capabilities`, `snapshot_count`,
 /// `drift_candidates`, `usage_7d`) are present for backward compatibility and
@@ -66,10 +68,15 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
         let drift = db.drift_candidates(30, 10).unwrap_or_default();
         let usage = db.usage_last_7_days().unwrap_or_default();
         let mem_path = resolve_db(None, &cfg.db_path).with_file_name("memory.db");
-        let memory_count = match open_memory_backend(&cfg, &mem_path, None).ok() {
-            Some(b) => b.count().await.unwrap_or(0),
-            None => 0,
-        };
+        let (memory_count, memory_backend_kind) =
+            match open_memory_backend(&cfg, &mem_path, None).ok() {
+                Some(b) => {
+                    let kind = b.backend_kind();
+                    let count = b.count().await.unwrap_or(0);
+                    (count, kind)
+                }
+                None => (0, "sqlite"),
+            };
         let usage_map: std::collections::HashMap<&str, i64> =
             usage.iter().map(|(c, n)| (c.as_str(), *n)).collect();
 
@@ -129,6 +136,7 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
                 "has_semantic_search": has_semantic_search,
                 "last_indexed_at": last_indexed_at,
                 "memory_entries": memory_count,
+                "memory_backend": memory_backend_kind,
                 // ── Extensions (backward-compat, may change) ─────────────────
                 "tier": tier_str,
                 "server_url": tier_url,
@@ -231,6 +239,12 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
 
     let db = Database::open(db_path)?;
     let s = db.stats()?;
+
+    // ── Memory backend ────────────────────────────────────────────────────────
+    let mem_path_text = resolve_db(None, &cfg.db_path).with_file_name("memory.db");
+    if let Ok(b) = open_memory_backend(&cfg, &mem_path_text, None) {
+        println!("Memory backend: {}", b.backend_kind());
+    }
 
     // ── Capability tier section ───────────────────────────────────────────────
     print_tier_section(tier, &cfg);
