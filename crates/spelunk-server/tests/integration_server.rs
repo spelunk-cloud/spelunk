@@ -42,6 +42,50 @@ async fn send(
     router(state).oneshot(req).await.unwrap()
 }
 
+/// Like [`send`], but allows attaching extra headers (e.g. `Last-Event-ID`).
+async fn send_with_headers(
+    state: AppState,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder.body(Body::empty()).unwrap();
+    router(state).oneshot(req).await.unwrap()
+}
+
+/// Read raw SSE bytes off a streaming response body until at least
+/// `min_events` `\n\n`-terminated frames have been seen, or `timeout` elapses.
+/// The `memory_stream` handler never closes its body, so callers must bound
+/// how much they read.
+async fn read_sse_frames(
+    resp: axum::response::Response,
+    min_events: usize,
+    timeout: std::time::Duration,
+) -> String {
+    use futures_util::StreamExt;
+    let mut body = resp.into_body().into_data_stream();
+    let mut buf = String::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if buf.matches("\n\n").count() >= min_events {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, body.next()).await {
+            Ok(Some(Ok(chunk))) => buf.push_str(&String::from_utf8_lossy(&chunk)),
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        }
+    }
+    buf
+}
+
 // ── health ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -413,4 +457,160 @@ async fn project_stats_returns_correct_counts() {
     assert_eq!(stats["count"], 1);
     assert_eq!(stats["total"], 1);
     assert_eq!(stats["embedding_dim"], 4);
+}
+
+// ── memory_stream (SSE, ADR-026) ───────────────────────────────────────────────
+
+#[tokio::test]
+#[serial]
+async fn memory_stream_replays_with_event_framing_and_kind_filter() {
+    let state = make_state();
+
+    // Seed two notes of different kinds before opening the stream so they're
+    // picked up by the initial "since 0" poll (?t= unset, no Last-Event-ID —
+    // but seeding happens before the connection opens, so use ?t=0 to force
+    // a full replay from id 0).
+    send(
+        state.clone(),
+        "POST",
+        "/v1/projects/p/memory",
+        json_body(
+            serde_json::json!({"kind":"intent","title":"intent note","embedding":[0.0_f32,0.0,0.0,0.0]}),
+        ),
+        true,
+    )
+    .await;
+    send(
+        state.clone(),
+        "POST",
+        "/v1/projects/p/memory",
+        json_body(
+            serde_json::json!({"kind":"decision","title":"decision note","embedding":[0.0_f32,0.0,0.0,0.0]}),
+        ),
+        true,
+    )
+    .await;
+
+    // ?t=0 with no Last-Event-ID: notes_since(0,1) finds the first note (id
+    // 1), so since_id = 0 and both notes replay on the first poll.
+    let resp = send(
+        state,
+        "GET",
+        "/v1/projects/p/memory/stream?t=0&kind=intent",
+        Body::empty(),
+        false,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let raw = read_sse_frames(resp, 1, std::time::Duration::from_secs(5)).await;
+
+    // Only the `intent` note should pass the kind filter.
+    assert!(raw.contains("event: memory.created"), "raw: {raw}");
+    assert!(raw.contains("id: seq-0000001"), "raw: {raw}");
+    assert!(raw.contains("intent note"), "raw: {raw}");
+    assert!(
+        !raw.contains("decision note"),
+        "kind filter should drop the decision note: {raw}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_stream_emits_archived_event() {
+    let state = make_state();
+
+    let create = send(
+        state.clone(),
+        "POST",
+        "/v1/projects/p/memory",
+        json_body(
+            serde_json::json!({"kind":"note","title":"to archive","embedding":[0.0_f32,0.0,0.0,0.0]}),
+        ),
+        true,
+    )
+    .await;
+    let bytes = axum::body::to_bytes(create.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let note_id = created["id"].as_i64().expect("note id");
+
+    send(
+        state.clone(),
+        "POST",
+        &format!("/v1/projects/p/memory/{note_id}/archive"),
+        Body::empty(),
+        false,
+    )
+    .await;
+
+    let resp = send(
+        state,
+        "GET",
+        "/v1/projects/p/memory/stream?t=0",
+        Body::empty(),
+        false,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let raw = read_sse_frames(resp, 1, std::time::Duration::from_secs(5)).await;
+    assert!(raw.contains("event: memory.archived"), "raw: {raw}");
+    assert!(raw.contains(&format!("id: seq-{note_id:07}")), "raw: {raw}");
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_stream_resumes_from_last_event_id_without_gap_or_dup() {
+    let state = make_state();
+
+    // First note exists before the client ever connects.
+    send(
+        state.clone(),
+        "POST",
+        "/v1/projects/p/memory",
+        json_body(
+            serde_json::json!({"kind":"note","title":"note one","embedding":[0.0_f32,0.0,0.0,0.0]}),
+        ),
+        true,
+    )
+    .await;
+
+    // Pretend a previous connection already consumed note 1 (`seq-0000001`)
+    // and disconnected. A second note is written after that.
+    send(
+        state.clone(),
+        "POST",
+        "/v1/projects/p/memory",
+        json_body(
+            serde_json::json!({"kind":"note","title":"note two","embedding":[0.0_f32,0.0,0.0,0.0]}),
+        ),
+        true,
+    )
+    .await;
+
+    let resp = send_with_headers(
+        state,
+        "GET",
+        "/v1/projects/p/memory/stream",
+        &[("Last-Event-ID", "seq-0000001")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let raw = read_sse_frames(resp, 1, std::time::Duration::from_secs(5)).await;
+
+    // Only note two (id 2) should be replayed — no gap (note one missing
+    // would be a gap; note one re-appearing would be a dup).
+    assert!(raw.contains("id: seq-0000002"), "raw: {raw}");
+    assert!(raw.contains("note two"), "raw: {raw}");
+    assert!(
+        !raw.contains("note one"),
+        "resume from seq-0000001 must not re-send note one: {raw}"
+    );
+    assert!(
+        !raw.contains("seq-0000001"),
+        "resume from seq-0000001 must not re-send id seq-0000001: {raw}"
+    );
 }

@@ -6,7 +6,7 @@ use async_stream::stream;
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -560,7 +560,63 @@ fn default_since_limit() -> i64 {
 #[derive(Deserialize, ToSchema, utoipa::IntoParams)]
 pub struct StreamQuery {
     /// Unix epoch seconds to start from (inclusive). Defaults to now.
+    /// Ignored if a `Last-Event-ID` header is present (see ADR-026 §2.4).
     pub t: Option<i64>,
+    /// Comma-separated kind filter, e.g. `kind=intent,question`. Absent or
+    /// empty means all kinds. Only applies to `memory.created` events —
+    /// `memory.archived` and `ping` always pass (ADR-015 semantics).
+    pub kind: Option<String>,
+}
+
+// ── SSE event naming / filtering (ADR-026 §2.2-2.3, §2.5) ─────────────────────
+// keep in sync with cloud-api src/sse/events.rs (`event_name`/`passes_filter`);
+// extraction into `spelunk-core::sse` deferred per ADR-026 §2.5 (decision #158).
+
+/// `event:` name for a given `ServerNote` status, per the `MemoryEvent` taxonomy
+/// reachable from SQLite (ADR-026 §2.2). OSS does not emit
+/// `memory.conflict_detected`/`memory.conflict_resolved`.
+fn event_name_for_status(status: &str) -> &'static str {
+    match status {
+        "archived" => "memory.archived",
+        _ => "memory.created",
+    }
+}
+
+/// Parse a comma-separated `?kind=` filter into a list of trimmed, non-empty
+/// kind strings. Returns `None` if the filter is absent or empty (no filter).
+fn parse_kind_filter(kind: Option<&str>) -> Option<Vec<String>> {
+    let kinds: Vec<String> = kind?
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if kinds.is_empty() { None } else { Some(kinds) }
+}
+
+/// `memory.archived` and `ping` always pass; `memory.created` is filtered by
+/// `note.kind` against the `?kind=` allow-list (ADR-015 semantics).
+fn passes_kind_filter(note: &super::db::ServerNote, filter: Option<&[String]>) -> bool {
+    if note.status == "archived" {
+        return true;
+    }
+    match filter {
+        None => true,
+        Some(kinds) => kinds.iter().any(|k| k == &note.kind),
+    }
+}
+
+/// Parse the `Last-Event-ID` header (`seq-NNNNNNN` or bare integer) into an
+/// `id` lower bound (exclusive), per ADR-026 §2.4.
+fn parse_last_event_id(headers: &HeaderMap) -> Option<i64> {
+    let raw = headers.get("Last-Event-ID")?.to_str().ok()?;
+    let digits = raw.strip_prefix("seq-").unwrap_or(raw);
+    digits.parse::<i64>().ok()
+}
+
+/// Build the `id: seq-NNNNNNN` SSE event ID for a note, per ADR-026 §2.1.
+fn seq_id(note_id: i64) -> String {
+    format!("seq-{note_id:07}")
 }
 
 /// Return notes created after a given Unix timestamp. Archived entries are
@@ -592,12 +648,19 @@ pub async fn memory_since(
     Ok(Json(notes))
 }
 
-/// Stream new memory entries as Server-Sent Events. Each event carries a
-/// single `ServerNote` serialised as JSON. The stream polls the database once
-/// per second and stays open indefinitely — close the connection to stop it.
+/// Stream new memory entries as Server-Sent Events, per ADR-026.
 ///
-/// Pass `?t=<unix_secs>` to replay entries written after a known timestamp.
-/// Omit it to receive only entries written after the connection opens.
+/// Each event is framed with `event:` (`memory.created`, `memory.archived`,
+/// or `ping`), `id: seq-NNNNNNN` (the note's `id`), and a JSON `data:` payload.
+/// The stream polls the database once per second and stays open indefinitely
+/// — close the connection to stop it.
+///
+/// Resume: send a `Last-Event-ID: seq-NNNNNNN` header to resume from that
+/// sequence number (exclusive). Takes precedence over `?t=`. If neither is
+/// present, only entries written after the connection opens are streamed.
+///
+/// `?kind=<comma-separated>` filters `memory.created` events by note kind;
+/// `memory.archived` and `ping` are always emitted.
 #[utoipa::path(
     get,
     path = "/v1/projects/{project_id}/memory/stream",
@@ -617,6 +680,7 @@ pub async fn memory_stream(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     Query(params): Query<StreamQuery>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Validate the project exists before opening the stream.
     {
@@ -624,15 +688,42 @@ pub async fn memory_stream(
         require_project(&db, &project_id)?;
     }
 
-    let start_t = params.t.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
-    });
+    let kind_filter = parse_kind_filter(params.kind.as_deref());
+
+    // `Last-Event-ID` (resume) takes precedence over `?t=` (ADR-026 §2.4).
+    // If neither is present, start from "now" (`id` cursor seeded from the
+    // current max id below, `t` cursor seeded from the current time).
+    let last_event_id = parse_last_event_id(&headers);
 
     let s = stream! {
-        let mut last_seen = start_t;
+        // `since_id` is the exclusive `notes.id` lower bound used for both
+        // the replay batch and the poll cursor (de-dup safety, ADR-026 §2.4).
+        // `last_seen_t` seeds the legacy `created_at`-based cursor only for
+        // the very first poll when neither `Last-Event-ID` nor `?t=` is set.
+        let mut since_id: i64 = match last_event_id {
+            Some(id) => id,
+            None => {
+                let db = state.db.lock().await;
+                match db.get_project(&project_id) {
+                    Ok(Some(p)) => match params.t {
+                        // `?t=` provided with no Last-Event-ID: replay by
+                        // created_at, then switch to id-based cursoring.
+                        Some(t) => db
+                            .notes_since(p.id, t, 1)
+                            .ok()
+                            .and_then(|notes| notes.first().map(|n| n.id - 1))
+                            .unwrap_or(0),
+                        // No cursor at all: start from "now" — only stream
+                        // entries created after the connection opens.
+                        None => db.max_note_id(p.id).unwrap_or(0),
+                    },
+                    _ => 0,
+                }
+            }
+        };
+
+        let mut last_activity = std::time::Instant::now();
+
         loop {
             // Lock, query, immediately release.
             let notes = {
@@ -648,15 +739,37 @@ pub async fn memory_stream(
                     }
                 };
                 // Ignore DB errors mid-stream; keep the connection alive.
-                db.notes_since(pid, last_seen, 50).unwrap_or_default()
+                db.notes_since_id(pid, since_id, 50).unwrap_or_default()
             };
 
             for note in notes {
-                if note.created_at > last_seen {
-                    last_seen = note.created_at;
+                if note.id > since_id {
+                    since_id = note.id;
                 }
+                if !passes_kind_filter(&note, kind_filter.as_deref()) {
+                    continue;
+                }
+                let event_name = event_name_for_status(&note.status);
                 let data = serde_json::to_string(&note).unwrap_or_default();
-                yield Ok::<Event, Infallible>(Event::default().data(data));
+                last_activity = std::time::Instant::now();
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .event(event_name)
+                        .id(seq_id(note.id))
+                        .data(data),
+                );
+            }
+
+            // Named `ping` keepalive every 30s of no activity (ADR-026 §2.2),
+            // in addition to axum's transport-level keepalive.
+            if last_activity.elapsed() >= Duration::from_secs(30) {
+                last_activity = std::time::Instant::now();
+                let payload = serde_json::json!({ "event": "ping", "last_seq": since_id });
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .event("ping")
+                        .data(payload.to_string()),
+                );
             }
 
             tokio::time::sleep(Duration::from_secs(1)).await;

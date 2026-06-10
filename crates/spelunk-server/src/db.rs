@@ -424,6 +424,43 @@ impl ServerDb {
         Ok(notes)
     }
 
+    /// Return the highest `notes.id` for `project_id`, or `0` if the project
+    /// has no notes yet. Used to seed the SSE poll cursor for "start from
+    /// now" connections (no `Last-Event-ID` and no `?t=`, ADR-026 §2.4).
+    pub fn max_note_id(&self, project_id: i64) -> Result<i64> {
+        let max_id: Option<i64> = self.conn.query_row(
+            "SELECT MAX(id) FROM notes WHERE project_id = ?1",
+            rusqlite::params![project_id],
+            |r| r.get(0),
+        )?;
+        Ok(max_id.unwrap_or(0))
+    }
+
+    /// Return notes with `id > since_id` (exclusive), ordered ASC by `id`.
+    /// Unlike [`notes_since`], this includes archived entries — callers use
+    /// the `status` field to distinguish `memory.created` from
+    /// `memory.archived` transitions. `notes.id` is used directly as the SSE
+    /// `seq` (see ADR-026 §2.1). `limit` is capped at 500.
+    pub fn notes_since_id(
+        &self,
+        project_id: i64,
+        since_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ServerNote>> {
+        let limit = limit.clamp(1, 500);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, kind, title, body, tags, linked_files, created_at, status, superseded_by
+             FROM notes
+             WHERE project_id = ?1 AND id > ?2
+             ORDER BY id ASC
+             LIMIT ?3",
+        )?;
+        let notes = stmt
+            .query_map(rusqlite::params![project_id, since_id, limit], row_to_note)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(notes)
+    }
+
     pub fn delete_note(&self, project_id: i64, note_id: i64) -> Result<bool> {
         self.conn.execute(
             "DELETE FROM note_embeddings WHERE note_id = ?1",

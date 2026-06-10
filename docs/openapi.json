@@ -702,8 +702,8 @@
         "tags": [
           "memory"
         ],
-        "summary": "Stream new memory entries as Server-Sent Events. Each event carries a\nsingle `ServerNote` serialised as JSON. The stream polls the database once\nper second and stays open indefinitely — close the connection to stop it.",
-        "description": "Pass `?t=<unix_secs>` to replay entries written after a known timestamp.\nOmit it to receive only entries written after the connection opens.",
+        "summary": "Stream new memory entries as Server-Sent Events, per ADR-026.",
+        "description": "Each event is framed with `event:` (`memory.created`, `memory.archived`,\nor `ping`), `id: seq-NNNNNNN` (the note's `id`), and a JSON `data:` payload.\nThe stream polls the database once per second and stays open indefinitely\n— close the connection to stop it.\n\nResume: send a `Last-Event-ID: seq-NNNNNNN` header to resume from that\nsequence number (exclusive). Takes precedence over `?t=`. If neither is\npresent, only entries written after the connection opens are streamed.\n\n`?kind=<comma-separated>` filters `memory.created` events by note kind;\n`memory.archived` and `ping` are always emitted.",
         "operationId": "memory_stream",
         "parameters": [
           {
@@ -718,7 +718,7 @@
           {
             "name": "t",
             "in": "query",
-            "description": "Unix epoch seconds to start from (inclusive). Defaults to now.",
+            "description": "Unix epoch seconds to start from (inclusive). Defaults to now.\nIgnored if a `Last-Event-ID` header is present (see ADR-026 §2.4).",
             "required": false,
             "schema": {
               "type": [
@@ -726,6 +726,18 @@
                 "null"
               ],
               "format": "int64"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Comma-separated kind filter, e.g. `kind=intent,question`. Absent or\nempty means all kinds. Only applies to `memory.created` events —\n`memory.archived` and `ping` always pass (ADR-015 semantics).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -1732,13 +1744,20 @@
       "StreamQuery": {
         "type": "object",
         "properties": {
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Comma-separated kind filter, e.g. `kind=intent,question`. Absent or\nempty means all kinds. Only applies to `memory.created` events —\n`memory.archived` and `ping` always pass (ADR-015 semantics)."
+          },
           "t": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "Unix epoch seconds to start from (inclusive). Defaults to now."
+            "description": "Unix epoch seconds to start from (inclusive). Defaults to now.\nIgnored if a `Last-Event-ID` header is present (see ADR-026 §2.4)."
           }
         }
       },
