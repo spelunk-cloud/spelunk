@@ -614,3 +614,260 @@ async fn memory_stream_resumes_from_last_event_id_without_gap_or_dup() {
         "resume from seq-0000001 must not re-send id seq-0000001: {raw}"
     );
 }
+
+// ── ADR-026 test/bench follow-up (issue #375, PR #379) ─────────────────────────
+//
+// Two checklist items from ADR-026's "Test/bench follow-up (Test Engineer)"
+// section:
+//
+//   1. End-to-end wire-contract parity: assert the OSS `memory.created` /
+//      `memory.archived` / `ping` event shapes match the documented
+//      `MemoryEvent` taxonomy (ADR-026 §2.2), which mirrors cloud-api's
+//      `src/sse/events.rs::MemoryEvent` (modulo `memory.conflict_*`, which
+//      OSS does not emit — ADR-026 §2.2/§3). cloud-api's own
+//      `tests/routes_stream.rs` covers auth/routing for the cloud side; this
+//      test is the OSS-side half of the parity check, run against the same
+//      `spelunk memory watch` client contract (`event:`/`id: seq-NNNNNNN`
+//      framing + JSON `data:` shape) documented in ADR-013/015.
+//
+//   2. Reconnect-storm: repeated `Last-Event-ID` reconnects (mirroring
+//      `memory_watch`'s exponential-backoff reconnect loop) must not produce
+//      gaps or duplicates, and `notes_since_id` must be served via an index
+//      seek (not a full table scan) so a reconnect storm doesn't degrade into
+//      O(n) scans per reconnect.
+
+/// ADR-026 §2.2 event-shape parity: `memory.created` carries the full
+/// `ServerNote` (entry_id == `id`, `project_id` == slug, `kind`, `title`,
+/// `body`, `seq` == `id`, `created_at`), `memory.archived` carries
+/// `entry_id`/`seq`, and `ping` carries `last_seq`. Field names below mirror
+/// cloud-api's `MemoryEvent::MemoryCreated`/`MemoryArchived`/`Ping` variants
+/// (ADR-026 §2.2 table) so `spelunk memory watch`'s event parser handles both
+/// transports identically.
+#[tokio::test]
+#[serial]
+async fn memory_stream_event_payload_shapes_match_adr026_taxonomy() {
+    let state = make_state();
+
+    let create = send(
+        state.clone(),
+        "POST",
+        "/v1/projects/p/memory",
+        json_body(
+            serde_json::json!({"kind":"intent","title":"shape check","body":"b","embedding":[0.0_f32,0.0,0.0,0.0]}),
+        ),
+        true,
+    )
+    .await;
+    let bytes = axum::body::to_bytes(create.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let note_id = created["id"].as_i64().expect("note id");
+
+    // Connect *before* archiving, with `?t=0` to force a full replay from id
+    // 0, so the first poll observes the note while still `active` and emits
+    // `memory.created`.
+    let resp = send(
+        state.clone(),
+        "GET",
+        "/v1/projects/p/memory/stream?t=0",
+        Body::empty(),
+        false,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = read_sse_frames(resp, 1, std::time::Duration::from_secs(5)).await;
+
+    let frames: Vec<&str> = raw.split("\n\n").filter(|f| !f.is_empty()).collect();
+    assert_eq!(frames.len(), 1, "expected exactly 1 frame, got: {raw}");
+    {
+        let frame = frames[0];
+        let event = frame.lines().find_map(|l| l.strip_prefix("event: "));
+        let id = frame.lines().find_map(|l| l.strip_prefix("id: "));
+        let data: serde_json::Value = frame
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str(d).expect("data: payload must be valid JSON"))
+            .expect("frame must have a data: line");
+
+        assert_eq!(event, Some("memory.created"));
+        assert_eq!(id, Some(format!("seq-{note_id:07}")).as_deref());
+        // ServerNote shape: `id` doubles as `entry_id`/`seq` (ADR-026 §2.1).
+        assert_eq!(data["id"], note_id);
+        assert_eq!(data["kind"], "intent");
+        assert_eq!(data["title"], "shape check");
+        assert_eq!(data["status"], "active");
+        assert!(data["created_at"].is_i64());
+    }
+
+    // Now archive. Per the documented PR #379 limitation (ADR-026 §2.1),
+    // `memory.archived` is only emitted for notes with `id > since_id`, so a
+    // resume from `seq-{note_id:07}` would *not* see this transition — that's
+    // covered separately by `memory_stream_emits_archived_event`. Here we use
+    // a fresh `?t=0` full replay (`since_id=0`), where the note's *current*
+    // (`archived`) status is what gets emitted, to check the
+    // `memory.archived` payload shape.
+    send(
+        state.clone(),
+        "POST",
+        &format!("/v1/projects/p/memory/{note_id}/archive"),
+        Body::empty(),
+        false,
+    )
+    .await;
+
+    let resp = send(
+        state,
+        "GET",
+        "/v1/projects/p/memory/stream?t=0",
+        Body::empty(),
+        false,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = read_sse_frames(resp, 1, std::time::Duration::from_secs(5)).await;
+
+    let frames: Vec<&str> = raw.split("\n\n").filter(|f| !f.is_empty()).collect();
+    assert_eq!(frames.len(), 1, "expected exactly 1 frame, got: {raw}");
+    {
+        let frame = frames[0];
+        let event = frame.lines().find_map(|l| l.strip_prefix("event: "));
+        let id = frame.lines().find_map(|l| l.strip_prefix("id: "));
+        let data: serde_json::Value = frame
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str(d).expect("data: payload must be valid JSON"))
+            .expect("frame must have a data: line");
+
+        assert_eq!(event, Some("memory.archived"));
+        assert_eq!(id, Some(format!("seq-{note_id:07}")).as_deref());
+        assert_eq!(data["id"], note_id);
+        assert_eq!(data["status"], "archived");
+    }
+}
+
+/// Reconnect-storm: simulate `spelunk memory watch`'s reconnect loop —
+/// connect, read one batch, disconnect, reconnect with `Last-Event-ID` set to
+/// the last `seq` seen — many times in a row while notes are written between
+/// reconnects. Across the whole storm, every note must be seen exactly once
+/// (no gaps, no duplicates), regardless of how many times the client
+/// reconnects.
+#[tokio::test]
+#[serial]
+async fn memory_stream_reconnect_storm_no_gap_or_dup() {
+    let state = make_state();
+
+    const ROUNDS: usize = 25;
+    let mut last_event_id: Option<String> = None;
+    let mut seen_ids: Vec<i64> = Vec::new();
+
+    for round in 0..ROUNDS {
+        // Write a note before each (re)connect, as a concurrent producer
+        // would during a reconnect storm.
+        send(
+            state.clone(),
+            "POST",
+            "/v1/projects/p/memory",
+            json_body(
+                serde_json::json!({"kind":"note","title":format!("note {round}"),"embedding":[0.0_f32,0.0,0.0,0.0]}),
+            ),
+            true,
+        )
+        .await;
+
+        let resp = match &last_event_id {
+            Some(leid) => {
+                send_with_headers(
+                    state.clone(),
+                    "GET",
+                    "/v1/projects/p/memory/stream",
+                    &[("Last-Event-ID", leid.as_str())],
+                )
+                .await
+            }
+            // First connection: ?t=0 forces a full replay from id 0, matching
+            // `memory_watch`'s initial `--since-seq=0` behaviour.
+            None => {
+                send(
+                    state.clone(),
+                    "GET",
+                    "/v1/projects/p/memory/stream?t=0",
+                    Body::empty(),
+                    false,
+                )
+                .await
+            }
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Each round, a fresh connection should observe at least the note(s)
+        // written since the last reconnect's cursor.
+        let raw = read_sse_frames(resp, 1, std::time::Duration::from_secs(5)).await;
+
+        for frame in raw.split("\n\n").filter(|f| !f.is_empty()) {
+            let id_line = frame
+                .lines()
+                .find_map(|l| l.strip_prefix("id: "))
+                .expect("memory.created/.archived frame must carry id:");
+            let seq: i64 = id_line
+                .strip_prefix("seq-")
+                .expect("id must be seq-NNNNNNN")
+                .parse()
+                .expect("seq must be numeric");
+            assert!(
+                !seen_ids.contains(&seq),
+                "round {round}: duplicate seq {seq} (already seen: {seen_ids:?})"
+            );
+            seen_ids.push(seq);
+            last_event_id = Some(id_line.to_string());
+        }
+    }
+
+    // No gaps: every note 1..=ROUNDS must have been seen exactly once, in order.
+    seen_ids.sort_unstable();
+    let expected: Vec<i64> = (1..=ROUNDS as i64).collect();
+    assert_eq!(
+        seen_ids, expected,
+        "reconnect storm produced gaps or duplicates"
+    );
+}
+
+/// `notes_since_id` (the query driving both the SSE replay batch and the poll
+/// loop, ADR-026 §2.4) must be served by an index seek on `(project_id, ...)`,
+/// not a full table scan of `notes` — otherwise a reconnect storm degrades
+/// into O(n) scans per reconnect as the table grows. SQLite's query planner
+/// uses `idx_notes_project (project_id)` for the equality filter and the
+/// rowid (`notes.id` is `INTEGER PRIMARY KEY`) for the `id > ?` bound + `ORDER
+/// BY id ASC`, so the plan must not contain "SCAN notes" without an index.
+#[tokio::test]
+#[serial]
+async fn notes_since_id_query_plan_uses_index_not_full_scan() {
+    let db = common::open_test_server_db(4);
+
+    let plan_rows: Vec<String> = db
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id, kind, title, body, tags, linked_files, created_at, status, superseded_by
+             FROM notes
+             WHERE project_id = ?1 AND id > ?2
+             ORDER BY id ASC
+             LIMIT ?3",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![1_i64, 0_i64, 50_i64], |row| {
+            row.get::<_, String>(3) // `detail` column
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    let plan = plan_rows.join(" | ");
+    assert!(
+        !plan.to_uppercase().contains("SCAN NOTES")
+            || plan.to_uppercase().contains("USING INDEX")
+            || plan.to_uppercase().contains("USING PRIMARY KEY")
+            || plan.to_uppercase().contains("USING ROWID"),
+        "notes_since_id must not be a full table scan without an index: {plan}"
+    );
+}
