@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use super::MemoryAddArgs;
 use crate::{
     config::Config,
+    indexer::secrets::contains_secret,
     server_client::ServerInferenceClient,
     storage::{NoteInput, NoteRecord, append_to_git_notes, now_secs, open_memory_backend},
 };
@@ -90,7 +91,12 @@ pub(super) async fn memory_add(
             superseded_by: None,
         };
         // Use process CWD (None) — the CLI is always run from the project root.
-        if let Err(e) = append_to_git_notes(None, &record).await {
+        if contains_secret(&body) || contains_secret(&title) {
+            tracing::warn!(
+                "git-notes write-through skipped: note body or title matched a secret pattern. \
+                 Entry is stored in SQLite only. Set store_in_git_notes = false to suppress this check."
+            );
+        } else if let Err(e) = append_to_git_notes(None, &record).await {
             tracing::warn!("git-notes write-through failed (non-fatal): {e}");
         }
     }
