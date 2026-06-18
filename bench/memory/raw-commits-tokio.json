@@ -1,0 +1,2537 @@
+{
+  "repo": "tokio",
+  "num_commits_exported": 506,
+  "instructions": "Author questions from the commits below. Do NOT consult spelunk memory (spelunk memory list / spelunk memory search). Use the raw commit subjects and bodies as your only source material. Record ground-truth commit SHAs for each question.",
+  "commits": [
+    {
+      "commit": "7892f6020d9c914a41d0c350693fb71937d43c03",
+      "subject": "Implemented io-uring `Op<Statx>` and applied to `read_uring` and `fs::try_exists` (#8080)",
+      "body": "* implement Op<Statx> and use it to implement fs::try_exists\n\n* fix statx on unavailable platforms\n\n* complete using only io-uring operations for read_uring\n\n* Implemented io-uring::Op<Statx> and apply it accordingly to read_uring, try_exists\n\n* Added test for io uring statx operations. Checks for cancellations, shutdown, stating multiple files, ELOOP, ENAMETOOLONG, EACCES\n\n* Removed musl as supported platform for io_uring statx operations, as statx is supported on 1.25+ musl, and MSRV that uses 1.25 on all *-linux-musl platforms is 1.93\n\n* Removed pending checks for cancel_op_future since io_uring not available on Linux <5.1, removed stat permission denied test case since it doesn't work on Linux 4.19\n\n* Removed redundant cfg attributes on functions, added STATX_BTIME flag in statx operation, use assert pending in cancel ops\n\n* Uncommented stat_permission_denied test and make sure it doesn't run on platforms that don't support io_uring, removed unnecessary comments, and added TODO on symlink_metadata for when Metadata::from_statx is stabilized\n\n* Statx fd leak drop test added and added STATX_BTIME to file_metadata\n\n* Remove unnecessary utils function, refactored code in statx and statx fd leak test, and removed cfg_io_uring gates (localized the feature gate to the pertinent part of the code that uses it in read_uring)"
+    },
+    {
+      "commit": "Co-authored-by: Vrtgs <vrtgs@vrtgs.xyz>",
+      "subject": "",
+      "body": ""
+    },
+    {
+      "commit": "da044f27d7470f605dffea94fb2473da06ea2a76",
+      "subject": "net: disable some Miri tests for TCP socket (#8205)",
+      "body": "Co-authored-by: Alice Ryhl <aliceryhl@google.com>"
+    },
+    {
+      "commit": "ecb5125a6787b9d8eb818b1b00973bcd55ae77c0",
+      "subject": "runtime: document interaction with fork() (#8202)",
+      "body": ""
+    },
+    {
+      "commit": "bde89678532a8091d958268c0d36eac9362317d8",
+      "subject": "task: add `Stream` wrapper for `JoinSet` (#8189)",
+      "body": ""
+    },
+    {
+      "commit": "21e4a2a282b00c23498c9eedc372e87b00b5482f",
+      "subject": "taskdump: support taskdumps on s390x (#8192)",
+      "body": "Signed-off-by: satyamg1620 <Satyam.Gupta.3@ibm.com>"
+    },
+    {
+      "commit": "2e7930fe58cdf29671ea71a066ebc80b5006b97d",
+      "subject": "net: accept ConnectionReset in shutdown_after_tcp_reset test (#8196)",
+      "body": "The test asserts shutdown() returns Ok(()) after the peer resets the\nconnection (linger = 0). This holds on Linux and macOS, but on FreeBSD the\nkernel can finish processing the RST before shutdown() runs, so it returns\nConnectionReset and the test fails intermittently -- the oneshot only\nsynchronizes the application-level drop, not the kernel's RST processing.\n\nAccept Ok(()) or ConnectionReset for the post-reset shutdown, since both\nare valid for a connection the peer has already reset."
+    },
+    {
+      "commit": "67637b348a88ce3e035affe507bac17992851246",
+      "subject": "macros: clarify `tokio::main` expansion (#8193)",
+      "body": ""
+    },
+    {
+      "commit": "778e9d97d91cff2c3036cc5663936d479edb30cb",
+      "subject": "tests: fix typo in io_uring support functions docs (#8186)",
+      "body": ""
+    },
+    {
+      "commit": "71362aa609955d9dfce742f81773a5dc6b2a760c",
+      "subject": "net: add `SocketAddr` methods to Unix sockets (#8144)",
+      "body": ""
+    },
+    {
+      "commit": "2de86e557c576a74be7136e6fc2e21ccdf22da10",
+      "subject": "net: enable more Miri tests for TCP socket (#8180)",
+      "body": ""
+    },
+    {
+      "commit": "326bd2cc4484702260f2003697fbd1d4dcf9d20c",
+      "subject": "codec: use libc::memchr for LinesCodec delimiter scan (#8141)",
+      "body": ""
+    },
+    {
+      "commit": "32312ae0d6f0b1c6457f1323e3e7f568f448d0db",
+      "subject": "net: enable Miri tests for TCP socket (#8156)",
+      "body": ""
+    },
+    {
+      "commit": "37ced33efddccc6721588af6fbe095d34fa17d7d",
+      "subject": "time: ensure timers stay in the same runtime after `.reset()` (#8169)",
+      "body": ""
+    },
+    {
+      "commit": "923e72345c77aef4d11875d874ba67421b0412d3",
+      "subject": "time: move lazy-registration state into `Sleep` (#8132)",
+      "body": ""
+    },
+    {
+      "commit": "f619fc058793587ce8d004de8685326afcf977a2",
+      "subject": "docs: improve contributing guidelines (#8166)",
+      "body": ""
+    },
+    {
+      "commit": "82fe082ef14c2e2b2c1c29ed9873c2ca6e6109ee",
+      "subject": "fs: clarify `create_dir_all` succeeds if path exists (#8149)",
+      "body": ""
+    },
+    {
+      "commit": "1fe1b0e727dd1c48ad82173e35e125a3ba43b955",
+      "subject": "task: add `JoinMap::try_join_next` (#8099)",
+      "body": ""
+    },
+    {
+      "commit": "c6af672353b428fb525cc34a522737924f523a93",
+      "subject": "io: advance partially written buffers correctly in `write_all_vectored` (#8159)",
+      "body": ""
+    },
+    {
+      "commit": "2a05f364b79a7377bb21d6d5d14fd191b26e3ade",
+      "subject": "ci: set copyback to false for FreeBSD jobs (#8155)",
+      "body": ""
+    },
+    {
+      "commit": "c6d58ce7e7bf4a6e7e6efc1ffeb42daa3a627c17",
+      "subject": "ci: fix macOS runners (#8145)",
+      "body": ""
+    },
+    {
+      "commit": "de360cfc7eaf3cacd8fba7f6b8327e3cc98b5dc2",
+      "subject": "tokio-stream: fix duplicated word in changelog (#8143)",
+      "body": ""
+    },
+    {
+      "commit": "7d3b0ad192fa6da7f0301fb0db7472031a3d253a",
+      "subject": "sync: remove useless conversion in oneshot Receiver::poll (#8142)",
+      "body": ""
+    },
+    {
+      "commit": "0121120b6d91c438ca3a088a286ad78d293eea0b",
+      "subject": "taskdump: skip double wake on `Trace::capture`/`Trace::trace_with` (#8043)",
+      "body": ""
+    },
+    {
+      "commit": "bdcea6b2cd716b0a378626796bf5dc049608663d",
+      "subject": "fs: skip some io_uring tests on Kernels that don't support it (#8134)",
+      "body": ""
+    },
+    {
+      "commit": "ee0dc9092665a1f13df573dc5e5124999d8e9035",
+      "subject": "time: consolidate mutex locks on spurious poll (#8124)",
+      "body": ""
+    },
+    {
+      "commit": "78594a7497dcabd6850dbaf15dd3c5b4fe045d2c",
+      "subject": "Merge 'tokio-1.52.3' into 'master' (#8131)",
+      "body": ""
+    },
+    {
+      "commit": "d87569164fb61145e79e7ffe0b25783569cc8f93",
+      "subject": "chore: prepare Tokio v1.52.3 (#8130)",
+      "body": ""
+    },
+    {
+      "commit": "e1aebb031cb24bdb52289561343308f4a44a4d81",
+      "subject": "Merge 'tokio-1.51.3' into 'tokio-1.52.x' (#8129)",
+      "body": ""
+    },
+    {
+      "commit": "fd63094ee0d34b4f3f93f59507e91c65919a2d71",
+      "subject": "chore: prepare Tokio v1.51.3 (#8127)",
+      "body": ""
+    },
+    {
+      "commit": "067f229371b982412a3dc523cf58f95c3c8794ec",
+      "subject": "io: replace Vec method truncate(0) with clear (#8125)",
+      "body": "https://rust-lang.github.io/rust-clippy/master/index.html#manual_clear"
+    },
+    {
+      "commit": "8c600d0fd2cdebea4828fe9f699ced4dfd8aad3b",
+      "subject": "Merge 'tokio-1.47.5' into 'tokio-1.51.x' (#8123)",
+      "body": ""
+    },
+    {
+      "commit": "11bfc1345bbd5e901187e2b3702de10b0efbffdc",
+      "subject": "chore: prepare Tokio v1.47.5 (#8122)",
+      "body": ""
+    },
+    {
+      "commit": "f085b6211b8ebb6aba21f1f1f91e7b8b243aa815",
+      "subject": "sync: notify receivers in mpsc `OwnedPermit::release()` method (#8075)",
+      "body": ""
+    },
+    {
+      "commit": "30d25ccb8bc91ca811773ee243e71e31772275d2",
+      "subject": "sync: require that an `RwLock` has `max_readers != 0` (#8076)",
+      "body": ""
+    },
+    {
+      "commit": "9fccf5339d41c1f2f863f97b9133bc8a5a10bc28",
+      "subject": "sync: return `Empty` from `try_recv()` when mpsc is closed with outstanding permits (#8074)",
+      "body": ""
+    },
+    {
+      "commit": "ebf61b45b5184018f00bc666887ebccf3d4fe51b",
+      "subject": "sync: fix underflow in mpsc channel `len()` (#8062)",
+      "body": ""
+    },
+    {
+      "commit": "02ff0833e00adeb8cd451420f586f968deb70f78",
+      "subject": "sync: implement `PartialEq` and `Eq` for `CancellationToken` (#8110)",
+      "body": "Co-authored-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "e56ff72fe7574867c6c9bbd171afd8717897ea43",
+      "subject": "Merge 'tokio-1.52.2' into 'master' (#8117)",
+      "body": ""
+    },
+    {
+      "commit": "4abe9d732eb01f7b092a571c3dcc4fbd266f4067",
+      "subject": "chore: prepare Tokio v1.52.2 (#8115)",
+      "body": ""
+    },
+    {
+      "commit": "f82bcf3f45eb9d0dad9d7e45251adf67223f03b6",
+      "subject": "Merge 'tokio-1.51.2' into 'tokio-1.52.x' (#8114)",
+      "body": ""
+    },
+    {
+      "commit": "7db9bc41f18dffb6953f762a5f8e2f4ddb54d80d",
+      "subject": "test: revert \"remove `churn()` task from `lifo_stealable`\" (#8114)",
+      "body": "This reverts commit 6c03e03898d71eca976ee1ad8481cf112ae722ba."
+    },
+    {
+      "commit": "64834ec7018de92fadf00d053b565263913439c1",
+      "subject": "chore: prepare Tokio v1.51.2 (#8113)",
+      "body": ""
+    },
+    {
+      "commit": "967f5715a71d5d2600b71da8c4ab652c4e644a41",
+      "subject": "runtime: revert \"steal tasks from the LIFO slot\" (#8100)",
+      "body": "This reverts commit eeb55c733ba9a83c51d08b1629dca6a5ec0f4b2b."
+    },
+    {
+      "commit": "e77885a494d91baaaeeb9590436e555dea8dd1cb",
+      "subject": "net: implement UCred::pid on FreeBSD (#8086)",
+      "body": ""
+    },
+    {
+      "commit": "0926ab195aa6decebbde71ad080521051c02a8ee",
+      "subject": "time: defer waker clone on spurious poll (#8107)",
+      "body": ""
+    },
+    {
+      "commit": "50c23d300aef05e55b07b069a0455d5cab489cdd",
+      "subject": "runtime: avoid illegal state in `FastRand` (#8078)",
+      "body": "Co-authored-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "1cd6e65d76ba934d7545afe4b8ad93787b80c1e3",
+      "subject": "ci: small improvements for freeBSD jobs (#8102)",
+      "body": ""
+    },
+    {
+      "commit": "5ee26af3dbd606ce91adfcdfcd917ab73e6350f6",
+      "subject": "Merge tokio-1.52.x (for #8101) into master (#8106)",
+      "body": ""
+    },
+    {
+      "commit": "9271e3ed05928eafbeed9dd31d93aebaa49d2aad",
+      "subject": "Merge tokio-1.51.x (for #8101) into tokio-1.52.x (#8106)",
+      "body": ""
+    },
+    {
+      "commit": "cd1823f43efa95439b79a5a4507df65f83822004",
+      "subject": "Revert \"Pin stable to 1.94 for tokio-1.51.x\" (#8106)",
+      "body": "As we are merging tokio-1.51.x into tokio-1.52.x and then master, we\nshould not include this change.\n\nThis reverts commit bde3f20b0fd5de85a8946c4c5c623c039dcfa842."
+    },
+    {
+      "commit": "a97cf12ed9b90e3d5c1557f3afb47f43fcb84301",
+      "subject": "Merge tokio-1.47.x (commit 670a907c55c7) into tokio-1.51.x (#8105)",
+      "body": ""
+    },
+    {
+      "commit": "bde3f20b0fd5de85a8946c4c5c623c039dcfa842",
+      "subject": "Pin stable to 1.94 for tokio-1.51.x (#8105)",
+      "body": ""
+    },
+    {
+      "commit": "670a907c55c7f7b27da203208e65da60de6598b2",
+      "subject": "ci: fix CI on tokio-1.47.x (#8101)",
+      "body": "Co-authored-by: Mattia Pitossi <mattiapitossi@gmail.com>"
+    },
+    {
+      "commit": "5030b3005eae09141d6ee6725366007c767b9a97",
+      "subject": "tokio-stream: implement `FusedStream` for various stream adaptors (#8096)",
+      "body": "`MapWhile` is intentionally excluded because its current implementation\ndoes not track when the closure returns `None` early, making a correct\n`is_terminated()` impossible without a separate semantic change."
+    },
+    {
+      "commit": "26dee92b535d0a204531b6a04ee761f06c402d7e",
+      "subject": "chore: use functional slice building (#8097)",
+      "body": "Noticed some redundant procedural code."
+    },
+    {
+      "commit": "d3565a2923e24325fc5af3e597bd7a5b45437576",
+      "subject": "fs: rename Windows symlink dir test (#8098)",
+      "body": ""
+    },
+    {
+      "commit": "8f81e0814bd121683ebdfa21b494d1b77fb36403",
+      "subject": "time: avoid stack overflow in runtime constructor (#8093)",
+      "body": ""
+    },
+    {
+      "commit": "47cc31590fbc5662241355c86e331c42e6152775",
+      "subject": "tokio-stream: implement FusedStream for Fuse (#8090)",
+      "body": ""
+    },
+    {
+      "commit": "dc0f72816290074463a91e4fb479768b3fee453d",
+      "subject": "blocking: introduce a regression test for #8056 (#8068)",
+      "body": ""
+    },
+    {
+      "commit": "89713ad1eccdab8c21137a37f996f130d5a8bd31",
+      "subject": "miri tests: fstat is supported now (#8088)",
+      "body": ""
+    },
+    {
+      "commit": "6c03e03898d71eca976ee1ad8481cf112ae722ba",
+      "subject": "test: remove `churn()` task from `lifo_stealable` (#8070)",
+      "body": "Currently, the `rt_threaded::lifo_stealable` test I added in #7431\nspawns an additional task which sleeps on a 4ms timer in a loop. This\nensures that no worker remains permanently parked. This was added\nbecause it was necessary to stop the LIFO slot deadlock from occurring\nprior to changes in the logic for determining whether to notify another\nworker, which is what @Darksonn  was referring to in [this comment][1].\nRemoving the `churn()` test makes the test actually validate that\nanother worker is notified to steal the LIFO task, and that the changes\nfrom #7431 will *always* prevent a LIFO slot deadlock, regardless of the\nbehavior of other tasks on the runtime. See also [this comment][2] for\nfurther discussion.\n\n[1]: https://github.com/tokio-rs/tokio/pull/7431#discussion_r2184724657\n[2]: https://github.com/tokio-rs/tokio/pull/8069#issuecomment-4274244723"
+    },
+    {
+      "commit": "16bc4e2e28798e6fe77efdcbbf5f29172810d526",
+      "subject": "time: add `#[track_caller]` and panic docs to `timeout_at()` (#8077)",
+      "body": ""
+    },
+    {
+      "commit": "1afb39135073a56d8983fed0bde85b9f70a1ec3b",
+      "subject": "net: document pipe try_read*/try_write* readiness behavior (#8032)",
+      "body": "Add a Notes section to all five try_* methods on pipe::Sender and\npipe::Receiver explaining that the runtime's I/O driver only delivers\nreadiness events after control is yielded back to it, so calling\ntry_read/try_write before any .await returns WouldBlock even when the\noperation could otherwise succeed.\n\nThis is the same readiness model used by every other Tokio I/O type;\nthe pipe docs simply did not previously call it out. Refs #7625."
+    },
+    {
+      "commit": "Co-authored-by: Mattia Pitossi <mattiapitossi@gmail.com>",
+      "subject": "",
+      "body": ""
+    },
+    {
+      "commit": "b010b5ddafb316e5d540de1736f5f7bfde42ec39",
+      "subject": "test taskdump docs (#8064)",
+      "body": ""
+    },
+    {
+      "commit": "905c146aeda741ea2202f942a7c3a606dda13da5",
+      "subject": "chore: prepare to release v1.52.1 (#8059)",
+      "body": "# 1.52.1 (April 16th, 2026)\n\n## Fixed\n\n- runtime: revert [#7757] to fix [a regression][#8056] that causes\n  `spawn_blocking` to hang ([#8057])\n\n[#7757]: https://github.com/tokio-rs/tokio/pull/7757\n[#8056]: https://github.com/tokio-rs/tokio/pull/8056\n[#8057]: https://github.com/tokio-rs/tokio/pull/8057"
+    },
+    {
+      "commit": "56aaa43e91c4fbed88f0c2a5b65019ed9a0c3c61",
+      "subject": "rt: revert #7757 to fix regression in `spawn_blocking` (#8057)",
+      "body": "This reverts commit 1604bc335157be9a131e24cfde55cab3c90ebc92.\n\nUnfortunately, this commit introduced a regression that causes programs\nusing `spawn_blocking` to hang (see #8056). To fix the regression, we\nneed to undo this change and publish a v1.52.1 release as soon as\npossible.\n\nIn the future, we may wish to bring back a sharded queue for\n`spawn_blocking` tasks, either based on the implementation added in\n#7757 or a new one. However, since this is a substantial change to the\nruntime internals, I think such a change should probably be done as an\nunstable, opt-in `tokio::runtime::Builder` setting initially, so that we\ndon't regress existing users. I had hoped we could do this now, but\nunfortunately, the sharded queue implementation from #7757 is kind of\ntightly coupled with the rest of the `spawn_blocking` machinery and\ncannot be easily swapped out"
+    },
+    {
+      "commit": "and the hang still occurs with\n`NUM_SHARDS` set to 1, so there isn't an easy way to turn it on and off.\nTherefore, in the interest of getting a fix out ASAP, this is just a\nsimple revert.\n\nFixes #8056",
+      "subject": "",
+      "body": ""
+    },
+    {
+      "commit": "57ff47ab589bfb4dab6766de78655ffef4fb250b",
+      "subject": "ci: update `trybuild` to expect output from rustc 1.95.0 (#8058)",
+      "body": ""
+    },
+    {
+      "commit": "812de3e134888d1d9e7832e4b789d51f6fd2f749",
+      "subject": "ci: bump taiki-e/cache-cargo-install-action from 1 to 3 (#8053)",
+      "body": "Bumps [taiki-e/cache-cargo-install-action](https://github.com/taiki-e/cache-cargo-install-action) from 1 to 3.\n- [Release notes](https://github.com/taiki-e/cache-cargo-install-action/releases)\n- [Changelog](https://github.com/taiki-e/cache-cargo-install-action/blob/main/CHANGELOG.md)\n- [Commits](https://github.com/taiki-e/cache-cargo-install-action/compare/v1...v3)"
+    },
+    {
+      "commit": "updated-dependencies:\n- dependency-name: taiki-e/cache-cargo-install-action\n  dependency-version: '3'\n  dependency-type: direct:production\n  update-type: version-update:semver-major\n...\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+      "subject": "",
+      "body": ""
+    },
+    {
+      "commit": "ba82e73c7b804324c82b6fea6966ca12f55c3826",
+      "subject": "ci: use Dependabot to keep github actions up to date (#8052)",
+      "body": ""
+    },
+    {
+      "commit": "2e85f9ddf8b47197fa6299cc295f4319fec68e53",
+      "subject": "ci: replace cirrus-ci with freebsd-vm (#8041)",
+      "body": ""
+    },
+    {
+      "commit": "a7e1cd8ff8a2012cce500fd7e6ae73400531f46d",
+      "subject": "ci: update GitHub Actions workflows to use latest tool versions (#8047)",
+      "body": ""
+    },
+    {
+      "commit": "5f7be0ac42cb3e1b739da1562f98a797cd55a606",
+      "subject": "chore: perpare 1.52.0 (#8045)",
+      "body": "# 1.52.0 (April 14th, 2026)\n\n## Added\n\n- io: `AioSource::register_borrowed` for I/O safety support ([#7992])\n- net: add `try_io` function to `unix::pipe` sender and receiver types\n  ([#8030])\n\n## Added (unstable)\n\n- runtime: `Builder::enable_eager_driver_handoff` setting enable eager\n  hand off of the I/O and time drivers before polling tasks ([#8010])\n- taskdump: add `trace_with()` for customized task dumps ([#8025])\n- taskdump: allow `impl FnMut()` in `trace_with` instead of just `fn()`\n  ([#8040])\n- fs: support `io_uring` in `AsyncRead` for `File` ([#7907])\n\n## Changed\n\n- runtime: improve `spawn_blocking` scalability with sharded queue\n  ([#7757])\n- runtime: use `compare_exchange_weak()` in worker queue ([#8028])\n\n## Fixed\n\n- runtime: overflow second half of tasks when local queue is filled\n  instead of first half ([#8029])\n\n## Documented\n\n- docs: fix typo in `oneshot::Sender::send` docs ([#8026])\n- docs: hide #[tokio::main] attribute in the docs of `sync::watch`\n  ([#8035])\n- net: add docs on `ConnectionRefused` errors with UDP sockets ([#7870])\n\n[#7757]: https://github.com/tokio-rs/tokio/pull/7757\n[#7870]: https://github.com/tokio-rs/tokio/pull/7870\n[#7907]: https://github.com/tokio-rs/tokio/pull/7907\n[#7992]: https://github.com/tokio-rs/tokio/pull/7992\n[#8010]: https://github.com/tokio-rs/tokio/pull/8010\n[#8025]: https://github.com/tokio-rs/tokio/pull/8025\n[#8026]: https://github.com/tokio-rs/tokio/pull/8026\n[#8028]: https://github.com/tokio-rs/tokio/pull/8028\n[#8029]: https://github.com/tokio-rs/tokio/pull/8029\n[#8030]: https://github.com/tokio-rs/tokio/pull/8030\n[#8035]: https://github.com/tokio-rs/tokio/pull/8035\n[#8040]: https://github.com/tokio-rs/tokio/pull/8040"
+    },
+    {
+      "commit": "36d12d2686a64b9146c674e02e3cf81d8f87163d",
+      "subject": "taskdump: allow impl FnMut() in taskdumps instead of just fn() (#8040)",
+      "body": ""
+    },
+    {
+      "commit": "f943312865b9d5007f25d2fd5bd8efa3f89d1541",
+      "subject": "fs: support io-uring in `AsyncRead` for `File` (#7907)",
+      "body": ""
+    },
+    {
+      "commit": "5db10f538b683fe88d699dfd11be31d193db011c",
+      "subject": "net: add 'try_io' function to 'unix::pipe' sender and receiver types (#8030)",
+      "body": ""
+    },
+    {
+      "commit": "bbdba7101de6ce5329d84021ce669f185cc430b3",
+      "subject": "taskdump: add `trace_with` for customized task dumps (#8025)",
+      "body": "provided trace function."
+    },
+    {
+      "commit": "7cfce54386982264f8c9d5db3f5a96caf3b99cbe",
+      "subject": "ci: update FreeBSD image to 14.4 (#8038)",
+      "body": ""
+    },
+    {
+      "commit": "81370e6202859dee53c7a42053ec0ff4427910cf",
+      "subject": "net: add docs on `ConnectionRefused` errors with udp sockets (#7870)",
+      "body": ""
+    },
+    {
+      "commit": "203af021261ab7399c18ab12f22c24f1934c7d42",
+      "subject": "runtime: overflow second half of tasks when local queue is filled instead of first half (#8029)",
+      "body": ""
+    },
+    {
+      "commit": "de230926dc6ae08650688fe4cf2fd0a913392501",
+      "subject": "net: temporarily disable `tcp_stream` `try_read_buf` test on WASI (#8036)",
+      "body": "This test is flaky on WASI until\nhttps://github.com/bytecodealliance/wasmtime/issues/13040 has been addressed.\n\nSee https://github.com/tokio-rs/tokio/issues/8034 for additional details."
+    },
+    {
+      "commit": "432ec3f2b2a21b668c1d5c5703914ac5ecbe6d8a",
+      "subject": "sync: hide `#[tokio::main]` attribute in the docs of `sync::watch` (#8035)",
+      "body": ""
+    },
+    {
+      "commit": "1604bc335157be9a131e24cfde55cab3c90ebc92",
+      "subject": "rt: improve `spawn_blocking` scalability with sharded queue (#7757)",
+      "body": ""
+    },
+    {
+      "commit": "4c7d8b2a14de81ace4d8e61cfaeb8eca26f6f68c",
+      "subject": "runtime: use `compare_exchange_weak()` in worker queue (#8028)",
+      "body": ""
+    },
+    {
+      "commit": "d7db722bb47d29b81c9b98992813115dfaed491d",
+      "subject": "io: AioSource now employs IO Safety (#7992)",
+      "body": ""
+    },
+    {
+      "commit": "fccc28f1d0041fc5bdd798dc2645dc3b5fc71ef1",
+      "subject": "runtime: optional eager I/O driver/timer handoff when polling tasks (#8010)",
+      "body": ""
+    },
+    {
+      "commit": "927df0e9d936ef6995a6b9abedabc032b8ef655c",
+      "subject": "sync: fix typo in oneshot send doc (#8026)",
+      "body": ""
+    },
+    {
+      "commit": "98df02d7a4a638b3bc76a01f41966dc83c275103",
+      "subject": "chore: prepare Tokio v1.51.1 (#8023)",
+      "body": ""
+    },
+    {
+      "commit": "3ea11e2a5fb4139ca21b441044d98994a2b126c5",
+      "subject": "sync: fix semaphore reopens after forget (#8021)",
+      "body": ""
+    },
+    {
+      "commit": "c79121391db8f8d36d4213feeb25381caee110c7",
+      "subject": "rt: do not leak fd when cancelling io_uring open operation (#7983)",
+      "body": ""
+    },
+    {
+      "commit": "ad8c59add6a1988d8c327fb3358beeeae3bbb5cd",
+      "subject": "net: surface errors from `SO_ERROR` on `recv` for UDP sockets on Linux (#8001)",
+      "body": ""
+    },
+    {
+      "commit": "654d38b13228a13498e793d8bb4f6ba50fd1016a",
+      "subject": "metrics: fix `worker_local_schedule_count` test (#8008)",
+      "body": ""
+    },
+    {
+      "commit": "857ba8093327c5ddf9e00dc6055c6f315035f854",
+      "subject": "docs: improve contributing docs on how to specify crates dependency versions (#8009)",
+      "body": ""
+    },
+    {
+      "commit": "95b9342da7009d068fea6c5d532e04934d46980c",
+      "subject": "chore: remove path deps for tokio-macros 2.7.0 (#8007)",
+      "body": ""
+    },
+    {
+      "commit": "0af06b7bab12c58161b1d0ae79bdf4452305d42f",
+      "subject": "chore: prepare Tokio v1.51.0 (#8005)",
+      "body": ""
+    },
+    {
+      "commit": "01a7f1dfabc93293743701074752ff0d8e787595",
+      "subject": "chore: prepare tokio-macros v2.7.0 (#8004)",
+      "body": ""
+    },
+    {
+      "commit": "eeb55c733ba9a83c51d08b1629dca6a5ec0f4b2b",
+      "subject": "runtime: steal tasks from the LIFO slot (#7431)",
+      "body": ""
+    },
+    {
+      "commit": "1fc450aefba4b05cdff9b7825ca5e39cccb3780e",
+      "subject": "runtime: stabilize `LocalRuntime` (#7557)",
+      "body": ""
+    },
+    {
+      "commit": "324218f9bbdc26e4bb527d036613826824f3078b",
+      "subject": "Merge tag 'tokio-1.47.4' (#8003)",
+      "body": ""
+    },
+    {
+      "commit": "aa65d0d0b8ea6eec80985b9d231390f137493071",
+      "subject": "chore: prepare Tokio v1.47.4 (#8002)",
+      "body": ""
+    },
+    {
+      "commit": "bf18ed452d6aae438e84ae008a01a74776abdc19",
+      "subject": "sync: fix panic in `Chan::recv_many` when called with non-empty vector on closed channel (#7991)",
+      "body": "`Chan::recv_many` intends to assert that no slots\nhave been consumed when exiting with `Ready` via\nthe `rx_closed` code path.\n\nInstead of asserting no items were added to the\nbuffer, it asserted buffer emptiness, incorrectly\nmaking assumptions about the provided buffer.\n\nWhen `recv_many` was called on an empty channel\nwith idle semaphore after the receiver was closed,\nthe method would panic.\n\nThe branch coverage had been previously missing.\n\nThis changeset corrects the assertion\nand adds tests covering the code path.\n\nFixes #7990."
+    },
+    {
+      "commit": "43134f1e5784993eb4fb3863933d74ac9e28f598",
+      "subject": "wasm: add wasm32-wasip2 networking support (#7933)",
+      "body": "Motivation\n\nThis adds networking support for the `wasm32-wasip2` target platform, which\nincludes more extensive support for sockets than `wasm32-wasip1`.\n\nSolution\n\nThe bulk of the changes are in https://github.com/tokio-rs/mio/pull/1931.  This\npatch mainly tweaks a few `cfg` directives to indicate `wasm32-wasip2`'s\nadditional capabilities.\n\nNote that this is a draft PR until until\nhttps://github.com/tokio-rs/mio/pull/1931 and\nhttps://github.com/rust-lang/socket2/pull/639 have been include in stable\nreleases of their respective projects.\n\nAlso note that I've added a `wasm32-wasip2` target to CI and triaged each test\nwhich was previously disabled for WASI into one of three categories:\n\n- Disabled on both WASIp1 and p2 due to not-yet-supported features such as multithreading\n- Disabled on p1 but enabled on p2\n- Disabled on p1 and _temporarily_ disabled on p2 due to `wasi-libc` bugfixes which have been merged but not yet included in a Rust release.  I'll open an issue to re-enable them when the fixes land in Rust.\n\nFuture Work\n\nIn the future, we could consider adding support for `tokio::net::lookup_host`.\nWASIp2 natively supports asynchronous DNS lookups and is single threaded,\nwhereas Tokio currently assumes DNS lookups are blocking and require\nmultithreading to emulate async lookups.  A WASIp2-specific implementation could\ndo the lookup directly without multithreading.\n\nWASIp2 also supports single-threaded, asynchronous file I/O, timers, etc.  We\ncould either support those directly or wait for WASIp3's multithreading support,\nin which case most of `tokio::fs` (as well as `tokio::net::lookup_host`, etc.)\n_should_ work unchanged via `wasi-libc` and worker threads.\n\nCurrently, building for WASIp2 requires RUSTFLAGS=\"--cfg tokio_unstable\"`.  Once\nwe have a solid maintenance plan, we can remove that requirement."
+    },
+    {
+      "commit": "b4c3246d330379430937bdbb5e1b0c37282ae23e",
+      "subject": "macros: improve overall macro hygiene (#7997)",
+      "body": "Multiple macro expansions were previously assumming the existence of\nsome standard library symbols to both be in-scope and referring to the\nright symbol, and not only having the same identifier.\n\nThis has now been refactored into using reexports from the `support`\nmodule under the `macros` module. Some other macro invocations were also\nusing absolute standard library paths instead of calling into the afore\nmentioned module through the special `$crate` macro. This has been\nchanged, thus also reexporting some other items in `support`."
+    },
+    {
+      "commit": "7947fa4bd79d7345aa7e6b189fc1fbb6983a4351",
+      "subject": "rt: add runtime name (#7924)",
+      "body": ""
+    },
+    {
+      "commit": "9f132172dbb00b1f6b6bda64bb9b194382079499",
+      "subject": "sync: fix `notify_waiters` priority in `Notify` (#7996)",
+      "body": "Previously, if a `notify_waiters()` was followed by a `notify_one()`,\nan unpolled `Notified` future created before the `notify_waiters()`\ncall would consume the `NOTIFIED` permit created by the\n`notify_one()` call.\n\nThis commit fixes this by verifying the `notify_waiters_calls` count\nbefore optimistically attempting to acquire the `NOTIFIED` permit. If\nthe count indicates a `notify_waiters()` call has already happened, the\nfuture transitions directly to `State::Done` and leaves the permit\nintact for other waiters.\n\nFixes: #7965"
+    },
+    {
+      "commit": "6752f50154025a1aa2c231b643cdb78bb4c3892f",
+      "subject": "examples: add graceful shutdown example (#7962)",
+      "body": ""
+    },
+    {
+      "commit": "6c72168a93f9598c1e25915f188cf6492d012cfc",
+      "subject": "ci: remove Rust 1.94.0 workarounds (#7987)",
+      "body": ""
+    },
+    {
+      "commit": "ee4de818065a97c0be0d6bfc18fb36725349aef8",
+      "subject": "net: use null get_peer_cred on Hurd (#7989)",
+      "body": ""
+    },
+    {
+      "commit": "a8435c0fc8612bbdf38d3ad8b2ba96d5dbc848d9",
+      "subject": "examples: add FD table pre-warming example (#7978)",
+      "body": ""
+    },
+    {
+      "commit": "467d614267ce422206d8acbccf957eb49a597467",
+      "subject": "bench: use is_multiple_of instead of manual modulo check (#7984)",
+      "body": "Addresses clippy::manual_is_multiple_of warning on latest stable."
+    },
+    {
+      "commit": "66c786540ec0bc60f506945dafd7cc7cad6b01a0",
+      "subject": "chore: Do not show \"Available on non-loom only.\" doc label (#7977)",
+      "body": "* chore: Do not show \"Available on non-loom only.\" doc label\n\nCloses #7976\n\nUses the unstable #[doc(cfg()]. https://github.com/rust-lang/rust/issues/43781\n\n* Use build.rs to detect nightly builds\n\n* Use `docsrs` instead of `nightly`. Drop build.rs\n\n* Use doc(auto_cfg(hide(config_name)))\n\n* Use same nightly on CirrusCI (FreeBSD) as on Github Actions CI"
+    },
+    {
+      "commit": "dd1196d36930bf23d5ba32402f5dadef861546fa",
+      "subject": "ci: patch workspace members to disambiguate `--package` (#7967)",
+      "body": ""
+    },
+    {
+      "commit": "2db0070eb8ab1c543f5dc93b3392645d00ce43cc",
+      "subject": "stream: impl `FromStream` for `std::collections::*` (#7966)",
+      "body": ""
+    },
+    {
+      "commit": "26de3187e759e06c25432413643ea57d8a79503c",
+      "subject": "runtime: add `tokio::runtime::worker_index()` (#7921)",
+      "body": ""
+    },
+    {
+      "commit": "d3c7f56c10a43c220e6feb12c9796f36eaffda16",
+      "subject": "ci: workaround for OpenOptionsExt in 1.94.0 (#7968)",
+      "body": ""
+    },
+    {
+      "commit": "ee04abe7970b769439e2fecd4b1dd8790e4234e1",
+      "subject": "bench: add remote_spawn benchmark for inject queue contention (#7944)",
+      "body": ""
+    },
+    {
+      "commit": "aa1e7e2b9d24a0b5ececc07d57f2d9668938ea28",
+      "subject": "stream: impl `FromStream` for `BTreeSet` (#7954)",
+      "body": ""
+    },
+    {
+      "commit": "961757f5483e394ec3c99a4c2ab5a6e705a0b740",
+      "subject": "ci: freeze rustc on 1.93.1 (#7961)",
+      "body": ""
+    },
+    {
+      "commit": "e67cd87f71304e6b4cc94ce0c1656797466e56f3",
+      "subject": "chore: link to tokioconf.com (#7953)",
+      "body": ""
+    },
+    {
+      "commit": "a502d1b5c8f0fe0de49c4a5da5fc4faaa31aba7d",
+      "subject": "loom: remove `StaticAtomicU64` (#7902)",
+      "body": ""
+    },
+    {
+      "commit": "0273e45ead199dac7725faee1e3dc35a9c8753ab",
+      "subject": "chore: prepare Tokio v1.50.0 (#7934)",
+      "body": ""
+    },
+    {
+      "commit": "e3ee4e58dc9bb7accf26dfd51b0a2146922b5269",
+      "subject": "chore: prepare tokio-macros v2.6.1 (#7943)",
+      "body": ""
+    },
+    {
+      "commit": "8c980ea75a0f8dd2799403777db700c2e8f4cda4",
+      "subject": "io: add `write_all_vectored` to `tokio-util` (#7768)",
+      "body": ""
+    },
+    {
+      "commit": "e35fd6d6b7d9a8ba37ee621835ef91372c2565cb",
+      "subject": "ci: fix patch during clippy step (#7935)",
+      "body": "* fix the ci issue\n\n* fix readme\n\n* fix ci"
+    },
+    {
+      "commit": "03fe44c10302fdb55c29dbe5b08d4f8769c80272",
+      "subject": "runtime: fix `event_interval` doc (#7932)",
+      "body": ""
+    },
+    {
+      "commit": "d18e5dfbb0cdc28725bebb28cde80a6c11ee32bc",
+      "subject": "io: fix race in `Mock::poll_write` (#7882)",
+      "body": ""
+    },
+    {
+      "commit": "f21f2693f02aec9a876ac2bd21566c85e15b682e",
+      "subject": "runtime: fix race condition during the blocking pool shutdown (#7922)",
+      "body": ""
+    },
+    {
+      "commit": "d81e8f0acbdd7d866bce4f733b3545fd834c7840",
+      "subject": "macros: remove (most) local `use` declarations in `tokio::select!` (#7929)",
+      "body": ""
+    },
+    {
+      "commit": "25e7f2641ef2555d688c267059431a2802805f1d",
+      "subject": "rt: fix missing quotation in docs (#7925)",
+      "body": ""
+    },
+    {
+      "commit": "e1a91ef114a301b542d810abab9956f2868861b9",
+      "subject": "util: fix typo in docs (#7926)",
+      "body": ""
+    },
+    {
+      "commit": "1b11840f539ced93855df362eb51149ba08903a0",
+      "subject": "task: clarify when to use `spawn_blocking` vs dedicated threads (#7923)",
+      "body": ""
+    },
+    {
+      "commit": "09f92b5aedec6085863f570fe882915d0c2740f1",
+      "subject": "sync: clarify that recv returns None once closed and no more messages (#7920)",
+      "body": "The previous documentation stated:\n  'As such, Receiver::poll returns Ok(Ready(None))'\n\nThis was misleading: when all Sender handles are dropped, recv does NOT\nimmediately return None. Buffered messages already in the channel can\nstill be received. Only after all senders are dropped AND the channel\nhas been fully drained does recv return None.\n\nAlso update the method reference from the internal Receiver::poll to the\npublic API: Receiver::recv and Receiver::poll_recv.\n\nCloses #6053"
+    },
+    {
+      "commit": "e65040f061008ca5a94d21721aa8b544c078c606",
+      "subject": "sync: clarify RwLock fairness documentation (#7919)",
+      "body": "The previous wording 'if a task that wishes to acquire the write lock is\nat the head of the queue, read locks will not be given out' was\nmisleading: it implied that readers are only blocked when the writer is\nfirst in the queue. In reality, due to the FIFO ordering, any write\nrequest queued *before* a read request will block that reader.\n\nReplace with a more accurate description: 'a read lock will not be given\nout until all write lock requests that were queued before it have been\nacquired and released.'\n\nCloses #6901"
+    },
+    {
+      "commit": "c23735d43be36d31911dd2c832f36e5e6a6078a1",
+      "subject": "runtime: fix TOCTOU issue when decreasing `num_idle_threads` (#7918)",
+      "body": ""
+    },
+    {
+      "commit": "d83921bc5181010be72704d1fe8fb9b6f10cb7e8",
+      "subject": "runtime: fix double increment of `num_idle_threads` on shutdown (#7910)",
+      "body": ""
+    },
+    {
+      "commit": "96f64f4ee2afc0a6db76390134dd183d59ca5351",
+      "subject": "codec: fix is_readable should be buffer empty or not (#7912)",
+      "body": ""
+    },
+    {
+      "commit": "00d10c22f831f7d4508444f17a84e19319eaf36b",
+      "subject": "task: fix two typos (#7913)",
+      "body": ""
+    },
+    {
+      "commit": "a25d95a8c4f443886e55b24c97d4bbee1d87283d",
+      "subject": "io: clarify the behavior of `AsyncWriteExt::shutdown()` (#7908)",
+      "body": ""
+    },
+    {
+      "commit": "9e7e1ef7ad30ad84f54a047ecd65b78e5973a9c4",
+      "subject": "io: Explain how to flush stdout/stderr (#7904)",
+      "body": ""
+    },
+    {
+      "commit": "5bcd7c1d09e8d8a89ebcb96069cac1c1fdd76877",
+      "subject": "task: fix task module feature flags in docs (#7891)",
+      "body": ""
+    },
+    {
+      "commit": "2486d497786fa0b17fab03a79c154790c3bdeaed",
+      "subject": "tests: skip issue_7144 if strace is missing (#7903)",
+      "body": ""
+    },
+    {
+      "commit": "9dacb1c53e341b1183a89800d46ee33c6eabf7ad",
+      "subject": "tokio: replace some futures with `poll_fn` (#7895)",
+      "body": ""
+    },
+    {
+      "commit": "8167f871378246ab2108d1ea144257cf95934e4f",
+      "subject": "task: add `AbortOnDrop` (#7855)",
+      "body": ""
+    },
+    {
+      "commit": "159f70bc552a5f733a54ae77e6663403baa16eaf",
+      "subject": "ci: fix ambiguity issue during tokio releases (#7848)",
+      "body": ""
+    },
+    {
+      "commit": "d1e4db1018f9124d66d0cc9673b97606ba90bf86",
+      "subject": "sync: drop rx waker when oneshot receiver is dropped (#7886)",
+      "body": ""
+    },
+    {
+      "commit": "530af3f33131da706e62f7cb569516afef685c4e",
+      "subject": "runtime: correct the default thread name in docs (#7896)",
+      "body": ""
+    },
+    {
+      "commit": "d89e998922724de80996802721e167d9ca24f4d7",
+      "subject": "net: fix GET_BUF_SIZE constant for `target_os = \"android\"` (#7889)",
+      "body": "We recently tried to upgrade Android to the newest tokio, but tests that\nuse these constants fail, since Android is provided the non-Linux\nconstants."
+    },
+    {
+      "commit": "306ed1c30b67d78c8158e601acfda3b8650008dd",
+      "subject": "stream: bump minimum tokio version to 1.38 (#7887)",
+      "body": "tokio-stream 0.1.18 added `Stream::size_hint` for\n`ReceiverStream` and `UnboundedReceiverStream` (PR #7492),\nwhich calls `Receiver::is_closed()` and `Receiver::len()`\n(added in tokio 1.37.0) and `Receiver::capacity()` and\n`Receiver::max_capacity()` (added in tokio 1.38.0).\n\nThe declared minimum of tokio 1.15.0 is no longer sufficient,\ncausing compilation failures when resolved via\n`-Z direct-minimal-versions`.\n\nRefs: #7492"
+    },
+    {
+      "commit": "7e952697e835922aba8885df88f3ec886afeabbe",
+      "subject": "signal: specialize windows `Registry` (#7885)",
+      "body": ""
+    },
+    {
+      "commit": "c0943f99f091bbcc57a93c4533de2e75a9227f90",
+      "subject": "rt: clarify the documentation of `Runtime::spawn` (#7803)",
+      "body": ""
+    },
+    {
+      "commit": "187a2146a7692440cf6a83efb5fbcc886b66a6df",
+      "subject": "runtime: shorten default thread name to fit in Linux limit (#7880)",
+      "body": "Linux thread names are truncated at 15 characters.\nCurrently, Tokio threads show up as \"tokio-runtime-w\", whereas\nshortening \"runtime\" to \"rt\" would make the thread name perfectly fit\nin the 15 character limit."
+    },
+    {
+      "commit": "f61374f931a55357dcc20a9d9b55cc0c509f90f3",
+      "subject": "io: fix incorrect and confusing AsyncWrite documentation (#7875)",
+      "body": ""
+    },
+    {
+      "commit": "0d6c7af3e43457350bdc03a6dbcafa276fab7352",
+      "subject": "runtime: wake deferred tasks before entering `block_in_place` (#7879)",
+      "body": ""
+    },
+    {
+      "commit": "9dc9b53ae164cdba6f14146cfe32d16fcdc562a0",
+      "subject": "io: implement vectored writes for `write_buf` (#7871)",
+      "body": ""
+    },
+    {
+      "commit": "c3b31ba2ab78a901502ff4ac22ec3f2896ab8805",
+      "subject": "signal: guarantee that listeners never return `None` (#7869)",
+      "body": ""
+    },
+    {
+      "commit": "b68ea4156a7d0d63ba3351fb0299ea958f16e7fe",
+      "subject": "io: hardcode platform list for `poll_write` (#7872)",
+      "body": ""
+    },
+    {
+      "commit": "8f6d0864c3158546c343e3fa34872ed584d46fd4",
+      "subject": "macros: improve error message for return type mismatch in #[tokio::main] (#7856)",
+      "body": ""
+    },
+    {
+      "commit": "63abec05259b081eafc6cdd066dca1a808c3762e",
+      "subject": "macros: use `call_site` hygiene to avoid unused qualification (#7866)",
+      "body": ""
+    },
+    {
+      "commit": "8fd44d9bdc5af48c6d76aa4f3fddd45c18d0da43",
+      "subject": "docs: fix link to tokio::select! (#7867)",
+      "body": ""
+    },
+    {
+      "commit": "450fa2d09d63b18bf121b5edf453dee265ba5a00",
+      "subject": "fs: add tests for when `fs::hard_link` fails (#7863)",
+      "body": ""
+    },
+    {
+      "commit": "8cfa309126066597909fe42ec159d12d462dbcef",
+      "subject": "time: add docs about auto-advance and when to use sleep (#7858)",
+      "body": ""
+    },
+    {
+      "commit": "bf185b61ffe579e1ada0e920847692f7480489fa",
+      "subject": "docs: fix broken links of `select!` (#7860)",
+      "body": "Co-authored-by: Martin Grigorov <martin-g@users.noreply.github.com>"
+    },
+    {
+      "commit": "27d1383581192f74994569aeb08894f32008765a",
+      "subject": "deps: bump `tokio` to `1.47.0` (#7862)",
+      "body": ""
+    },
+    {
+      "commit": "11f9d4db73d8a80e2f29ace655b525a28ca99238",
+      "subject": "macros: add test for special return types (#7857)",
+      "body": ""
+    },
+    {
+      "commit": "1280cf81de55aef040b65b202dddb09713fd4f2b",
+      "subject": "io: always cleanup `AsyncFd` registration list on deregister (#7773)",
+      "body": ""
+    },
+    {
+      "commit": "67682ac2e87e27b4791e33467a7c6e773e0c2179",
+      "subject": "io: add optimizer hint that `memchr` returns in-bounds pointer (#7792)",
+      "body": ""
+    },
+    {
+      "commit": "b88c02c55e12bb51a5efae591697998c1942d1aa",
+      "subject": "time: implement `FusedStream` for `IntervalStream` (#7854)",
+      "body": ""
+    },
+    {
+      "commit": "240cc44da87ac30188e946ed1003b0e67f64aad8",
+      "subject": "signal: remember the result of `SetConsoleCtrlHandler` (#7833)",
+      "body": "The unix implementation remembers whether it failed or not, so the\nwindows implementation should do so as well. This PR also replaces the\n`(Once, AtomicState)` pair with `OnceLock` and tries to remember the\noriginal errno value."
+    },
+    {
+      "commit": "7ed6da6733199fe4d08b9694fce646dac5944e70",
+      "subject": "runtime: add comments to `schedule_option_task_without_yield` (#7851)",
+      "body": ""
+    },
+    {
+      "commit": "7a2135f426ab560a9efb320620f80e1935c43d31",
+      "subject": "runtime: avoid lock acquisition after uring init (#7850)",
+      "body": ""
+    },
+    {
+      "commit": "0913cad381ead40ee194e881366bc136c8d8546c",
+      "subject": "runtime: revert \"avoid lock acquisition after uring init\" (#7849)",
+      "body": "This reverts commit ff9681b3c62d63ca2703976d4767f29442bc87f2."
+    },
+    {
+      "commit": "ff9681b3c62d63ca2703976d4767f29442bc87f2",
+      "subject": "runtime: avoid lock acquisition after uring init (#7843)",
+      "body": ""
+    },
+    {
+      "commit": "f1cb007a281d49104e7b0e29d4ba5c6e7a06af11",
+      "subject": "net: add `TcpStream::set_zero_linger` (#7837)",
+      "body": ""
+    },
+    {
+      "commit": "2d4853ea16082d42be421001c1511eded1481b53",
+      "subject": "examples: use `select!` instead of `join!` in connect_(tcp|udp) examples (#7842)",
+      "body": ""
+    },
+    {
+      "commit": "d65165f7b563d75db110f8ca26b5a4ae749c59e7",
+      "subject": "rt: make `is_rt_shutdown_err` method public (#7771)",
+      "body": ""
+    },
+    {
+      "commit": "71a1a3da7ad0af2200e08d75996a97f50bdf49db",
+      "subject": "tokio: update outdated unstable features section (#7839)",
+      "body": ""
+    },
+    {
+      "commit": "df73fa21884f65ac4f5556ec72814cefed94897f",
+      "subject": "runtime: panic when `event_interval` is set to 0 (#7838)",
+      "body": ""
+    },
+    {
+      "commit": "09ad5367b8de39ae2532c7c0efe4136167be015d",
+      "subject": "runtime: avoid redundant unpark in current_thread scheduler (#7834)",
+      "body": ""
+    },
+    {
+      "commit": "934f68d91c90777235e119f4b42f3de660c45bd0",
+      "subject": "runtime: don't park in `current_thread` if `before_park` defers waker (#7835)",
+      "body": ""
+    },
+    {
+      "commit": "41d1877689f8669902b003a6affce60bdfeb3025",
+      "subject": "chore: prepare tokio-test 0.4.5 (#7831)",
+      "body": ""
+    },
+    {
+      "commit": "60b083b630ed279d579368e513406d735d739511",
+      "subject": "chore: prepare tokio-stream 0.1.18 (#7830)",
+      "body": ""
+    },
+    {
+      "commit": "9cc02cc88d083113cd9889a74b382e39e430e180",
+      "subject": "chore: prepare tokio-util 0.7.18 (#7829)",
+      "body": ""
+    },
+    {
+      "commit": "d2799d791b10388e60a2a5fe5e4a33b3336e1465",
+      "subject": "task: improve the docs of `Builder::spawn_local` (#7828)",
+      "body": ""
+    },
+    {
+      "commit": "4d4870f291b69e2426232440e03c9e66fe77b525",
+      "subject": "task: doc that task drops before JoinHandle completion (#7825)",
+      "body": ""
+    },
+    {
+      "commit": "fdb150901afb0456037c6232eab8ce80116ccd02",
+      "subject": "fs: check for io-uring opcode support (#7815)",
+      "body": ""
+    },
+    {
+      "commit": "426a56278017c30e7da7b4c9365a2610f4695f76",
+      "subject": "rt: remove `allow(dead_code)` after `JoinSet` stabilization (#7826)",
+      "body": ""
+    },
+    {
+      "commit": "e3b89bbefa7564e2eba2fb9f849ef7bf87d60fad",
+      "subject": "chore: prepare Tokio v1.49.0 (#7824)",
+      "body": ""
+    },
+    {
+      "commit": "4f577b84e939c8d427d79fdc73919842d8735de2",
+      "subject": "Merge 'tokio-1.47.3' into 'master'",
+      "body": ""
+    },
+    {
+      "commit": "f320197693ee09e28f1fca0e55418081adcdfc25",
+      "subject": "chore: prepare Tokio v1.47.3 (#7823)",
+      "body": ""
+    },
+    {
+      "commit": "ea6b144cd1042d6841a7830b18f2df77c3db904b",
+      "subject": "ci: freeze rustc on nightly-2025-01-25 in `netlify.toml` (#7652)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "264e703296bccd6783a438815d91055d4517099b",
+      "subject": "Merge `tokio-1.43.4` into `tokio-1.47.x` (#7822)",
+      "body": ""
+    },
+    {
+      "commit": "dfb0f00838ca1986dee04a54a6299d35b0a4072c",
+      "subject": "chore: prepare Tokio v1.43.4 (#7821)",
+      "body": ""
+    },
+    {
+      "commit": "4a91f197b03dc335010fffcf0e0c14e1f4011b42",
+      "subject": "ci: fix wasm32-wasip1 tests (#7788)",
+      "body": "(cherry picked from commit 1b17a7e241989520704ce408045904bc2e275e3c)"
+    },
+    {
+      "commit": "601c383ab6def5a6d2f95a434c95a97b65059628",
+      "subject": "ci: upgrade FreeBSD from 14.2 to 14.3 (#7758)",
+      "body": "14.2 is no more available:\n\n```\n$ gcloud compute images list --project freebsd-org-cloud-dev --no-standard-images\nNAME                                             PROJECT                FAMILY                       DEPRECATED  STATUS\nfreebsd-13-5-release-amd64-gce                   freebsd-org-cloud-dev  freebsd-13-5                             READY\nfreebsd-13-5-stable-amd64-v20251030              freebsd-org-cloud-dev  freebsd-13-5-snap                        READY\nfreebsd-13-5-stable-amd64-v20251107              freebsd-org-cloud-dev  freebsd-13-5-snap                        READY\nfreebsd-14-3-release-amd64-ufs-gce               freebsd-org-cloud-dev  freebsd-14-3                             READY\nfreebsd-14-3-stable-amd64-ufs-20251120           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-14-3-stable-amd64-ufs-20251127           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-14-3-stable-amd64-zfs-20251113           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-14-3-stable-amd64-zfs-20251120           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-14-3-stable-amd64-zfs-20251127           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-15-0-release-amd64-ufs                   freebsd-org-cloud-dev  freebsd-15-0-amd64-ufs                   READY\nfreebsd-15-0-release-amd64-zfs                   freebsd-org-cloud-dev  freebsd-15-0-amd64-zfs                   READY\nfreebsd-15-0-stable-amd64-ufs-20251120           freebsd-org-cloud-dev  freebsd-15-0-amd64-ufs-snap              READY\nfreebsd-15-0-stable-amd64-ufs-20251127           freebsd-org-cloud-dev  freebsd-15-0-amd64-ufs-snap              READY\nfreebsd-15-0-stable-amd64-zfs-20251120           freebsd-org-cloud-dev  freebsd-15-0-amd64-zfs-snap              READY\nfreebsd-15-0-stable-amd64-zfs-20251127           freebsd-org-cloud-dev  freebsd-15-0-amd64-zfs-snap              READY\nfreebsd-16-0-current-amd64-ufs-20251110          freebsd-org-cloud-dev  freebsd-16-0-snap                        READY\nfreebsd-16-0-current-amd64-zfs-20251110          freebsd-org-cloud-dev  freebsd-16-0-snap                        READY\nfreebsd-16-0-current-arm64-aarch64-ufs-20251111  freebsd-org-cloud-dev  freebsd-16-0-snap                        READY\nfreebsd-16-0-current-arm64-aarch64-zfs-20251111  freebsd-org-cloud-dev  freebsd-16-0-snap                        READY\n```\n\n(cherry picked from commit 5471a5835e8bc406c2adc2b66d3020c00ab6a685)"
+    },
+    {
+      "commit": "484cb52d8d21cb8156decbeba9569651fcc09d0d",
+      "subject": "sync: return `TryRecvError::Disconnected` from `Receiver::try_recv` after `Receiver::close` (#7686)",
+      "body": "(cherry picked from commit d060401f6c7dca4a20674e3ad63ad7f1b228aa31)"
+    },
+    {
+      "commit": "16f20c34ed9bc11eb1e7cdec441ab844b198d2cd",
+      "subject": "rt: mention `LocalRuntime` in `new_current_thread` docs (#7820)",
+      "body": ""
+    },
+    {
+      "commit": "46674789abdcd72189bb48a82c6c2121bc3922a0",
+      "subject": "signal: optimize unix signal storage to skip zero (#7819)",
+      "body": ""
+    },
+    {
+      "commit": "8f4ebfd2f7f120e6f50448509496614d7008aef3",
+      "subject": "signal: specialize unix `OsStorage` (#7818)",
+      "body": ""
+    },
+    {
+      "commit": "bd3940c14fb22718b16b8e84fbfc40a6b43a5e5f",
+      "subject": "docs: fix typos in bounded.rs and park.rs (#7817)",
+      "body": ""
+    },
+    {
+      "commit": "c27bed36acc96ae46193ff32ceb8ccc225fd58b1",
+      "subject": "examples: improve the style of `chat.rs` (#7812)",
+      "body": ""
+    },
+    {
+      "commit": "6d3feb581f2620ee4884f9699f5492f079ed0911",
+      "subject": "task: Better typed RawTask::try_read_output (#7806)",
+      "body": ""
+    },
+    {
+      "commit": "a708ad19cb9ae652d8a813554e68cb1d86593eb9",
+      "subject": "chore: fix minor typos (#7804)",
+      "body": ""
+    },
+    {
+      "commit": "4bc2a15d28554426a500ce73be969ecd9ed6dd89",
+      "subject": "io: add `SyncIoBridge` cross-references to `copy` and `copy_buf` (#7798)",
+      "body": ""
+    },
+    {
+      "commit": "33566434bba678c492a5b03b24a013d2f8710c6e",
+      "subject": "metrics: clarify that `num_alive_tasks` is not strongly consistent (#7614)",
+      "body": ""
+    },
+    {
+      "commit": "7388f2d2ea5311af4b2fa0e088d890facfbf4054",
+      "subject": "net: add support for `TCLASS` option on IPv6 (#7781)",
+      "body": "Co-authored-by: Thomas de Zeeuw <thomasdezeeuw@gmail.com>"
+    },
+    {
+      "commit": "0a3e3862697d902cffd729506cb28f6007c204d1",
+      "subject": "time: improve the readability of alternative timer (#7801)",
+      "body": ""
+    },
+    {
+      "commit": "d666068be7489a7ff49b3ac3f6b61ccee0839972",
+      "subject": "fs: handle `EINTR` in `fs::write` for io-uring (#7786)",
+      "body": ""
+    },
+    {
+      "commit": "1b17a7e241989520704ce408045904bc2e275e3c",
+      "subject": "ci: fix wasm32-wasip1 tests (#7788)",
+      "body": ""
+    },
+    {
+      "commit": "5b91709edf0f288da0b712ed5c60bf105a06d0c9",
+      "subject": "chore: fix some minor typos in the comments (#7785)",
+      "body": "Signed-off-by: xibeiyoumian <xibeiyoumian@outlook.com>"
+    },
+    {
+      "commit": "08f40652aadf1d352696c8f403430d7ace7eca74",
+      "subject": "macros: remove `extern crate proc_macro` (#7783)",
+      "body": ""
+    },
+    {
+      "commit": "6403b5370ed7bf64be11e9b97aaefa14d15bd422",
+      "subject": "readme: remove TokioConf 2026 CFP announcement (#7774)",
+      "body": ""
+    },
+    {
+      "commit": "064181f386414a543c0819af8c65866bbd879895",
+      "subject": "io: add `tokio_util::io::simplex` (#7565)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "009a2567d0376d96ff3b459c5581057ab5b11770",
+      "subject": "sync: clarify the cancellation safety of `oneshot::Receiver` (#7780)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>\nCo-authored-by: Alice Ryhl <aliceryhl@google.com>"
+    },
+    {
+      "commit": "231a3a69f9a191c88b94a9ff141865f9a8d0bf84",
+      "subject": "task: stabilize the `LocalSet::id()` (#7776)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "0fa7755e97b2b4ba4630d21a6d5316f39aaa4ee5",
+      "subject": "runtime: stabilize `runtime::id::Id` (#7125)",
+      "body": ""
+    },
+    {
+      "commit": "d3fe35593d46fd60a092e1ea7b8c0fd6cce2cf98",
+      "subject": "net: clarify the cancellation safety of the `TcpStream::peek` (#7305)",
+      "body": ""
+    },
+    {
+      "commit": "0ec0a8546105b9f250f868b77e42c82809703aab",
+      "subject": "io: document the default capacity of the `ReaderStream` (#7147)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>\nCo-authored-by: Qi <add_sp@outlook.com>"
+    },
+    {
+      "commit": "97d06ae1a69a38dfe20e65b5972f456781f2e0c1",
+      "subject": "macros: fix the hygiene issue of `join!` and `try_join!` (#7766)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "b5054e1dfff24c6166ed61100cfbfd329b16b8f8",
+      "subject": "docs: break up `CONTRIBUTING.md` into several parts (#7762)",
+      "body": ""
+    },
+    {
+      "commit": "398eef81203865c3033cdb0e88c637ec7ff0dd65",
+      "subject": "fs: support io_uring with `tokio::fs::read` (#7696)",
+      "body": ""
+    },
+    {
+      "commit": "c8116ecd7bba1dae71bfac25600420ec73fbc2b1",
+      "subject": "stream: work around the rustc bug in `StreamExt::collect` (#7754)",
+      "body": ""
+    },
+    {
+      "commit": "5471a5835e8bc406c2adc2b66d3020c00ab6a685",
+      "subject": "ci: upgrade FreeBSD from 14.2 to 14.3 (#7758)",
+      "body": "14.2 is no more available:\n\n```\n$ gcloud compute images list --project freebsd-org-cloud-dev --no-standard-images\nNAME                                             PROJECT                FAMILY                       DEPRECATED  STATUS\nfreebsd-13-5-release-amd64-gce                   freebsd-org-cloud-dev  freebsd-13-5                             READY\nfreebsd-13-5-stable-amd64-v20251030              freebsd-org-cloud-dev  freebsd-13-5-snap                        READY\nfreebsd-13-5-stable-amd64-v20251107              freebsd-org-cloud-dev  freebsd-13-5-snap                        READY\nfreebsd-14-3-release-amd64-ufs-gce               freebsd-org-cloud-dev  freebsd-14-3                             READY\nfreebsd-14-3-stable-amd64-ufs-20251120           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-14-3-stable-amd64-ufs-20251127           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-14-3-stable-amd64-zfs-20251113           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-14-3-stable-amd64-zfs-20251120           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-14-3-stable-amd64-zfs-20251127           freebsd-org-cloud-dev  freebsd-14-3-snap                        READY\nfreebsd-15-0-release-amd64-ufs                   freebsd-org-cloud-dev  freebsd-15-0-amd64-ufs                   READY\nfreebsd-15-0-release-amd64-zfs                   freebsd-org-cloud-dev  freebsd-15-0-amd64-zfs                   READY\nfreebsd-15-0-stable-amd64-ufs-20251120           freebsd-org-cloud-dev  freebsd-15-0-amd64-ufs-snap              READY\nfreebsd-15-0-stable-amd64-ufs-20251127           freebsd-org-cloud-dev  freebsd-15-0-amd64-ufs-snap              READY\nfreebsd-15-0-stable-amd64-zfs-20251120           freebsd-org-cloud-dev  freebsd-15-0-amd64-zfs-snap              READY\nfreebsd-15-0-stable-amd64-zfs-20251127           freebsd-org-cloud-dev  freebsd-15-0-amd64-zfs-snap              READY\nfreebsd-16-0-current-amd64-ufs-20251110          freebsd-org-cloud-dev  freebsd-16-0-snap                        READY\nfreebsd-16-0-current-amd64-zfs-20251110          freebsd-org-cloud-dev  freebsd-16-0-snap                        READY\nfreebsd-16-0-current-arm64-aarch64-ufs-20251111  freebsd-org-cloud-dev  freebsd-16-0-snap                        READY\nfreebsd-16-0-current-arm64-aarch64-zfs-20251111  freebsd-org-cloud-dev  freebsd-16-0-snap                        READY\n```"
+    },
+    {
+      "commit": "be99e7aa0405e58629844e43546f9107bdc08e73",
+      "subject": "benches: add spawn_blocking concurrency benchmark (#7748)",
+      "body": ""
+    },
+    {
+      "commit": "3bf2e53f0b65833824e71b6a0532513004d65d4e",
+      "subject": "net: deprecate `{TcpStream,TcpSocket}::set_linger` (#7752)",
+      "body": ""
+    },
+    {
+      "commit": "ab3996a6dd2aabce13b01f2b4de7de778a7d0c5d",
+      "subject": "time: update outdated docs of `Wheel` (#7749)",
+      "body": ""
+    },
+    {
+      "commit": "c03a37fa0b88ec20df22bec2b035852fd1eab44e",
+      "subject": "tokio: enable more tests in Miri (#7734)",
+      "body": ""
+    },
+    {
+      "commit": "73d733a3415af98d72c2cce40612c4e59adbd5d8",
+      "subject": "time: add alternative timer for better multicore scalability (#7467)",
+      "body": "This change introduces per-worker timer wheels in the time subsystem\nto reduce the lock contention.\n\nKey changes:\n- Each worker now maintains a local timer wheel.\n- Timer insertions are performed locally.\n- Timer cancellations are forwarded via a\n  dedicated cross-worker cancellation queue.\n\nRelevant RFC: https://github.com/tokio-rs/tokio/issues/7384"
+    },
+    {
+      "commit": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>",
+      "subject": "",
+      "body": ""
+    },
+    {
+      "commit": "749322d3510a6828d9b118027fddedbc2d174d28",
+      "subject": "task: implement `Extend` for `JoinSet` (#7195)",
+      "body": ""
+    },
+    {
+      "commit": "963b6317540e3d9408ef67e81ea528b7d0c5675c",
+      "subject": "refactor: introduce constants for default addresses and improve error handling in TCP examples (#7741)",
+      "body": "- Added `DEFAULT_ADDR` constant to `chat.rs` and `echo-tcp.rs` for better maintainability.\n- Enhanced error logging in `connect-tcp.rs` and `echo-tcp.rs` to include connection addresses.\n- Improved peer management in `chat.rs` by automatically cleaning up disconnected peers."
+    },
+    {
+      "commit": "9a1b076c0084e2bca8558818bffd2273ec5ae5bd",
+      "subject": "io: replace `Result<T, io::Error>` with `io::Result<T>` in `AsyncWrite` (#7740)",
+      "body": ""
+    },
+    {
+      "commit": "c434ed786509792db580e800f796adcad6a5915c",
+      "subject": "net: clarify the drop behavior of `unix::OwnedWriteHalf` (#7742)",
+      "body": ""
+    },
+    {
+      "commit": "4714ca168d6bd97193625657b0381e9b65a9ceff",
+      "subject": "net: clarify the platform-dependent backlog in `TcpSocket` docs (#7738)",
+      "body": ""
+    },
+    {
+      "commit": "5e3ad02fb106f72194c13bdff8317e9a99953c05",
+      "subject": "sync: fix a typo in the docs of `PollSender::is_closed` (#7737)",
+      "body": ""
+    },
+    {
+      "commit": "12412afea4b75b7297cfe6aefb0c5b742adecd6d",
+      "subject": "deps: bump `tokio` to `1.44.0` (#7733)",
+      "body": ""
+    },
+    {
+      "commit": "cae083a26f6f6127c927d72c7bb8a9ae32f46c6a",
+      "subject": "docs: fix typos in README (#7731)",
+      "body": ""
+    },
+    {
+      "commit": "fd7a8d7c65e11b983372d4ceb86c9b8e4dff4bd8",
+      "subject": "chore: add TokioConf 2026 CFP announcement (#7730)",
+      "body": "* chore: add TokioConf 2026 CFP announcement\n\n* sync readmes"
+    },
+    {
+      "commit": "d709df25717e292609d93d4002a98232e63eccd3",
+      "subject": "ci: bump miri to `nightly-2025-11-09` (#7726)",
+      "body": ""
+    },
+    {
+      "commit": "665f08b5ad15485e8dcd6c3ec5ad1bda03a2a68d",
+      "subject": "tokio: enable the `unsafe_op_in_unsafe_fn` lint at the crate level (#7711)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "d4641ba9fcb1fadd4161750df76963422721c65a",
+      "subject": "util: use `<ptr>::addr` instead of unsafe impl (#7725)",
+      "body": ""
+    },
+    {
+      "commit": "2bf80f0ac6daaa28c0ad2c7d3ed1def59ae243e8",
+      "subject": "runtime: disable io-uring on `EPERM` (#7724)",
+      "body": ""
+    },
+    {
+      "commit": "62ecff895acb574e41c8a8d5460d6c8ca4940243",
+      "subject": "stream: add `ChunksTimeout::into_remainder` (#7715)",
+      "body": ""
+    },
+    {
+      "commit": "d84a9e9af3d9e2acb8c2186b86da834621f10224",
+      "subject": "util: enable loom tests (#7644)",
+      "body": "Co-authored-by: Benjamin Ran <benjaminran@Benjamins-MacBook-Pro-3.local>"
+    },
+    {
+      "commit": "0671c205cc5c06420a4154c6edd2dfba2512b54d",
+      "subject": "sync: improve the docs for the errors of mpsc (#7722)",
+      "body": "* docs: fix documentation comments for mpsc error enums\n\n* docs: improve code docs for `TryRecvError`\n\n* docs: improve code docs for mpsc `SendError`"
+    },
+    {
+      "commit": "1ece2f1fa787f1bd1ebdc212f093fb1b5647bd82",
+      "subject": "task: remove unnecessary trait bounds on the `Debug` implementation (#7720)",
+      "body": "Remove the trait bounds of the `Debug` impl for `JoinQueue`\nand `AbortOnDropHandle`.\n\nSigned-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "12319f26d07cd0821cdb45f50cf2b13200f2d04e",
+      "subject": "sync: add missing period to `mpsc::Sender::try_send` docs (#7721)",
+      "body": ""
+    },
+    {
+      "commit": "454fd8c3477a37d12d5d11948fd6fe496924e950",
+      "subject": "chore: prepare tokio-util v0.7.17 (#7719)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "4421022c254cda51fe2dd641c2114fb3af7fb711",
+      "subject": "codec: remove unnecessary trait bounds on all `Framed` constructors (#7716)",
+      "body": ""
+    },
+    {
+      "commit": "5a709e391bdab3cf8bab9fe65d75fa2b92f4e0db",
+      "subject": "io_uring: change `Completable` to not return io::Result (#7702)",
+      "body": ""
+    },
+    {
+      "commit": "5efb1c3b16496f51f2ec959b68a1b97efd7ee234",
+      "subject": "io: doc that `AsyncWrite` does not inherit from `Write` (#7705)",
+      "body": ""
+    },
+    {
+      "commit": "f490029b8fc4552d54b527fc0052fb539e493ebf",
+      "subject": "runtime: revert \"replace manual vtable definitions with `Wake`\" (#7699)",
+      "body": "This reverts commit 4380de9fe9e0938790a2c06f4bdaa8bd91c08ed1."
+    },
+    {
+      "commit": "d25778f67d4571f9067a0004133d5a9005b6aedd",
+      "subject": "task: add tests for `task::Builder::spawn_local` (#7697)",
+      "body": ""
+    },
+    {
+      "commit": "b8318fa1723784cc7f777a900af74ada0ad0dbf7",
+      "subject": "task: add tests for `spawn_local` in panic scenarios (#7694)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "acfdb87e2b8b5daa8ffe31de53eaff0df3f04c50",
+      "subject": "task: use `#[tokio::test]` explicitly in `tests/task_builder.rs` (#7698)",
+      "body": ""
+    },
+    {
+      "commit": "d060401f6c7dca4a20674e3ad63ad7f1b228aa31",
+      "subject": "sync: return `TryRecvError::Disconnected` from `Receiver::try_recv` after `Receiver::close` (#7686)",
+      "body": ""
+    },
+    {
+      "commit": "5dacc2e2a8ca151d0e4c5d7021bac8f1fdca1987",
+      "subject": "task: add tests for `spawn_local` and `spawn_local_on` (#7609)",
+      "body": "Add tests for task collections (TaskTracker, JoinSet, JoinMap)."
+    },
+    {
+      "commit": "444d3f5c49ebc8449ba4feccae5bb1a740313953",
+      "subject": "task: add example for `spawn_local` usage on local runtime (#7689)",
+      "body": ""
+    },
+    {
+      "commit": "d23a838732077122aee71530f15d3c0bf69f11bb",
+      "subject": "runtime: add tests for spawn local on multi and current runtimes (#7687)",
+      "body": ""
+    },
+    {
+      "commit": "2137f7d953df2c65ad254aba41e7e403905dda91",
+      "subject": "process: remove obsolete `allow(deprecated)` from `is_rt_shutdown_err` (#7685)",
+      "body": ""
+    },
+    {
+      "commit": "51e9dc0943a864a74ed82bae638bb876f7a60150",
+      "subject": "Merge 'tokio-1.47.2' into 'master' (#7683)",
+      "body": ""
+    },
+    {
+      "commit": "3762a6a990ef0d5794787ceb929e6d3b78f755ae",
+      "subject": "chore: prepare Tokio v1.47.2 (#7681)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "07f6cc7e1d9b319be02960074c885a7eb423c3b8",
+      "subject": "macros: fix the hygiene issue of `join!` and `try_join!` (#7638)",
+      "body": "(cherry picked from commit eb99e476e674f81095e2f8f15cbc92f8650f5364)"
+    },
+    {
+      "commit": "308e3e68715ffa10ffb95a0b430ca063e08a6c9a",
+      "subject": "ci: add lockfile for LTS branch",
+      "body": "This is to lock the following dependencies:\n\n- `parking_lot_core` to `0.9.11`\n- `parking_lot` to `0.12.4`\n- `lock_api` to `0.4.13`\n\nSee <https://github.com/tokio-rs/tokio/issues/7653>\nfor more details.\n\nSigned-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "5a1879c2d03f201cbbc59a6cc54ed2fb23a2b1f8",
+      "subject": "Merge 'tokio-1.43.3' into 'tokio-1.47.x'",
+      "body": ""
+    },
+    {
+      "commit": "de6ef21a81fc451f904bcad8ba85dd8c96b17d76",
+      "subject": "chore: prepare Tokio v1.43.3",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "90551d234f43d2c4d9ed5189120f7b2dcb43437f",
+      "subject": "deps: bump the locked slap to `0.4.11`",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "bd4c3dddcac8185acf3e419068fd3465e776c8ac",
+      "subject": "deps: bump the locked tracing-subscriber to `0.3.20`",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "49b331855ece1c5fd6fdb4aa1cf91eebbd92244e",
+      "subject": "process: fix error when runtime is shut down on nightly-2025-10-12 (#7672)",
+      "body": "(cherry picked from commit 9e5527d1d5eadbeed46f4d5d4eb22cd96c72a39a)"
+    },
+    {
+      "commit": "da292dfb66ef34fdfbb6aa1f23c3b2456ca4d400",
+      "subject": "sync: close the `broadcast::Sender` in `broadcast::Sender::new()` (#7629)",
+      "body": "(cherry picked from commit 6d1ae6286880c828c13efb5f11b60c18fb94f947)"
+    },
+    {
+      "commit": "b9feac8d6841bc7933f3d9d508f4179800d4d579",
+      "subject": "runtime: use release in `wake_by_ref()` even if already woken (#7622)",
+      "body": "(cherry picked from commit 67869be3d75c58f9b84bc469e00439b70aff0516)"
+    },
+    {
+      "commit": "4fee6e350016c8e651adb7b9fc5d05685d874c14",
+      "subject": "ci: update macros_type_mismatch for Rust 1.90.0 (#7630)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>\n(cherry picked from commit 2af3e4430a8c546d5273e0bac669fd6696431e89)"
+    },
+    {
+      "commit": "b1e69e560c7b49557f3b43596e2090733f986457",
+      "subject": "ci: pin the rust version for wasm tests (#7518)",
+      "body": "(cherry picked from commit 987675e84353d32f6c11f6fe738f247669717a3b)"
+    },
+    {
+      "commit": "556820ff84030b37e74e11b86b7733f5795770ea",
+      "subject": "chore: prepare Tokio v1.48.0 (#7677)",
+      "body": ""
+    },
+    {
+      "commit": "fd1659a05222858b675d5515ef609ca39d825bff",
+      "subject": "chore: prepare tokio-macros v2.6.0 (#7676)",
+      "body": ""
+    },
+    {
+      "commit": "53e8acac641a614b89e35912ebed0520c6dbcf93",
+      "subject": "ci: update nightly version to 2025-10-12 (#7670)",
+      "body": ""
+    },
+    {
+      "commit": "9e5527d1d5eadbeed46f4d5d4eb22cd96c72a39a",
+      "subject": "process: fix error when runtime is shut down on nightly-2025-10-12 (#7672)",
+      "body": ""
+    },
+    {
+      "commit": "25a24de0e661d86fa059779e87e0605909465f4a",
+      "subject": "net: remove PollEvented noise from Debug formats (#7675)",
+      "body": ""
+    },
+    {
+      "commit": "c1fa25f3009d6f5374e337b999fe4fe926c8e7f2",
+      "subject": "task: clarify the behavior of several `spawn_local` methods (#7669)",
+      "body": ""
+    },
+    {
+      "commit": "e7e02fcf0f16fc906c0fac48aafd6a168ae3cf24",
+      "subject": "fs: use `FileOptions` inside `fs::File` to support uring (#7617)",
+      "body": ""
+    },
+    {
+      "commit": "f7a7f62959aafd03fd40a07a4f511476dff1e57f",
+      "subject": "ci: remove cargo-deny Unicode-DFS-2016 license exception config (#7619)",
+      "body": ""
+    },
+    {
+      "commit": "d1f1499f630c34c1d319acdc2cc86d7a1008c4b4",
+      "subject": "tokio: use cargo feature for taskdump support instead of cfg (#7655)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>\nCo-authored-by: Alice Ryhl <aliceryhl@google.com>"
+    },
+    {
+      "commit": "ad6f6189529b1067bd4628d1c62abf9a3a64281e",
+      "subject": "runtime: clarify the behavior of `Handle::block_on` (#7665)",
+      "body": ""
+    },
+    {
+      "commit": "0f9ae13c31811150d8bb7ad14127aa19c709ed49",
+      "subject": "task: add `LocalKey::try_get` (#7666)",
+      "body": "Signed-off-by: tison <wander4096@gmail.com>"
+    },
+    {
+      "commit": "9255d96b1b5d6ac85e348d718ed69ea2f80b585c",
+      "subject": "deps: bump windows-sys to version 0.61 (#7645)",
+      "body": ""
+    },
+    {
+      "commit": "ffcc9f7c9505e31dceee8f8b50de4d50cf72f502",
+      "subject": "tokio: fix the docs of feature flag (#7663)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "1a4cf319b56a8fee2a9f66d5fcdca9b6d69bd54d",
+      "subject": "sync: improve the docs of `UnboundedSender::send` (#7661)",
+      "body": ""
+    },
+    {
+      "commit": "3698a6f153c3b3484a5231901aae441e39327768",
+      "subject": "fs: support io_uring in `fs::write` (#7567)",
+      "body": ""
+    },
+    {
+      "commit": "5b4cbbc39e6c2d14907aff068244160fa8ca58dc",
+      "subject": "tokio: raise MSRV to 1.71 (#7658)",
+      "body": ""
+    },
+    {
+      "commit": "c1f0c76fa042577336326c77c07a9eeb213858ec",
+      "subject": "macros: suppress `clippy::unwrap_in_result` in `#[tokio::main]` (#7651)",
+      "body": ""
+    },
+    {
+      "commit": "d0953e833d1e5bfdafe1293316eaf5dd3bb90569",
+      "subject": "task: simplify the example of `TaskTracker` (#7657)",
+      "body": ""
+    },
+    {
+      "commit": "b157f5da76a50063f831112f8ca7ccc787120f50",
+      "subject": "runtime: add guide for choosing between runtime types (#7635)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "35470bfc6e43dac2715009cc1adc0931944cf3b5",
+      "subject": "sync: clarify bounded channel panic behavior (#7641)",
+      "body": "Signed-off-by: Xinye Tao <xinye.tao@metabit-trading.com>\nCo-authored-by: Xinye Tao <xinye.tao@metabit-trading.com>"
+    },
+    {
+      "commit": "95edd8515ee863ac550849af0a741c889ebdf314",
+      "subject": "docs: fix some docs links (#7654)",
+      "body": ""
+    },
+    {
+      "commit": "a0f7f5c94a3958093dbda6934e498e90c3fd1f17",
+      "subject": "fs: emit compilation error without `tokio_unstable` for `io-uring` (#7634)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "02486978d1a6c976b3e8b06051015b6df72cecf9",
+      "subject": "ci: freeze rustc on nightly-2025-01-25 in `netlify.toml` (#7652)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "8ccf2fb92e7568bf16318dc8f3205cad14a9bc5d",
+      "subject": "ci: unfreeze wasm tests from rustc 1.88.0 (#7537)",
+      "body": ""
+    },
+    {
+      "commit": "bce76c515f68271a457a0e494dbf027c309f46d6",
+      "subject": "task: add `try_join_next` and `try_join_next_with_id` on `JoinQueue` (#7636)",
+      "body": ""
+    },
+    {
+      "commit": "b48586f560062e5597f8ef7e9003a3b6cf3b2af0",
+      "subject": "tokio: fix typos in `tokio/CHANGELOG.md` (#7643)",
+      "body": ""
+    },
+    {
+      "commit": "eb99e476e674f81095e2f8f15cbc92f8650f5364",
+      "subject": "macros: fix the hygiene issue of `join!` and `try_join!` (#7638)",
+      "body": ""
+    },
+    {
+      "commit": "b9b532485bbb879042a1bd2ef40a50e6c1d15bb6",
+      "subject": "sync: clarify the behavior of `tokio::sync::watch::Receiver` (#7584)",
+      "body": ""
+    },
+    {
+      "commit": "1b98d5ad85f44a2d2df91b520990ded04db81371",
+      "subject": "task: add `tokio_util::task::JoinQueue` (#7590)",
+      "body": ""
+    },
+    {
+      "commit": "6d1ae6286880c828c13efb5f11b60c18fb94f947",
+      "subject": "sync: close the `broadcast::Sender` in `broadcast::Sender::new()` (#7629)",
+      "body": ""
+    },
+    {
+      "commit": "3b5a15dfdfc5dc789dcb80cef0986fb2fa5cac0a",
+      "subject": "fs: use the Cargo feature for io-uring support instead of cfg (#7621)",
+      "body": "Co-authored-by: Emile Fugulin <code@efugulin.com>"
+    },
+    {
+      "commit": "2af3e4430a8c546d5273e0bac669fd6696431e89",
+      "subject": "ci: update macros_type_mismatch for Rust 1.90.0 (#7630)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "67869be3d75c58f9b84bc469e00439b70aff0516",
+      "subject": "runtime: use release in `wake_by_ref()` even if already woken (#7622)",
+      "body": ""
+    },
+    {
+      "commit": "c6b16cc8610e4832968e6d02270ce307fbc20006",
+      "subject": "net: clarify the supported platform of `set_reuseport()` and `reuseport()` (#7628)",
+      "body": ""
+    },
+    {
+      "commit": "7c197c7784454b3e78aeddbad102d57f83dd98a4",
+      "subject": "runtime: clarify the edge case of `Builder::global_queue_interval()` (#7605)",
+      "body": ""
+    },
+    {
+      "commit": "5f3f5b0be4ec933aed2290ea9d929b5daadae321",
+      "subject": "sync: improve the docs of `sync::watch` (#7601)",
+      "body": "Co-authored-by: Alice Ryhl <aliceryhl@google.com>"
+    },
+    {
+      "commit": "32a1acc85fdd00c6affa022833290fc7cd179b19",
+      "subject": "examples: bump `http` crate from `0.2` to `1` (#7618)",
+      "body": ""
+    },
+    {
+      "commit": "7f455b2d9334c89dba03d9dd49a19cc56b791ecd",
+      "subject": "task: clarify the task ID reuse guarantees (#7577)",
+      "body": ""
+    },
+    {
+      "commit": "86de2e306b91eb9a6de7aa5a38e3359789f27bf4",
+      "subject": "util: fix `pending_only_on_first_poll_with_cancellation_token_owned_test` to use an owned cancellation token (#7613)",
+      "body": "The name of the test suggests that it should test the\nwith_cancellation_token_owned() extension method"
+    },
+    {
+      "commit": "6dc4f85f0bf1d5c22c15187a2b8cb78784ab4bda",
+      "subject": "net: clarify the behavior of `UCred::pid()` on Cygwin (#7611)",
+      "body": ""
+    },
+    {
+      "commit": "637fc1d103882dd04ce434d1fed4a0026fc7b6c2",
+      "subject": "tokio: fix minor errors in `tokio/CHANGELOG.md` (#7608)",
+      "body": ""
+    },
+    {
+      "commit": "7a0ca807be828606b14cff2c9a3d150ff9d999ce",
+      "subject": "time: add `#[track_caller]` to `FutureExt::timeout` (#7588)",
+      "body": "Signed-off-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "d8e8037de50d12162626d35498d1348538bbf38a",
+      "subject": "net: fix copy/paste errors in udp peek methods (#7604)",
+      "body": ""
+    },
+    {
+      "commit": "de978c47e04783c739222da1956ab1b8b340e255",
+      "subject": "task: remove duplicated code in `JoinMap::remove_by_id` (#7603)",
+      "body": ""
+    },
+    {
+      "commit": "024bd6093351b31f718790a43b4c9c99d2a80f7a",
+      "subject": "task: improve the example of `poll_proceed` (#7586)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "7127e257a7d7025a5f6a62eb8aab81c2191f5cdb",
+      "subject": "io: export `Chain` of `AsyncReadExt::chain` (#7599)",
+      "body": ""
+    },
+    {
+      "commit": "94b6df699b566bcbff909e24f08b17416f8e1e52",
+      "subject": "fs: fill the destination buffer with 0s for MockFile::read() (#7596)",
+      "body": ""
+    },
+    {
+      "commit": "510b9ea9dc153a163863cbbe3418f5287269b85c",
+      "subject": "macros: Update the version used for Git tag sample for release steps (#7598)",
+      "body": "Change 1.x.y to x.y.z so that it does not become obsolete again when\ntokio-macros 3.x is released"
+    },
+    {
+      "commit": "0fc23971d9dd1a1859a905b3fc9ed77fef412141",
+      "subject": "macros: add missing `local` flavor to `tokio::main` error message (#7597)",
+      "body": ""
+    },
+    {
+      "commit": "f07233f742c02cd84c48b9c6010ed7f4671e0a3a",
+      "subject": "test: add tests for time in wasm32-unknown-unknown (#7510)",
+      "body": ""
+    },
+    {
+      "commit": "8efd04e38284f2da2d1b3abc8496a511e131d1ce",
+      "subject": "sync: reword allocation failure paragraph in broadcast docs (#7595)",
+      "body": ""
+    },
+    {
+      "commit": "044eaa1a41a5a37fca7bf4902527b910c14f9ca9",
+      "subject": "fs: preserve `max_buf_size` when cloning a `File` (#7593)",
+      "body": ""
+    },
+    {
+      "commit": "03bb6e29b173ca15750e57823c9119bce9704fef",
+      "subject": "fs: add `File::max_buf_size` (#7594)",
+      "body": ""
+    },
+    {
+      "commit": "ac4c95972e0a32eb9ff612ab8588afd9c398c928",
+      "subject": "sync: fix implementation of unused `RwLock::try_*` methods (#7587)",
+      "body": "bd4ccae184b0359cb88f9ebc2ba157867e1eee0e introduced a wrapper for the\nRwLock to get rid of poisoning aspects.\n\nBy mistake (?!) its try_read/write methods actually delegate to\nread/write() and this would lead to blocking\n\nSigned-off-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "14e739c306ad6501b525b6809f66291eec923fd5",
+      "subject": "readme: fix the version used as an example how to use the latest minor of LTS (#7592)",
+      "body": ""
+    },
+    {
+      "commit": "9f59c6952e0f16b5775b1b0b736b9816c0772987",
+      "subject": "ci: remove the job `test-pass` (#7575)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "86400a1920c4caef28ae5178af0fcf1a34822b92",
+      "subject": "io: fix typos in the docs of `AsyncFd` readiness guards (#7583)",
+      "body": "Signed-off-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "c9b4e4c1101ba7c8fbcec0ffe5516d928d30d669",
+      "subject": "examples: fix the write length in the `connect-tcp` example (#7581)",
+      "body": "Signed-off-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "3eb515e1a706dd37f60516bd0f040434644de7a9",
+      "subject": "examples: update outdated example name `connect` to `connect-tcp` (#7582)",
+      "body": "Signed-off-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "1ed2a1436f859e5622d1b2f2e7b3a21aeb1e55d9",
+      "subject": "process: fix unit test for trailing LF in `uname -r` (#7579)",
+      "body": "Signed-off-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "c6aceed64397e275d300e1233a3304ace02a7765",
+      "subject": "io: clarify the zero capacity case of `AsyncRead::poll_read` (#7580)",
+      "body": "Signed-off-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "4590828fb4ea28ab99eb79ab7c1bc717949203ac",
+      "subject": "stream: improve the the docs of `TcpListenerStream` (#7578)",
+      "body": "Signed-off-by: Martin Tzvetanov Grigorov <mgrigorov@apache.org>"
+    },
+    {
+      "commit": "a99a3518020e1c7ea6db6f9d2e7e567637a3d7e7",
+      "subject": "sync: use `UnsafeCell::get_mut` in `Mutex::get_mut` and `RwLock::get_mut` (#7569)",
+      "body": ""
+    },
+    {
+      "commit": "d1e06f831e23e9442ea313fbe8d4d7e9399e492f",
+      "subject": "net: implement `AsRef<Self>` for `TcpStream` and `UnixStream` (#7573)",
+      "body": ""
+    },
+    {
+      "commit": "37ca2f049c552fde50a2535de6dfc61ee6e96eed",
+      "subject": "sync: remove inner mutex in `SetOnce` (#7554)",
+      "body": ""
+    },
+    {
+      "commit": "c8371d45bc0529f88dd168e83c1e8b14f9b9def6",
+      "subject": "codec: add `{FramedRead,FramedWrite}::into_parts()` (#7566)",
+      "body": ""
+    },
+    {
+      "commit": "adc3e19ba7467a192ae9ef2379549bac03e2ca1c",
+      "subject": "time: clarify the cancellation safety of the `DelayQueue` (#7564)",
+      "body": ""
+    },
+    {
+      "commit": "925c614c89d0a26777a334612e2ed6ad0e7935c3",
+      "subject": "time: reduce the generated code size of `Timeout<T>::poll` (#7535)",
+      "body": ""
+    },
+    {
+      "commit": "dd74c7c1bfd69ee997c57aade1db2326b85855df",
+      "subject": "task: implement `Ord` for `task::Id` (#7530)",
+      "body": ""
+    },
+    {
+      "commit": "23263231fdd1c52aa6498947f783b928a7f04663",
+      "subject": "net: qualify that `SO_REUSEADDR` is only set on Unix (#7533)",
+      "body": ""
+    },
+    {
+      "commit": "86528741f960b2425fe7168080744ff3f16cf195",
+      "subject": "ci: update GitHub actions/checkout to v5 (#7529)",
+      "body": ""
+    },
+    {
+      "commit": "131afd3c53afef88844bf803ff99f4a76c6c824e",
+      "subject": "net: clarify socket gets closed on drop (#7526)",
+      "body": ""
+    },
+    {
+      "commit": "9ed6f70b812d5b9d98051f7b2b617b83e1d7823e",
+      "subject": "ci: remove a typo from `spellcheck.dic` (#7524)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "46f7d87962c0c1273bc66aca99d3f3c08da93265",
+      "subject": "runtime: fix a typo in comment of `MAX_LIFO_POLLS_PER_TICK` (#7520)",
+      "body": ""
+    },
+    {
+      "commit": "987675e84353d32f6c11f6fe738f247669717a3b",
+      "subject": "ci: pin the rust version for wasm tests (#7518)",
+      "body": ""
+    },
+    {
+      "commit": "11d7c0486a9b5944452bf2d12790ae551fb395a2",
+      "subject": "task: inline the docs of `TaskTracker` while re-exporting it (#7516)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "3e84a198e4d6283f015965cd627ee5aaff69e022",
+      "subject": "fs: add io_uring `open` operation (#7321)",
+      "body": ""
+    },
+    {
+      "commit": "7497561fedbfb834b28070bd922fe4f72268730f",
+      "subject": "net: render the `cygwin` in the docs of `quickack` and `set_quickack` (#7515)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "ef5b6af7f6b641db7a1ed1f09534bc75943bf835",
+      "subject": "future: clarify the fairness of `FutureExt` for cancellation adapters (#7512)",
+      "body": "This fixes the docstrings on `FutureExt` so that the bias and fairness\nnotes are correct and consistent in all cases.\nAll cancellation-related wrappers are biased towards the completion of\nthe inner future, but they do initially check if the token is\nalready cancelled at construction time."
+    },
+    {
+      "commit": "0922aa2a0b09cf35582f15c799996c64e0b6e50a",
+      "subject": "ci: fix clippy warnings triggered under specific cfg (#7495)",
+      "body": ""
+    },
+    {
+      "commit": "2403b91d7531ee63886e28e3072d2664e2e81772",
+      "subject": "process: upgrade `Command::spawn_with` to use `FnOnce` (#7511)",
+      "body": ""
+    },
+    {
+      "commit": "f1d3b065b6c41925f9ac859156eb89043812ae35",
+      "subject": "task: fix flaky joinmap test during abort (#7509)",
+      "body": ""
+    },
+    {
+      "commit": "cf6b50a3fd44684d63fd758aae1ee2955f16c798",
+      "subject": "chore: prepare tokio-util v0.7.16 (#7507)",
+      "body": ""
+    },
+    {
+      "commit": "416e36b0dff3214a9fd9dee26f9e554d7d162b46",
+      "subject": "task: stabilise `JoinMap` (#7075)",
+      "body": ""
+    },
+    {
+      "commit": "9741c90f9f8b14a7d78d7629a29a281602d5f2b9",
+      "subject": "sync: document cancel safety on `SetOnce::wait` (#7506)",
+      "body": ""
+    },
+    {
+      "commit": "4e3f17bce3addf0bbf626e4847bab73e28328181",
+      "subject": "codec: also apply capacity to read buffer in `Framed::with_capacity` (#7500)",
+      "body": ""
+    },
+    {
+      "commit": "f020b5c4b50281a3824dfcd08a625a46b6150a2b",
+      "subject": "ci: fix incorrect tokio version in Cargo.lock",
+      "body": ""
+    },
+    {
+      "commit": "86cbf81e151772fad0f2fc8afa0fa7094d00b81d",
+      "subject": "Merge 'tokio-1.47.1' into 'master'",
+      "body": ""
+    },
+    {
+      "commit": "be8ee45b3fc2d107174e586141b1cb12c93e2ddf",
+      "subject": "chore: prepare Tokio v1.47.1 (#7504)",
+      "body": ""
+    },
+    {
+      "commit": "d9b19166cde30b8d4a65f31a94b5ee09d2dd7b8c",
+      "subject": "Merge 'tokio-1.43.2' into 'tokio-1.47.x' (#7503)",
+      "body": ""
+    },
+    {
+      "commit": "db8edc620fb369f6cc92dd9dcfdd03b832c2b02f",
+      "subject": "chore: prepare Tokio v1.43.2 (#7502)",
+      "body": ""
+    },
+    {
+      "commit": "e47565b086436a9024812d5cc0ba5672ab515e47",
+      "subject": "blocking: clarify that spawn_blocking is aborted if not yet started (#7501)",
+      "body": ""
+    },
+    {
+      "commit": "4730984d66e708b36efe84245cbf15bd483a886f",
+      "subject": "readme: add 1.47 as LTS release (#7497)",
+      "body": "(cherry picked from commit ad2e19ffe193b7bce76eab9a51037089da4bc6dc)"
+    },
+    {
+      "commit": "1979615cbf1cc4b4d296814957394703827362d0",
+      "subject": "process: fix panic from spurious pidfd wakeup (#7494)",
+      "body": ""
+    },
+    {
+      "commit": "1bc50825f3901daff595b2c45ff04c48f0267198",
+      "subject": "codec: add `FramedWrite::with_capacity` (#7493)",
+      "body": ""
+    },
+    {
+      "commit": "f669a609cf1eaa94d2bc135212f57ff913eca898",
+      "subject": "ci: add lockfile for LTS branch",
+      "body": "This is to fix CI failures from backtrace in rustdoc jobs."
+    },
+    {
+      "commit": "ad2e19ffe193b7bce76eab9a51037089da4bc6dc",
+      "subject": "readme: add 1.47 as LTS release (#7497)",
+      "body": ""
+    },
+    {
+      "commit": "5f04d14d8136254f602590ef3a984c8eca8dae3c",
+      "subject": "net: add `TcpStream::quickack` and `TcpStream::set_quickack` (#7490)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "01ea8f22eaf670ad0cfa5a1facd554ab364bfdcd",
+      "subject": "ci: add kernel-version-test workflow for io_uring tests (#7486)",
+      "body": ""
+    },
+    {
+      "commit": "9f423053fb9a9d68a2790fe1a88745f093f11c4c",
+      "subject": "sync: umplement `Stream::size_hint` for `ReceiverStream` and `UnboundedReceiverStream` (#7492)",
+      "body": ""
+    },
+    {
+      "commit": "0e5c5d64f5aa4387e7d0fb3c1a69561b170fbfcf",
+      "subject": "future: add adapters of `CancellationToken` for `FutureExt` (#7475)",
+      "body": ""
+    },
+    {
+      "commit": "1b27e17ff80af0de2e6a90129567d8d9fc7234ae",
+      "subject": "net: add `SocketAddr::as_abstract_name` (#7491)",
+      "body": ""
+    },
+    {
+      "commit": "8fc62c06c78183a2be97a476b54ae61bfa30fae4",
+      "subject": "metrics: reorder metrics to be grouped by cfg-gates (#7453)",
+      "body": ""
+    },
+    {
+      "commit": "4b96af6040b0136d3fd147b28e3775961f6a3d0a",
+      "subject": "macros: add \"local\" runtime flavor (#7375)",
+      "body": ""
+    },
+    {
+      "commit": "ce41896f8dcbc6249df3279600f45f7a65915cf6",
+      "subject": "sync: fix broken link of Python `asyncio.Event` in `SetOnce` docs (#7485)",
+      "body": ""
+    },
+    {
+      "commit": "c8ab78a84fff284958dc84b77b5222fecd0f44b2",
+      "subject": "changelog: fix incorrect PR number for 1.47.0 (#7484)",
+      "body": ""
+    },
+    {
+      "commit": "3911cb8523f190142f61c64b66881c07c0d3e7be",
+      "subject": "chore: prepare Tokio v1.47.0 (#7482)",
+      "body": ""
+    },
+    {
+      "commit": "d545aa2601e3008ce49c8c0191b0f172ce577452",
+      "subject": "sync: add `sync::Notify::notified_owned()` (#7465)",
+      "body": ""
+    },
+    {
+      "commit": "911ab21d7012a50e53971ad1292a9f18de22d4c8",
+      "subject": "sync: add `SetOnce` (#7418)",
+      "body": ""
+    },
+    {
+      "commit": "9e94fa7e15cfe6ebbd06e9ebad4642896620d924",
+      "subject": "task: remove raw-entry feature from hashbrown dep (#7252)",
+      "body": ""
+    },
+    {
+      "commit": "0d234c3cf9231288bd7ea3d8f2df65fa24b87a80",
+      "subject": "ci: unfreeze wasm-unknown-unknown from rustc 1.81 (#7471)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>\nCo-authored-by: Taiki Endo <te316e89@gmail.com>"
+    },
+    {
+      "commit": "3754e059b61553dd51064b433fb61465c4b93afe",
+      "subject": "ci: use ubuntu-24.04-arm instead of ubuntu-22.04-arm (#7470)",
+      "body": ""
+    },
+    {
+      "commit": "6d868d96ce9df27c5ec1be3bba960ebe80ee4793",
+      "subject": "sync: fix `CancellationToken` failing to cancel the ready futures (#7462)",
+      "body": "This patch fixes an issue where the `CancellationToken::run_until_cancelled` never cancels the `Future` that returns `Ready` at the first `poll`."
+    },
+    {
+      "commit": "Co-authored-by: Luca BRUNO <lucab@lucabruno.net>",
+      "subject": "",
+      "body": ""
+    },
+    {
+      "commit": "0a3fe460862720d005b8fa39cdde30575a063785",
+      "subject": "sync: remove duplicated code in `OnceCell` tests (#7458)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "154d7d5fe663302c96e25d2b6064813996264a91",
+      "subject": "ci: cleanup legacy `R-loom-multi-thread-alt` label from the labeler (#7457)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "611b7933561670c8349ddd5c100fdc76c474e3db",
+      "subject": "coop: add `cooperative` and `poll_proceed` (#7405)",
+      "body": ""
+    },
+    {
+      "commit": "888ee60e41a5afb6eeede62f80b29551f7b87bbc",
+      "subject": "metrics: properly annotate required features for 64-bit-only metrics (#7449)",
+      "body": ""
+    },
+    {
+      "commit": "7dd4d8a30e41611994f55e7f5c9cf124a1c74e2a",
+      "subject": "runtime: cleanup legacy tests of alt multi-threaded runtime (#7451)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>"
+    },
+    {
+      "commit": "085e616c873a3b64708188f1ecc393ab367cb7fe",
+      "subject": "sync: use `swap` in `AtomicWaker::wake` (#7450)",
+      "body": ""
+    },
+    {
+      "commit": "a7896d07f1d3093524c7a190b57570dad3767c7a",
+      "subject": "chore: update CI to clippy 1.88 (#7452)",
+      "body": ""
+    },
+    {
+      "commit": "aff24dfbebf79c698abf16db24930d478c099252",
+      "subject": "deps: upgrade `windows-sys` from 0.52 to 0.59 (#7117)",
+      "body": ""
+    },
+    {
+      "commit": "71cc9ab4c27db1ec2412d7f0bc86bcae7ebf1d74",
+      "subject": "deps: update to socket2 v0.6 (#7443)",
+      "body": ""
+    },
+    {
+      "commit": "02cbe4591b71bcfb7e775a9a09685885ce4f860e",
+      "subject": "runtime: improve safety comments of `Readiness<'_>` (#7415)",
+      "body": "Signed-off-by: ADD-SP <qiqi.zhang@konghq.com>\nCo-authored-by: Eliza Weisman <eliza@buoyant.io>\nCo-authored-by: Alice Ryhl <aliceryhl@google.com>"
+    },
+    {
+      "commit": "0783797520cd04241901615e586bd0aa806aaad5",
+      "subject": "runtime: fix handling of cancelled io_uring Ops (#7436)",
+      "body": ""
+    },
+    {
+      "commit": "ab3ff69cf2258a8c696b2dca89a2cef4ff114c1c",
+      "subject": "chore: prepare to release v1.46.1 (#7444)",
+      "body": "# 1.46.1 (July 4th, 2025)\n\nThis release fixes incorrect spawn locations in runtime task hooks for tasks\nspawned using `tokio::spawn` rather than `Runtime::spawn`. This issue only\neffected the spawn location in `TaskMeta::spawned_at`, and did not effect task\nlocations in Tracing events.\n\n## Unstable\n\n- runtime: add `TaskMeta::spawn_location` tracking where a task was spawned\n  ([#7440)])\n\n[#7440]: https://github.com/tokio-rs/tokio/pull/7440"
+    },
+    {
+      "commit": "a0d5b8ab308bbeaa8090d411550d6c887d699096",
+      "subject": "runtime(unstable): fix task hook spawn locations for `tokio::spawn` (#7440)",
+      "body": "## Motivation\n\nUnfortunately, due to an oversight on my part, the capturing of spawn\nlocations was only tested with the `Runtime::spawn` method, and *not*\nwith `tokio::spawn`/`tokio::task::spawn`, which is how most tasks are\nspawned in Real Life. And, it turned out that because this was not\ntested...well, it was broken. Agh. My bad.\n\n## Solution\n\nAlthough the whole call chain for spawning tasks using `tokio::spawn`\nwas correctly annotated with `#[track_caller]`, the location wasn't\npropagated correctly because of the `context::with_current(|handle| {\n... })` closure that accesses the current runtime. Because the call to\nspawn the task occurs inside a closure, the *closure*'s location is\ncaptured instead of the caller. This means any task spawned by\n`tokio::spawn` records its location as being in\n`tokio/src/task/spawn.rs`, which is not what we'd like. This commit\nfixes that by capturing the spawn location outside the `with_current`\nclosure and passing it in explicitly.\n\nI've updated the tests to also spawn a task with `tokio::spawn`, so that\nwe ensure this works correctly."
+    },
+    {
+      "commit": "a1ee3ef218894f2441b5719812ab218ae0539c8d",
+      "subject": "chore: fix some minor typos in the comments (#7442)",
+      "body": "Signed-off-by: shangchenglumetro <shuang.cui@live.com>"
+    },
+    {
+      "commit": "171cd148a37da40dcbb8b06bf2c67634b2ba1f87",
+      "subject": "changelog: fix typo in `pipe::OpenOptions` for 1.46.0 (#7439)",
+      "body": ""
+    },
+    {
+      "commit": "3f1f268583a16c11560f8e310d5a35e9aa55b547",
+      "subject": "chore: prepare Tokio v1.46.0 (#7437)",
+      "body": ""
+    },
+    {
+      "commit": "3e890cc0171ddb210acdcfec831b7c7bcbb0d2d9",
+      "subject": "rt(unstable): add spawn `Location` to `TaskMeta` (#7417)",
+      "body": "As described in issue #7411, task spawning APIs are currently annotated\nwith `#[track_caller]`, allowing us to capture the location in the user\nsource code where the task was spawned. This is used for `tracing`\nevents used by `tokio-console` and friends. However, this information is\n*not* exposed to the runtime `on_task_spawn`, `on_before_task_poll`,\n`on_after_task_poll`, and `on_task_terminate` hooks, which is a shame,\nas it would be useful there as well.\n\nThis branch adds the task's spawn location to the `TaskMeta` struct\nprovided to the runtime's task hooks. This is implemented by storing a\n`&'static Location<'static>` in the task's `Core` alongside the\n`task::Id`. In [this comment][1], @ADD-SP suggested storing the\n`Location` in the task's `Trailer`.\n\nI opted to store it in the `Core` instead, as the `Trailer` is intended\nto store \"cold\" data that is only accessed when the task _completes_,\nand not on every poll. Since the task meta is passed to the\n`on_before_task_poll` and `on_after_task_poll` hooks, we would be\naccessing the `Trailer` on polls if we stored the `Location` there.\nTherefore, I put it in the `Core`, instead, which contains data that we\naccess every time the task is polled.\n\nCloses #7411\n\n[1]: https://github.com/tokio-rs/tokio/issues/7411#issuecomment-2993377045"
+    },
+    {
+      "commit": "69290a64327a017fd9a0cedefaac60c4993c3b54",
+      "subject": "net: derive `Clone` for `net::unix::SocketAddr` (#7422)",
+      "body": ""
+    },
+    {
+      "commit": "e2b175848b2cb25e99cd3a0486e506f889379db5",
+      "subject": "fuzz: cfg fuzz tests under cfg(test) (#7428)",
+      "body": ""
+    },
+    {
+      "commit": "b7a75b5be349aab2cee9b224c0610d7cf4fea73e",
+      "subject": "net: update `AsRawFd` doc link to current Rust stdlib location (#7429)",
+      "body": ""
+    },
+    {
+      "commit": "6b705b3053d2c777e05cb60c758202ff9d4b2e7d",
+      "subject": "net: allow `pipe::OpenOptions::read_write` on Android (#7426)",
+      "body": ""
+    },
+    {
+      "commit": "3636fd018ab6416fdfa3aab21e1e55966062dc3c",
+      "subject": "net: fix broken link of `RawFd` in `TcpSocket` docs (#7416)",
+      "body": ""
+    },
+    {
+      "commit": "2506c9fa9916a1bdffbc762f7eb2ae5c2fd23836",
+      "subject": "benches: revert \"properly gate unix benches\" (#7412)",
+      "body": "This reverts commit 933fa498d0bda193960784cb3f6a47be3bc1e492."
+    },
+    {
+      "commit": "b3a14483bf5efa1b5cf75af27f6ef0770f4c5689",
+      "subject": "sync: improve docs of `tokio_util::sync::CancellationToken` (#7408)",
+      "body": "Co-authored-by: Alice Ryhl <aliceryhl@google.com>"
+    },
+    {
+      "commit": "013f323def73f85185e2633f1b5f8939cc841318",
+      "subject": "docs: add a missing panic scenario of `time::advance` (#7394)",
+      "body": ""
+    },
+    {
+      "commit": "b92670006566302b7eb17b1a2f7cb8d868a9ab25",
+      "subject": "sync: add `DropGuardRef` for `CancellationToken` (#7407)",
+      "body": ""
+    },
+    {
+      "commit": "99a03a502eb69309024406b07c85cabb965f53d4",
+      "subject": "runtime: add `thread_park_ok` test (#7402)",
+      "body": ""
+    },
+    {
+      "commit": "933fa498d0bda193960784cb3f6a47be3bc1e492",
+      "subject": "benches: properly gate unix benches (#7392)",
+      "body": ""
+    },
+    {
+      "commit": "9f848c9f544a87f52ca406bad895a2b0ffa10e4b",
+      "subject": "rt: add check for io_uring availability at runtime (#7357)",
+      "body": ""
+    },
+    {
+      "commit": "912b862a0526511e6d88cd85c81317f7406107c1",
+      "subject": "task: add `AbortOnDropHandle::detach` (#7400)",
+      "body": ""
+    },
+    {
+      "commit": "714e5b571f2f6b329dfd830b9d3986fac7e7a0c8",
+      "subject": "runtime: move ` impl Schedule for Arc<Handle>` (#7398)",
+      "body": ""
+    },
+    {
+      "commit": "8e999e380643160f0e944fd5708de2bd3d1b0d51",
+      "subject": "macros: add biased mode to join! and try_join! (#7307)",
+      "body": ""
+    },
+    {
+      "commit": "1d980145cb51c3a352fe6947b7758f8d9125117d",
+      "subject": "io: document cancellation safety of `AsyncWriteExt::flush` (#7364)",
+      "body": ""
+    },
+    {
+      "commit": "8259133ca018d136ebbfc7b9032eb6ca4b7a3e73",
+      "subject": "task: disallow blocking in `LocalSet::{poll,drop}` (#7372)",
+      "body": ""
+    },
+    {
+      "commit": "38d88c679938f9ae92649f5780217c04f1659f45",
+      "subject": "net: add cygwin support (#7393)",
+      "body": ""
+    },
+    {
+      "commit": "c38de96b9478c29a08805a4be7e351fdca8bb43a",
+      "subject": "sync: add `same_channel` analogue to `OwnedPermit` (#7389)",
+      "body": ""
+    },
+    {
+      "commit": "2440d113ff9841060b1876628c1153f0bcf2945c",
+      "subject": "ci: enable tests using fcntl in miri (#7382)",
+      "body": ""
+    },
+    {
+      "commit": "ab8d7b82a1252b41dc072f641befb6d2afcb3373",
+      "subject": "readme: fix double period in reactor description (#7363)",
+      "body": ""
+    },
+    {
+      "commit": "9563707aaa73a802fa4d3c51c12869a037641070",
+      "subject": "time: cumulative minor improvements (#7358)",
+      "body": ""
+    },
+    {
+      "commit": "193c1574a119605e4d9081d481a6bb03e7bf26cc",
+      "subject": "examples: update rand crate to 0.9.1 (#7371)",
+      "body": ""
+    },
+    {
+      "commit": "328bd049f6a9c2819ee6bcb6752dd57a3a456aee",
+      "subject": "io: clarify behavior of seeking when `start_seek` is not used (#7366)",
+      "body": ""
+    },
+    {
+      "commit": "4380de9fe9e0938790a2c06f4bdaa8bd91c08ed1",
+      "subject": "chore: replace manual vtable definitions with `Wake` (#7342)",
+      "body": ""
+    },
+    {
+      "commit": "98f527f42d8b95dc643e053cf60d4084f4fed69d",
+      "subject": "Merge tag 'tokio-1.45.1'",
+      "body": ""
+    },
+    {
+      "commit": "3768696d92d403d98b7d559934617890f882ec02",
+      "subject": "chore: prepare Tokio v1.45.1 (#7359)",
+      "body": ""
+    },
+    {
+      "commit": "d7d4f7d08bf75daf23bec676b03cb4c88993e5d0",
+      "subject": "sync: update broadcast docs on allocation failure (#7352)",
+      "body": ""
+    },
+    {
+      "commit": "421a7b001c762a25c0b009c9ffb86f0661608f90",
+      "subject": "rt: do not track time-based metrics on wasm32-unknown-unknown (#7322)",
+      "body": ""
+    },
+    {
+      "commit": "b1bdb3c57b9adfa928644ece1da97860c558efbb",
+      "subject": "ci: update macros_type_mismatch for Rust 1.87.0 (#7339)",
+      "body": "(cherry picked from commit a48e418dcbbe7eccc7ea0f0071ca60aca21a61b7)"
+    },
+    {
+      "commit": "7ec77a067739ea2203c506fbfe6bc4aca1139ea7",
+      "subject": "time: eliminate `UnsafeCell` around the `TimerShared` (#7329)",
+      "body": ""
+    },
+    {
+      "commit": "55e3ed2a3976020d8513d5276d2afbaf2ea53c4d",
+      "subject": "runtime: eliminate unnecessary lfence while operating on `queue::Local<T>` (#7340)",
+      "body": ""
+    },
+    {
+      "commit": "17d8c2b29d94550f504d8fd76d8d8aaf66095864",
+      "subject": "runtime: various minor `LocalRuntime` improvements (#7346)",
+      "body": ""
+    },
+    {
+      "commit": "327bec2caf92af5e2732f8fdfe2e4a20d349f67e",
+      "subject": "rt: add infrastructure code for io_uring (#7320)",
+      "body": ""
+    },
+    {
+      "commit": "ea30a5ea5eee1b3970052f19e8a8b16d0a5c29f4",
+      "subject": "time: rename `cached_when` to `registered_when` (#7333)",
+      "body": ""
+    },
+    {
+      "commit": "0cf95f067347bca820099dcec1e457bbe993390b",
+      "subject": "net: fix docs for `recv_buffer_size` method (#7336)",
+      "body": ""
+    },
+    {
+      "commit": "a48e418dcbbe7eccc7ea0f0071ca60aca21a61b7",
+      "subject": "ci: update macros_type_mismatch for Rust 1.87.0 (#7339)",
+      "body": ""
+    },
+    {
+      "commit": "4cbcb687f429f2a4cee948b0462e23f86ef95822",
+      "subject": "time: address style issues (#7328)",
+      "body": ""
+    },
+    {
+      "commit": "0715e6defc4ed358f47654dadaffb3643401ffd8",
+      "subject": "time: remove outdated explicitly `drop` call of `Mutex` (#7326)",
+      "body": "This drop was firstly introduced by [#3289],\nand the next line invokes `panic!`.\n\nIn [#5434], the original `panic!` was replaced\nwith `return Err`, so dropping it explicitly\nis no longer necessary.\n\n[#3289]: https://github.com/tokio-rs/tokio/pull/3289\n[#5434]: https://github.com/tokio-rs/tokio/pull/5434"
+    },
+    {
+      "commit": "bdd64cc9d3561115d125584484404e9d1f7d7cca",
+      "subject": "runtime: add doc note that `on_*_task_poll` is unstable (#7311)",
+      "body": ""
+    },
+    {
+      "commit": "f0fdef80c46787bbc4351516d9439f66dfec403c",
+      "subject": "net: ignore `NotConnected` in `TcpStream::shutdown` (#7290)",
+      "body": ""
+    },
+    {
+      "commit": "00754c8f9c8cd0c10fd54e5304cb9cb95a759d53",
+      "subject": "chore: prepare Tokio v1.45.0 (#7308)",
+      "body": ""
+    },
+    {
+      "commit": "1ae9434e8e4a419ce25644e6c8d2b2e2e8c34750",
+      "subject": "time: revert \"use sharding for timer implementation\" related changes (#7226)",
+      "body": "The work on sharding the timer implementation has caused a measurable performance regression due to increased contention. This patch reverts the current work on sharding. The next step will be to work on a per-worker timer wheel."
+    },
+    {
+      "commit": "8895bba448534a4eb159f18e57fd845c740e1d38",
+      "subject": "ci: Test AArch64 Windows (#7288)",
+      "body": ""
+    },
+    {
+      "commit": "48ca254d92d4408accd7b1c1beab188288fadb00",
+      "subject": "time: update `sleep` documentation to reflect maximum allowed duration (#7302)",
+      "body": ""
+    },
+    {
+      "commit": "a0af02a396274b30ec1d0a27e18ac9ae6eaa2186",
+      "subject": "compat: add more documentation to `tokio_util::compat` (#7279)",
+      "body": ""
+    },
+    {
+      "commit": "0ce3a1188a56c4c133d5b789eb366c0752e9b22c",
+      "subject": "metrics: stabilize `worker_park_count` and `worker_unpark_count` (#7276)",
+      "body": ""
+    },
+    {
+      "commit": "1ea9ce11d4317d767136d489041548408348be77",
+      "subject": "ci: fix cfg!(miri) declarations in tests (#7286)",
+      "body": ""
+    },
+    {
+      "commit": "4d4d12613bb30f6b550421d6ce2c2c54eb5d341d",
+      "subject": "chore: prepare tokio-util v0.7.15 (#7283)",
+      "body": ""
+    },
+    {
+      "commit": "5490267a79a894c22cc014367e0fcd43f4ad2bb6",
+      "subject": "fs: update the mockall dev dependency to 0.13.0 (#7234)",
+      "body": ""
+    },
+    {
+      "commit": "1434b32b5a0df3b38a0d588485cd9a20a8e92a89",
+      "subject": "examples: improve echo example consistency (#7256)",
+      "body": ""
+    },
+    {
+      "commit": "159a3b2c8587cd12ad54eb16489dad6eb674d4ca",
+      "subject": "rt(unstable): remove alt multi-threaded runtime (#7275)",
+      "body": "The alternative multi-threaded runtime started as an experiment. We have been\nunable to find real-world benefit. Work has halted on this effort, so lets get\nrid of it."
+    },
+    {
+      "commit": "ce87dcfbf08dc5330386433c1e62229a3c4d5571",
+      "subject": "runtime: document the queue behavior of `spawn_blocking` (#7269)",
+      "body": ""
+    },
+    {
+      "commit": "d41d49d202708a6846e5de023962a8ee17358ba6",
+      "subject": "metrics: fix panic comment in `max_error` docs (#7273)",
+      "body": ""
+    },
+    {
+      "commit": "7a6c424f6e07d79e7c029866ed601bb948aba10a",
+      "subject": "process: add `Command::spawn_with` (#7249)",
+      "body": "Signed-off-by: Paul Mabileau <paulmabileau@hotmail.fr>"
+    },
+    {
+      "commit": "c3037adac90fbbf92a160b970f38e50b66936b4c",
+      "subject": "task: properly handle removed entries in `JoinMap` (#7264)",
+      "body": ""
+    },
+    {
+      "commit": "964fd06e0f215b26c4d969bc09e11299a29d6e11",
+      "subject": "benches: add helper functions for building runtimes (#7260)",
+      "body": ""
+    },
+    {
+      "commit": "817fa605ee6a2549fe8e6057ec23a8309d42d2e9",
+      "subject": "fs: avoid some copies in `tokio::fs::write` (#7199)",
+      "body": ""
+    },
+    {
+      "commit": "77de684ed94a2ac15504c0033f4c8fe39693f3b9",
+      "subject": "runtime: mark `runtime::Handle` unwind-safe (#7230)",
+      "body": ""
+    },
+    {
+      "commit": "83d550e51127cf3130b5c40525de1e7b6916bbe0",
+      "subject": "changelog: fix release date of v1.44.2 (#7248)",
+      "body": ""
+    },
+    {
+      "commit": "1b3d3e7cd67d0f99472591070590d031baaca029",
+      "subject": "Merge 'tokio-1.43.1-fix-release-date' into 'master' (#7247)",
+      "body": ""
+    },
+    {
+      "commit": "9e044e144baa7d99a7210b0afe3a20b3e00a8f85",
+      "subject": "changelog: fix release date of v1.43.1 (#7246)",
+      "body": ""
+    },
+    {
+      "commit": "cb08fbc6c36208962964fe5adf4509e02b9c92bd",
+      "subject": "Merge 'tokio-1.42.1' into 'tokio-1.43.x' (#7245)",
+      "body": ""
+    },
+    {
+      "commit": "e59584a661490dc4fdfd71c34e1a05c004bcee5b",
+      "subject": "changelog: fix release date of v1.42.1 (#7244)",
+      "body": ""
+    },
+    {
+      "commit": "f7fb0bdc7a4b8db7b44aa34bf869cc76e61ef246",
+      "subject": "chore: prepare Tokio v1.42.1",
+      "body": ""
+    },
+    {
+      "commit": "9faea740df38c3691eb558b4a9387e2195960a85",
+      "subject": "Merge 'tokio-1.38.x' into 'tokio.1.42.x'",
+      "body": ""
+    },
+    {
+      "commit": "2a8c551631a55be6759e630c1adbc2efc4469f06",
+      "subject": "tokio: update mio-aio dev dependency to 1.0 (#7235)",
+      "body": "This eliminates a duplicate dependency on mio"
+    },
+    {
+      "commit": "676630785bca7bb527882be576e3470dbdbe045e",
+      "subject": "Merge branch 'tokio-1.44.x' into forward-port-1.44.x",
+      "body": ""
+    },
+    {
+      "commit": "ec4b1d7215a3e1e91797ad3fb6ba0f7c7f3d2566",
+      "subject": "chore: forward port 1.43.x",
+      "body": ""
+    },
+    {
+      "commit": "e3c3a56718d201fb7bb430567f05fbb64b2ef082",
+      "subject": "Merge branch 'tokio-1.43.x' into forward-port-1.43.x",
+      "body": ""
+    },
+    {
+      "commit": "a7b658c35bd40f6811e557aeb97cbb361b612c56",
+      "subject": "chore: prepare Tokio v1.43.1 release",
+      "body": ""
+    },
+    {
+      "commit": "c1c8d1033d637d7027fdc137ec8008c5801cbc0d",
+      "subject": "Merge remote-tracking branch 'origin/tokio-1.38.x' into forward-port-1.38.x",
+      "body": ""
+    },
+    {
+      "commit": "aa303bc2051f7c21b48bb7bfcafe8fd4f39afd21",
+      "subject": "chore: prepare Tokio v1.38.2 release",
+      "body": ""
+    },
+    {
+      "commit": "7b6ccb515ff067151ed62db835f735e5653f8784",
+      "subject": "chore: backport CI fixes",
+      "body": ""
+    },
+    {
+      "commit": "4b174ce2c95fe1d1a217917db93fcc935e17e0da",
+      "subject": "sync: fix cloning value when receiving from broadcast channel",
+      "body": "The broadcast channel does not require values to implement `Sync` yet it calls\nthe `.clone()` method without synchronizing. This is unsound logic. This patch\nadds per-value synchronization on receive to handle this case. It is unlikely\nany usage of the broadcast channel is currently at risk of the unsoundeness\nissue as it requires accessing a `!Sync` type during `.clone()`, which would be\nvery unusual when using the broadcast channel."
+    },
+    {
+      "commit": "0ec4d0db4d24af74cea40cf0ceed6b7a0a5ff183",
+      "subject": "docs: remove redundant words in comment (#7224)",
+      "body": ""
+    },
+    {
+      "commit": "d83ba30d8d426c1ce4363190fbb718fd086928d1",
+      "subject": "task: explicitly state that `TaskTracker` does not abort tasks on Drop (#7223)",
+      "body": ""
+    },
+    {
+      "commit": "f339587b27de64c8dfe04c5c8f5a48ee17a24e01",
+      "subject": "deps: update hashbrown to 0.15 (#7219)",
+      "body": ""
+    },
+    {
+      "commit": "b663abe09199c63f18abf5cc024b01fdc71553a4",
+      "subject": "chore: update tokio-util version number (#7215)",
+      "body": ""
+    },
+    {
+      "commit": "9a11efc262ba361250ff944ed10258b620792841",
+      "subject": "chore: prepare tokio-util v0.7.14 (#7215)",
+      "body": ""
+    },
+    {
+      "commit": "d760b26666867f80552534433de004ddebbfeef7",
+      "subject": "Merge tokio-1.44.1 into master (#7218)",
+      "body": ""
+    },
+    {
+      "commit": "d413c9c02af8f2b4fea14b769b86484b12f46595",
+      "subject": "chore: prepare Tokio v1.44.1 (#7217)",
+      "body": ""
+    },
+    {
+      "commit": "addbfb9204be25a8621feb3f20b44a7c1f00edbd",
+      "subject": "rt: skip defer queue in `block_in_place` context (#7216)",
+      "body": ""
+    },
+    {
+      "commit": "56870433289f6906716c9d9b2a28da5c9e76352e",
+      "subject": "test: remove unused dependencies (#7214)",
+      "body": ""
+    },
+    {
+      "commit": "72c87a7724e23feac56810a2f61c11484ebb3858",
+      "subject": "test: add `io::Builder::name` for better panic messages (#7212)",
+      "body": "Introduce tokio_test::io::Builder::name to configure\nname of the mock object, to include in panic messages.\n\nAlso show number of remaining actions or action index\nin some cases to help debugging failed tests."
+    },
+    {
+      "commit": "8507e28f89916662d2f61af823993483169d912c",
+      "subject": "Remove an old custom `OnceCell` implementation in favor of `std` (#7208)",
+      "body": ""
+    },
+    {
+      "commit": "7efcab43c95feef0e020a8bac8aa31e70e3aafe2",
+      "subject": "Do not require `Unpin` for some trait impls (#7204)",
+      "body": ""
+    },
+    {
+      "commit": "e4a39d2ef6a389cceaebfa54f89ec04b5651c1e0",
+      "subject": "sync: add `CancellationToken::run_until_cancelled_owned` (#7081)",
+      "body": ""
+    },
+    {
+      "commit": "afd3678f89dd0253af9194a4945711cfd3c0662a",
+      "subject": "metrics: stabilize `worker_total_busy_duration` (#6899)",
+      "body": ""
+    },
+    {
+      "commit": "8182ecf2628d5e80dac52b8ed1ea466dbb0925b9",
+      "subject": "chore: prepare Tokio v1.44.0 (#7202)",
+      "body": ""
+    },
+    {
+      "commit": "a258bff7018940b438e5de3fb846588454df4e4d",
+      "subject": "ci: enable printing in multi thread loom tests (#7200)",
+      "body": ""
+    },
+    {
+      "commit": "e076d21f679a35ae2697165d46d111285d09e3b4",
+      "subject": "process: clarify `Child::kill` behavior (#7162)",
+      "body": ""
+    },
+    {
+      "commit": "042433cdccdf0dd33408c1751a80ddd50a077872",
+      "subject": "net: debug_assert on creating a tokio socket from a blocking one (#7166)",
+      "body": "See #5595 and #7172.\n\nThis adds a debug assertion that checks that a supplied underlying std socket is set to nonblocking mode when constructing a tokio socket object from such an object.\n\nThis only works on unix."
+    },
+    {
+      "commit": "0284d1b5c8ea5aff5b30c254200fb0a46c21d67c",
+      "subject": "macros: make `select!` budget-aware (#7164)",
+      "body": ""
+    },
+    {
+      "commit": "710bc8071ea030f0ad98817414997beab2420ad2",
+      "subject": "rt: coop should yield using waker defer strategy (#7185)",
+      "body": ""
+    },
+    {
+      "commit": "a2b12bd5799f06e912b32ac05a5ffb5cf1fe31cd",
+      "subject": "readme: adjust release schedule to once per month (#7191)",
+      "body": ""
+    },
+    {
+      "commit": "e7b593cbee9541500cef047f3a0ee70be1c55c6f",
+      "subject": "process: fix grammar of the `ChildStdin` struct doc comment (#7192)",
+      "body": ""
+    },
+    {
+      "commit": "3aaf4a53776f134b99121cbe273b6d2c93d6bf99",
+      "subject": "coop: adjust grammar in `tests/coop_budget.rs` (#7173)",
+      "body": ""
+    },
+    {
+      "commit": "8e741c1c0ed7c440eba5aa1cf4b55085aeb48dfb",
+      "subject": "tokio: mark 1.43 as LTS (#7189)",
+      "body": ""
+    },
+    {
+      "commit": "47d46455bdf0e13b2b40a0dfb22dad61addafb7c",
+      "subject": "util: optimize buffer reserve for `AnyDelimiterCodec::encode` (#7188)",
+      "body": ""
+    }
+  ]
+}

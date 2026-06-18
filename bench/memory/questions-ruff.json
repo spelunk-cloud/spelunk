@@ -1,57 +1,62 @@
 [
     {
-        "question": "How does `ruff:ignore` suppression handle a diagnostic whose range only partially overlaps the suppression comment, such as a multi-line list literal?",
-        "ground_truth_commit": "b78e92bf9de4c0965902a18f0221d34317586dfe",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "Why does ruff suppress the autofix (but keep the diagnostic) for invalid control characters inside f-string replacement fields on Python versions before 3.12 (PLE2510 etc.)?",
+        "ground_truth_commit": "f83e48cabc2971108870bcddcc81ed7674598476",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "Why was `ruff rule` changed to allow rule names instead of only rule codes, and why couldn't this be preview-gated?",
-        "ground_truth_commit": "10b729da9c4ad273e81b1afcf36fca32d3434a9f",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "How was UP032's detection of side effects broadened so it no longer unsoundly converts `.format()` calls that repeat a side-effecting argument, and what helper replaced the old call-only check?",
+        "ground_truth_commit": "bc52b711c0c9f85080632b613e85416c70527fe7",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "What out-of-bounds panic occurred in Jupyter notebooks when using suppression comments, and how was it fixed?",
-        "ground_truth_commit": "8b630c748545726909daa7b4b8b32eb84cb049ad",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "Why did ERA001 stop flagging `ruff:ignore` and `ruff:file-ignore` comments as commented-out code?",
+        "ground_truth_commit": "d08cde09a057e34b87e117d5c4f6825ee6421525",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "What does ty's support for `Callable()` in match statement class patterns cover (e.g., reachability, narrowing, sub-patterns)?",
-        "ground_truth_commit": "267af002fb9431f6f2db5ab849c1dcd6d7752733",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "When does F523 avoid removing a `.format()` call entirely, and what behavior-changing cases (brace escapes, named placeholders) motivated that guard?",
+        "ground_truth_commit": "49882fa3844b9f93a7985dfd277a3348975bc576",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "Why did the project switch from the `lsp-types` crate to `gen-lsp-types` for LSP type definitions?",
-        "ground_truth_commit": "612f2f28501fc65ce90d970c86463657a2c840a0",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "What caused the ERA001/RUF100 conflict when a `# noqa: ERA001` appeared on commented-out code, and how did `comment_contains_code` handling change to fix it?",
+        "ground_truth_commit": "b427926f2014abf7204cc433d6cb5204c8bbc49c",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "Why was the generated rule code for `noqa_code` match arms causing incremental build invalidation, and how was it stabilized?",
-        "ground_truth_commit": "2bb936cb39b6b054d3525829b4d06587492dd2fa",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "How was RUF075's terminal-yield check extended to cover `yield` before `break`, and why is it only terminal when the enclosing loop is itself in terminal position?",
+        "ground_truth_commit": "35ee0888f4ed173ed35d2fcd31d261a085a89c21",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "Why was the autofix for `np.in1d` to `np.isin` (NPY201) dropped in favor of a manual fix?",
-        "ground_truth_commit": "85ba4a3243ee5764666859211a716e5fe11f704a",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "Why was C417's lambda-arity check (`lambda_has_expected_arity`) wrong for lambdas with positional-only parameters, and what did it fail to inspect?",
+        "ground_truth_commit": "8a8e35ebfe318e2467a0f276e5d1a3a9032a55ad",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "What new ty lint rule detects generic types used without explicit type parameters, and what existing tools' behavior is it equivalent to?",
-        "ground_truth_commit": "dc79edf868725c5e611f7e3ec1b6d75f2a5d9d65",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "How was parser lookahead for operators reduced, and why does only `not`/`in` still require peeking two tokens ahead?",
+        "ground_truth_commit": "aea5ed4d278017057c2e842c6c3a2e92ad71495f",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "How does UP032 (pyupgrade) now handle leading empty string literals when converting `.format()` calls to f-strings, and what bug did this fix?",
-        "ground_truth_commit": "e5b5f5c6d2b1824fcd2a6d171657db213708f9ac",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "Why was a recursion limit added to ruff's parser, and what kind of input could previously cause a stack overflow?",
+        "ground_truth_commit": "c423054dc09e5b644c926b6b527b6accfbe693e9",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "How was flake8-pytest-style extended to also check `pytest_asyncio` fixtures, and which function implements the detection?",
-        "ground_truth_commit": "f293d70613261a5dcd1649aa9b726b6cb8289417",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "What does the RUF075 `fallible-context-manager` rule detect about `@contextlib.contextmanager` functions, and where is the rule implemented?",
+        "ground_truth_commit": "e1cdbbad869bea136223631f13b152beaf3a3899",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "Why was the new RUF076 rule added to ban `pytest` autouse fixtures?",
-        "ground_truth_commit": "43fefbaf3463be7082f88a5f60ece4011a000107",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "Why was RUF074 (incorrect-decorator-order) added, and what runtime failure does the `@abstractmethod` over `@property` ordering cause?",
+        "ground_truth_commit": "51a7c2e7c8e9a64f64afc59a2242d8737b5cf77d",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+    },
+    {
+        "question": "Why was `lint.future-annotations = true` incorrectly forcing strict-mode behavior for TC001/TC002/TC003, and how are the future-annotations and strict settings supposed to relate?",
+        "ground_truth_commit": "5ace2a89bdc6dcaa87089fa017db48d61030aaad",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     }
 ]

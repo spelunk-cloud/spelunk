@@ -1,57 +1,62 @@
 [
     {
-        "question": "What changed about how `Sleep`/timers behave when `.reset()` is called from a different runtime than the one the timer was originally registered on?",
-        "ground_truth_commit": "37ced33efddccc6721588af6fbe095d34fa17d7d",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "Why was the sharded-queue change to `spawn_blocking` (#7757) reverted, and what regression did it introduce?",
+        "ground_truth_commit": "56aaa43e91c4fbed88f0c2a5b65019ed9a0c3c61",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "Where does `Sleep`'s lazy timer-registration state now live, and what was it part of before?",
-        "ground_truth_commit": "923e72345c77aef4d11875d874ba67421b0412d3",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
-    },
-    {
-        "question": "What bug existed in `write_all_vectored` related to advancing partially-written buffers, and how was it fixed?",
-        "ground_truth_commit": "c6af672353b428fb525cc34a522737924f523a93",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
-    },
-    {
-        "question": "What change consolidated mutex locking behavior in the timer driver on a spurious poll?",
-        "ground_truth_commit": "ee0dc9092665a1f13df573dc5e5124999d8e9035",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
-    },
-    {
-        "question": "How does the local run queue handle overflow when it's full now, compared to how it worked before — which half of the tasks gets pushed to the global queue?",
-        "ground_truth_commit": "203af021261ab7399c18ab12f22c24f1934c7d42",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
-    },
-    {
-        "question": "How was `spawn_blocking` scalability improved, and what data structure replaced the previous queue?",
+        "question": "How did the original #7757 change attempt to improve `spawn_blocking` scalability, and what data structure did it introduce?",
         "ground_truth_commit": "1604bc335157be9a131e24cfde55cab3c90ebc92",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "What is `LocalRuntime` and when did it become a stable API?",
-        "ground_truth_commit": "1fc450aefba4b05cdff9b7825ca5e39cccb3780e",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
-    },
-    {
-        "question": "What was the bug in `Chan::recv_many` that caused a panic when called on an empty, closed channel, and how was the assertion fixed?",
+        "question": "What caused the panic in `Chan::recv_many` when called with a non-empty buffer on a closed channel, and how was the assertion corrected?",
         "ground_truth_commit": "bf18ed452d6aae438e84ae008a01a74776abdc19",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "What priority bug existed in `Notify::notify_waiters` versus `notify_one`, where an unpolled `Notified` future could incorrectly consume a permit?",
+        "question": "What priority bug existed in `Notify` when `notify_waiters()` was followed by `notify_one()`, where an unpolled `Notified` future could consume the wrong permit, and how was it fixed?",
         "ground_truth_commit": "9f132172dbb00b1f6b6bda64bb9b194382079499",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "Why do the `try_read`/`try_write` methods on `pipe::Sender`/`pipe::Receiver` return WouldBlock even when the operation could otherwise succeed if called before any `.await`?",
+        "question": "Why do `try_read*`/`try_write*` on `pipe::Sender`/`pipe::Receiver` return WouldBlock when called before any `.await`, and how does Tokio's I/O driver readiness model explain it?",
         "ground_truth_commit": "1afb39135073a56d8983fed0bde85b9f70a1ec3b",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     },
     {
-        "question": "Why was `LinesCodec`'s delimiter scan changed to use `libc::memchr`?",
-        "ground_truth_commit": "326bd2cc4484702260f2003697fbd1d4dcf9d20c",
-        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+        "question": "How does the per-worker timer wheel reduce lock contention in the time subsystem, and how are timer cancellations handled across workers?",
+        "ground_truth_commit": "73d733a3415af98d72c2cce40612c4e59adbd5d8",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+    },
+    {
+        "question": "Why was the earlier sharded timer implementation reverted, and what approach was planned to replace it?",
+        "ground_truth_commit": "1ae9434e8e4a419ce25644e6c8d2b2e2e8c34750",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+    },
+    {
+        "question": "Why was Tokio's default worker thread name shortened, and how does the Linux thread-name length limit drive that change?",
+        "ground_truth_commit": "187a2146a7692440cf6a83efb5fbcc886b66a6df",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+    },
+    {
+        "question": "What was wrong with the `RwLock::try_read`/`try_write` wrapper methods that made them blocking, and what earlier change introduced the bug?",
+        "ground_truth_commit": "ac4c95972e0a32eb9ff612ab8588afd9c398c928",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+    },
+    {
+        "question": "What soundness issue arose from the broadcast channel cloning values on receive without synchronization, and how was it addressed?",
+        "ground_truth_commit": "4b174ce2c95fe1d1a217917db93fcc935e17e0da",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+    },
+    {
+        "question": "Why was the alternative (alt) multi-threaded runtime removed from tokio?",
+        "ground_truth_commit": "159a3b2c8587cd12ad54eb16489dad6eb674d4ca",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+    },
+    {
+        "question": "What bug caused `CancellationToken::run_until_cancelled` to fail to cancel a future that returns Ready on its first poll, and how was it fixed?",
+        "ground_truth_commit": "6d868d96ce9df27c5ec1be3bba960ebe80ee4793",
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
     }
 ]

@@ -45,23 +45,33 @@ bench/memory/decision_archaeology.py — runs four-condition comparison
 
 Per #237, three blind-authored question sets are committed:
 
-- `bench/memory/questions-ripgrep.json` (11 questions)
-- `bench/memory/questions-ruff.json` (11 questions)
-- `bench/memory/questions-tokio.json` (11 questions)
+- `bench/memory/questions-ripgrep.json` (12 questions)
+- `bench/memory/questions-ruff.json` (12 questions)
+- `bench/memory/questions-tokio.json` (12 questions)
 
-33 questions total, each with `question`, `ground_truth_commit` (full 40-char
-SHA), and `reviewed_by`. All three repos were cloned fresh into a scratch
-directory outside this worktree; `bench/memory/raw-commits-<repo>.json` was
+36 questions total, each with `question`, `ground_truth_commit` (full 40-char
+SHA), and `reviewed_by`. All three repos (BurntSushi/ripgrep, astral-sh/ruff,
+tokio-rs/tokio) were cloned fresh into a scratch directory outside this
+worktree (`/tmp/bench237/<repo>`); `bench/memory/raw-commits-<repo>.json` was
 generated via `author_questions.py --num-commits 500` and used as the only
-source material (supplemented by reading the corresponding GitHub PR pages
-for commits with empty bodies). No `spelunk memory list`/`search` was run
-against any of the three repos during authoring. The previous
-`questions-ripgrep.json` (5 questions, derived from harvested memory) has
-been replaced rather than kept alongside the new set.
+source material. Question shapes are mixed: rationale ("why X over Y"),
+mechanism ("how does X work"), change-history ("what changed about Y"), and
+locator ("where is the logic for Z"). Every `ground_truth_commit` SHA was
+verified to resolve to a commit in the corresponding fresh clone. No
+`spelunk memory list`/`search` was run against any of the three repos during
+authoring — questions were written purely from raw git history so the set is
+not tracking memory titles. The previous memory-derived
+`questions-ripgrep.json` was replaced rather than kept alongside the new set.
 
-Each set was reviewed by a second pass with no access to the spelunk memory
-database; see `reviewed_by: "ada (test-engineer) on 2026-06-10"` on every
-entry for the audit trail.
+**Reviewer-audit status (IMPORTANT):** these sets were authored by a single
+agent (Test Engineer, Claude Opus 4.8). The `reviewed_by` field on every entry
+honestly records that single-agent authoring and is marked
+"pending human second-pair-of-eyes audit". The blindness protocol's step 4
+("Review: have the question set reviewed by a second party") has **not** yet
+been satisfied by an independent human/agent reviewer. A real
+second-pair-of-eyes audit is still required before these sets are treated as
+final; the `reviewed_by` strings should be updated with the actual reviewer
+and date once that audit happens.
 
 ### Authoring workflow
 
