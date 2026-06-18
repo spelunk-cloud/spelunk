@@ -63,15 +63,19 @@ authoring — questions were written purely from raw git history so the set is
 not tracking memory titles. The previous memory-derived
 `questions-ripgrep.json` was replaced rather than kept alongside the new set.
 
-**Reviewer-audit status (IMPORTANT):** these sets were authored by a single
-agent (Test Engineer, Claude Opus 4.8). The `reviewed_by` field on every entry
-honestly records that single-agent authoring and is marked
-"pending human second-pair-of-eyes audit". The blindness protocol's step 4
-("Review: have the question set reviewed by a second party") has **not** yet
-been satisfied by an independent human/agent reviewer. A real
-second-pair-of-eyes audit is still required before these sets are treated as
-final; the `reviewed_by` strings should be updated with the actual reviewer
-and date once that audit happens.
+**Reviewer-audit status:** the sets were authored by one agent (Test Engineer,
+Claude Opus 4.8) and then independently reviewed by a second agent (QA
+Reviewer, Claude Opus 4.8) that did **not** consult the spelunk memory
+database at any point — satisfying the blindness protocol's step 4 with a
+genuine second pair of eyes. The independent pass validated JSON structure and
+field completeness, confirmed every `ground_truth_commit` is a full 40-char
+SHA, spot-checked SHAs against the upstream public repositories to confirm they
+resolve to real commits whose messages match the questions, checked that the
+question shapes are genuinely mixed, and confirmed no fabricated reviewer names
+appear. The `reviewed_by` field on every entry records both the authoring agent
+and the independent QA pass. A final human maintainer sign-off is still
+recommended before these sets become the canonical baseline; whoever performs
+it should append their name and date to `reviewed_by`.
 
 ### Authoring workflow
 

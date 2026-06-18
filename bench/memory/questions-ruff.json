@@ -2,61 +2,61 @@
     {
         "question": "Why does ruff suppress the autofix (but keep the diagnostic) for invalid control characters inside f-string replacement fields on Python versions before 3.12 (PLE2510 etc.)?",
         "ground_truth_commit": "f83e48cabc2971108870bcddcc81ed7674598476",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "How was UP032's detection of side effects broadened so it no longer unsoundly converts `.format()` calls that repeat a side-effecting argument, and what helper replaced the old call-only check?",
         "ground_truth_commit": "bc52b711c0c9f85080632b613e85416c70527fe7",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "Why did ERA001 stop flagging `ruff:ignore` and `ruff:file-ignore` comments as commented-out code?",
         "ground_truth_commit": "d08cde09a057e34b87e117d5c4f6825ee6421525",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "When does F523 avoid removing a `.format()` call entirely, and what behavior-changing cases (brace escapes, named placeholders) motivated that guard?",
         "ground_truth_commit": "49882fa3844b9f93a7985dfd277a3348975bc576",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "What caused the ERA001/RUF100 conflict when a `# noqa: ERA001` appeared on commented-out code, and how did `comment_contains_code` handling change to fix it?",
         "ground_truth_commit": "b427926f2014abf7204cc433d6cb5204c8bbc49c",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "How was RUF075's terminal-yield check extended to cover `yield` before `break`, and why is it only terminal when the enclosing loop is itself in terminal position?",
         "ground_truth_commit": "35ee0888f4ed173ed35d2fcd31d261a085a89c21",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "Why was C417's lambda-arity check (`lambda_has_expected_arity`) wrong for lambdas with positional-only parameters, and what did it fail to inspect?",
         "ground_truth_commit": "8a8e35ebfe318e2467a0f276e5d1a3a9032a55ad",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "How was parser lookahead for operators reduced, and why does only `not`/`in` still require peeking two tokens ahead?",
         "ground_truth_commit": "aea5ed4d278017057c2e842c6c3a2e92ad71495f",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "Why was a recursion limit added to ruff's parser, and what kind of input could previously cause a stack overflow?",
         "ground_truth_commit": "c423054dc09e5b644c926b6b527b6accfbe693e9",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "What does the RUF075 `fallible-context-manager` rule detect about `@contextlib.contextmanager` functions, and where is the rule implemented?",
         "ground_truth_commit": "e1cdbbad869bea136223631f13b152beaf3a3899",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "Why was RUF074 (incorrect-decorator-order) added, and what runtime failure does the `@abstractmethod` over `@property` ordering cause?",
         "ground_truth_commit": "51a7c2e7c8e9a64f64afc59a2242d8737b5cf77d",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     },
     {
         "question": "Why was `lint.future-annotations = true` incorrectly forcing strict-mode behavior for TC001/TC002/TC003, and how are the future-annotations and strict settings supposed to relate?",
         "ground_truth_commit": "5ace2a89bdc6dcaa87089fa017db48d61030aaad",
-        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 — pending human second-pair-of-eyes audit"
+        "reviewed_by": "test-engineer (Claude Opus 4.8) self-authored on 2026-06-18 \u2014 pending human second-pair-of-eyes audit; QA-reviewed by qa-reviewer (Claude Opus 4.8) on 2026-06-18 without consulting the memory DB"
     }
 ]
