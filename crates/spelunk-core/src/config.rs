@@ -144,6 +144,11 @@ struct ProjectConfig {
     /// Deprecated alias for server_key.
     memory_server_key: Option<String>,
     project_id: Option<String>,
+    /// Embedding vector dimension (must match the embedding model). Project-level
+    /// so a repo can pin the dimension of the model it was indexed with.
+    embedding_dim: Option<usize>,
+    /// Per-model document embedding-text template (placeholders `{title}`, `{body}`).
+    document_prompt_template: Option<String>,
 }
 
 /// Resolve the database path.
@@ -187,6 +192,22 @@ pub struct Config {
     /// Default embedding batch size
     #[serde(default = "Config::default_batch_size")]
     pub batch_size: usize,
+
+    /// Embedding vector dimension. Must match the embedding model's output.
+    /// The document vector table (`embeddings`) is created with this dimension
+    /// on first index; the vec0 table dimension is fixed at creation, so
+    /// switching to a model with a different dimension requires re-indexing on a
+    /// fresh `.spelunk` (`index --force` after removing the index DB).
+    /// Default: 768 (EmbeddingGemma / Nomic Embed Text v1.5).
+    #[serde(default = "Config::default_embedding_dim")]
+    pub embedding_dim: usize,
+
+    /// Document embedding-text template. Placeholders: `{title}`, `{body}`.
+    /// When unset, reproduces EmbeddingGemma's format
+    /// (`title: {title} | text: {body}`). Set per embedding model to match its
+    /// recommended document format (e.g. nomic: `search_document: {body}`).
+    #[serde(default)]
+    pub document_prompt_template: Option<String>,
 
     /// Base URL for the OpenAI-compatible API server (e.g. LM Studio, Ollama, vLLM).
     /// Default: `http://127.0.0.1:1234`
@@ -274,6 +295,9 @@ impl Config {
     fn default_batch_size() -> usize {
         32
     }
+    pub fn default_embedding_dim() -> usize {
+        768
+    }
     fn default_plans_dir() -> PathBuf {
         PathBuf::from("docs/plans")
     }
@@ -296,6 +320,8 @@ impl Default for Config {
             embedding_model: Self::default_embedding_model(),
             llm_model: None,
             batch_size: Self::default_batch_size(),
+            embedding_dim: Self::default_embedding_dim(),
+            document_prompt_template: None,
             api_base_url: Self::default_api_base_url(),
             server_url: None,
             server_key: None,
@@ -349,6 +375,12 @@ impl Config {
             }
             if let Some(v) = proj.project_id {
                 cfg.project_id = Some(v);
+            }
+            if let Some(v) = proj.embedding_dim {
+                cfg.embedding_dim = v;
+            }
+            if proj.document_prompt_template.is_some() {
+                cfg.document_prompt_template = proj.document_prompt_template;
             }
         }
 

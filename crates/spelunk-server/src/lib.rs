@@ -35,6 +35,11 @@ pub struct AppState {
     pub embedder: Option<Arc<dyn spelunk_core::embeddings::EmbeddingBackend>>,
     /// Optional LLM backend for `/explore` and `/llm/complete`.
     pub llm: Option<Arc<dyn spelunk_core::llm::LlmBackend>>,
+    /// Template applied to search queries before embedding. Placeholder `{query}`.
+    /// Default reproduces the code-retrieval prefix (`task: code retrieval | query: {query}`).
+    /// Set per embedding model (e.g. nomic: `search_query: {query}`) so the query
+    /// vector space matches the indexed document vectors.
+    pub query_prompt: String,
     /// Server-side hard ceiling for `max_tokens` on `/llm/complete`.
     /// Client-supplied values are clamped down to this. Default: 8192.
     pub max_tokens_ceiling: usize,

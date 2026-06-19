@@ -62,6 +62,17 @@ struct Args {
     #[arg(long, env = "SPELUNK_EMBEDDING_MODEL", default_value = "")]
     embedding_model: String,
 
+    /// Template applied to search queries before embedding. Placeholder `{query}`.
+    /// Default reproduces the code-retrieval prefix. Set per embedding model so the
+    /// query vector space matches the indexed documents (e.g. nomic:
+    /// `search_query: {query}`). Overrides `SPELUNK_QUERY_PROMPT`.
+    #[arg(
+        long,
+        env = "SPELUNK_QUERY_PROMPT",
+        default_value = "task: code retrieval | query: {query}"
+    )]
+    query_prompt: String,
+
     /// Base URL of an OpenAI-compatible chat completions server for LLM features
     /// (`/explore`). Overrides `SPELUNK_LLM_URL`.
     #[arg(long, env = "SPELUNK_LLM_URL")]
@@ -203,6 +214,7 @@ async fn main() -> Result<()> {
         conflict_threshold: args.conflict_threshold,
         embedder,
         llm,
+        query_prompt: args.query_prompt.clone(),
         max_tokens_ceiling,
         rate_limiter,
         instance_id,

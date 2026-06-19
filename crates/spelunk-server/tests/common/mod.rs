@@ -54,6 +54,7 @@ pub fn make_test_state(dim: usize, auth_key: Option<String>) -> spelunk_server::
         conflict_threshold: spelunk_server::default_conflict_threshold(),
         embedder: None,
         llm: None,
+        query_prompt: "task: code retrieval | query: {query}".to_string(),
         max_tokens_ceiling: 8192,
         rate_limiter: std::sync::Arc::new(spelunk_server::rate_limiter::RateLimiter::new(1000, 60)),
         instance_id,

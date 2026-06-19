@@ -1,4 +1,18 @@
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+/// Process-wide document embedding-text template, set once at the start of
+/// `index` from `Config::document_prompt_template`. Placeholders: `{title}`,
+/// `{body}`. When unset, [`Chunk::embedding_text`] uses the built-in
+/// EmbeddingGemma format. Follows the same set-once-config pattern as the
+/// secrets-scanner regexes.
+static DOC_TEMPLATE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Set the document embedding-text template for this process. Idempotent: only
+/// the first call takes effect (one `spelunk index` invocation per process).
+pub fn set_document_template(template: Option<String>) {
+    let _ = DOC_TEMPLATE.set(template);
+}
 
 /// The semantic kind of an extracted code chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +81,10 @@ impl Chunk {
             Some(doc) => format!("{doc}\n{}", self.content),
             None => self.content.clone(),
         };
+        // Per-model override (e.g. nomic: `search_document: {body}`).
+        if let Some(Some(tmpl)) = DOC_TEMPLATE.get() {
+            return tmpl.replace("{title}", title).replace("{body}", &body);
+        }
         match &self.summary {
             Some(summary) => format!("title: {title} | summary: {summary} | text: {body}"),
             None => format!("title: {title} | text: {body}"),

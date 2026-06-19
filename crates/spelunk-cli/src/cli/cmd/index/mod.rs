@@ -63,6 +63,9 @@ pub async fn index(args: IndexArgs, cfg: Config) -> Result<()> {
     // Compile secret-scanning regexes once before the hot loop.
     crate::indexer::secrets::init();
 
+    // Apply the per-model document embedding-text template (if configured).
+    crate::indexer::chunker::set_document_template(cfg.document_prompt_template.clone());
+
     // If running inside a git linked worktree, resolve to the main worktree root
     // so all worktrees share one index without creating any symlink.
     let project_root = worktree::resolve_main_worktree_root(&args.path);
@@ -72,14 +75,14 @@ pub async fn index(args: IndexArgs, cfg: Config) -> Result<()> {
         .db
         .clone()
         .unwrap_or_else(|| project_root.join(".spelunk").join("index.db"));
-    let db = match Database::open(&db_path) {
+    let db = match Database::open_with_dim(&db_path, cfg.embedding_dim) {
         Ok(db) => db,
         Err(e) => {
             if args.force && db_path.exists() {
                 tracing::warn!("corrupt index detected, deleting and rebuilding: {e}");
                 std::fs::remove_file(&db_path)
                     .with_context(|| format!("removing corrupt index at {}", db_path.display()))?;
-                Database::open(&db_path)?
+                Database::open_with_dim(&db_path, cfg.embedding_dim)?
             } else {
                 return Err(e).with_context(|| {
                     format!(

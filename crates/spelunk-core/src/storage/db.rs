@@ -9,11 +9,24 @@ pub struct Database {
 }
 
 impl Database {
-    /// Open (or create) the database at `path` and run all migrations.
+    /// Default embedding dimension (EmbeddingGemma / Nomic Embed Text v1.5).
+    pub const DEFAULT_EMBEDDING_DIM: usize = 768;
+
+    /// Open (or create) the database at `path` and run all migrations, creating
+    /// the document vector table at the default 768 dimensions.
     ///
     /// Assumes `sqlite3_auto_extension` has already been called in `main` to
     /// load the sqlite-vec extension into every new connection.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_dim(path, Self::DEFAULT_EMBEDDING_DIM)
+    }
+
+    /// Like [`Database::open`], but creates the document/snapshot vector tables
+    /// with `embedding_dim` dimensions. Used by `index` so that embedding models
+    /// whose output dimension differs from 768 index correctly. The vec0 tables
+    /// are created `IF NOT EXISTS`, so the dimension is fixed at first creation;
+    /// later opens reuse the existing tables regardless of `embedding_dim`.
+    pub fn open_with_dim(path: &Path, embedding_dim: usize) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating db directory {}", parent.display()))?;
@@ -26,7 +39,7 @@ impl Database {
 
         let db = Self { conn };
         db.migrate()?;
-        db.apply_vector_migration()?;
+        db.apply_vector_migration(embedding_dim)?;
         db.apply_graph_migration()?;
         db.apply_spec_migration()?;
         db.apply_fts_migration()?;
@@ -35,7 +48,7 @@ impl Database {
         db.apply_summary_migration()?;
         db.apply_usage_migration()?;
         db.apply_snapshot_migration()?;
-        db.apply_snapshot_vector_migration()?;
+        db.apply_snapshot_vector_migration(embedding_dim)?;
         db.apply_compound_graph_idx_migration()?;
         db.apply_conventions_migration()?;
         Ok(db)
@@ -48,10 +61,14 @@ impl Database {
         Ok(())
     }
 
-    /// Create the sqlite-vec virtual table. Idempotent (`IF NOT EXISTS`).
-    pub fn apply_vector_migration(&self) -> Result<()> {
+    /// Create the sqlite-vec virtual table at `embedding_dim` dimensions.
+    /// Idempotent (`IF NOT EXISTS`); the dimension is fixed at first creation.
+    pub fn apply_vector_migration(&self, embedding_dim: usize) -> Result<()> {
         self.conn
-            .execute_batch(include_str!("../../migrations/002_vectors.sql"))
+            .execute_batch(&format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS embeddings USING vec0(\n    \
+                 chunk_id INTEGER PRIMARY KEY,\n    embedding FLOAT[{embedding_dim}]\n);"
+            ))
             .context("running vector migration (is the sqlite-vec extension loaded?)")?;
         Ok(())
     }
@@ -130,9 +147,12 @@ impl Database {
 
     /// Create the snapshot_embeddings vec0 virtual table. Idempotent.
     /// Must be called after sqlite-vec extension is loaded.
-    pub fn apply_snapshot_vector_migration(&self) -> Result<()> {
+    pub fn apply_snapshot_vector_migration(&self, embedding_dim: usize) -> Result<()> {
         self.conn
-            .execute_batch(include_str!("../../migrations/017_snapshot_vectors.sql"))
+            .execute_batch(&format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS snapshot_embeddings USING vec0(\n    \
+                 chunk_id  INTEGER PRIMARY KEY,\n    embedding FLOAT[{embedding_dim}]\n);"
+            ))
             .context("running snapshot vector migration")?;
         Ok(())
     }

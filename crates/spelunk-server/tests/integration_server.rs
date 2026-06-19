@@ -359,6 +359,7 @@ async fn since_endpoint_returns_entries_after_timestamp() {
         conflict_threshold: spelunk_server::default_conflict_threshold(),
         embedder: None,
         llm: None,
+        query_prompt: "task: code retrieval | query: {query}".to_string(),
         max_tokens_ceiling: 8192,
         rate_limiter: Arc::new(RateLimiter::new(1000, 60)),
         instance_id,

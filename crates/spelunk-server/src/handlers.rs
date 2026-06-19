@@ -876,9 +876,10 @@ pub async fn project_search(
         )
     })?;
 
-    // Apply the code-retrieval query prefix so the vector space matches
-    // the indexed chunk vectors (Chunk::embedding_text format).
-    let query_text = format!("task: code retrieval | query: {}", body.query);
+    // Apply the configured query template so the vector space matches the
+    // indexed chunk vectors (Chunk::embedding_text format). Default reproduces
+    // the code-retrieval prefix; `--query-prompt` overrides it per model.
+    let query_text = state.query_prompt.replace("{query}", &body.query);
     let vecs = embedder
         .embed(&[query_text.as_str()])
         .await
@@ -1212,6 +1213,7 @@ mod tests {
             conflict_threshold,
             embedder: None,
             llm: None,
+            query_prompt: "task: code retrieval | query: {query}".to_string(),
             max_tokens_ceiling: 8192,
             rate_limiter: Arc::new(super::super::rate_limiter::RateLimiter::new(1000, 60)),
             instance_id,
