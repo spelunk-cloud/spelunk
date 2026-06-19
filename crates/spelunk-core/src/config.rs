@@ -149,6 +149,9 @@ struct ProjectConfig {
     embedding_dim: Option<usize>,
     /// Per-model document embedding-text template (placeholders `{title}`, `{body}`).
     document_prompt_template: Option<String>,
+    /// Chunks per embedding request. Lower it for slow or batch-limited embedding
+    /// backends (CPU model servers, llama.cpp) to avoid request timeouts / 413s.
+    batch_size: Option<usize>,
 }
 
 /// Resolve the database path.
@@ -381,6 +384,9 @@ impl Config {
             }
             if proj.document_prompt_template.is_some() {
                 cfg.document_prompt_template = proj.document_prompt_template;
+            }
+            if let Some(v) = proj.batch_size {
+                cfg.batch_size = v;
             }
         }
 

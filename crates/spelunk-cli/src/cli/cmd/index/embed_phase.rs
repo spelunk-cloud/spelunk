@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 use super::super::ui::{is_tty, progress_style};
 use crate::{capability::Tier, config::Config, embeddings::vec_to_blob, storage::Database};
 
-/// Maximum chunks per request — server enforces 256 (returns 413 if exceeded).
-/// Keep well below that ceiling so each HTTP call completes within the client
-/// timeout: at ONNX_BATCH_SIZE=32 on the server, 64 chunks = 2 ONNX calls
-/// (~30-40 s on CPU), leaving plenty of headroom under the 120 s limit.
-const MAX_BATCH: usize = 64;
+/// Hard ceiling on chunks per request — the server enforces 256 (returns 413 if
+/// exceeded). The actual batch size is `Config::batch_size` clamped to this, so
+/// slower or batch-limited embedding backends (CPU model servers, llama.cpp) can
+/// request smaller batches to avoid request timeouts / 413s.
+const MAX_BATCH: usize = 256;
 
 #[derive(Serialize)]
 struct EmbedRequest {
@@ -74,7 +74,8 @@ pub(super) async fn run_embed_phase(
 
     let mut embedded = 0u64;
 
-    for batch in chunk_ids_and_texts.chunks(MAX_BATCH) {
+    let batch_size = cfg.batch_size.clamp(1, MAX_BATCH);
+    for batch in chunk_ids_and_texts.chunks(batch_size) {
         let req_chunks: Vec<ReqChunk> = batch
             .iter()
             .map(|(id, text)| ReqChunk {
