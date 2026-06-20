@@ -2,6 +2,21 @@ use serde::{Deserialize, Serialize};
 
 use super::super::memory::Note;
 
+// ── Cloud project list wire types (ADR-005: slug→UUID resolution) ─────────────
+
+/// One entry from `GET /v1/projects` on the cloud API.
+#[derive(Deserialize)]
+pub struct CloudProjectItem {
+    pub id: String,
+    pub slug: Option<String>,
+}
+
+/// Response from `GET /v1/projects` on the cloud API.
+#[derive(Deserialize)]
+pub struct CloudProjectListResponse {
+    pub projects: Vec<CloudProjectItem>,
+}
+
 // ── Wire types (match server JSON schema) ─────────────────────────────────────
 
 #[derive(Serialize)]

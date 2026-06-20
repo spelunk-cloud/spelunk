@@ -411,6 +411,15 @@ impl Config {
     }
 }
 
+/// Return `true` if `s` is a valid UUID string (any version/variant).
+///
+/// Used by `resolve_cloud_project_uuid` to decide whether the configured
+/// `project_id` is already a UUID (skip network resolution) or a human slug
+/// (needs resolution via `GET /v1/projects`).
+pub fn looks_like_uuid(s: &str) -> bool {
+    uuid::Uuid::parse_str(s).is_ok()
+}
+
 /// Return `true` if `url` targets a loopback address (`127.x.x.x`, `localhost`, `::1`).
 ///
 /// This is a lightweight string check — no DNS resolution.
@@ -581,6 +590,25 @@ project_id = "my-proj"
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    // ── looks_like_uuid ──────────────────────────────────────────────────────
+
+    #[test]
+    fn looks_like_uuid_accepts_valid_uuid() {
+        assert!(looks_like_uuid("018f4e2a-1234-7abc-8def-000000000001"));
+        assert!(looks_like_uuid("00000000-0000-0000-0000-000000000000"));
+        assert!(looks_like_uuid("ffffffff-ffff-ffff-ffff-ffffffffffff"));
+    }
+
+    #[test]
+    fn looks_like_uuid_rejects_slugs() {
+        assert!(!looks_like_uuid("my-project"));
+        assert!(!looks_like_uuid("spelunk"));
+        assert!(!looks_like_uuid("acme/my-app"));
+        assert!(!looks_like_uuid("github.com/owner/repo"));
+        assert!(!looks_like_uuid("local/9f2a8b3c4d5e6f70"));
+        assert!(!looks_like_uuid(""));
     }
 
     // ── is_loopback_url ──────────────────────────────────────────────────────

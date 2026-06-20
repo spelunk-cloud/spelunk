@@ -1,32 +1,47 @@
 use super::*;
 
 fn backend(project_id: &str) -> RemoteMemoryBackend {
-    RemoteMemoryBackend {
-        client: reqwest::Client::new(),
-        base_url: "http://127.0.0.1:7777".to_string(),
-        project_id: project_id.to_string(),
-        api_key: None,
-    }
+    RemoteMemoryBackend::new(
+        reqwest::Client::new(),
+        "http://127.0.0.1:7777".to_string(),
+        project_id.to_string(),
+        None,
+        None,
+    )
+}
+
+fn backend_with_base(project_id: &str, base_url: &str) -> RemoteMemoryBackend {
+    RemoteMemoryBackend::new(
+        reqwest::Client::new(),
+        base_url.to_string(),
+        project_id.to_string(),
+        None,
+        None,
+    )
 }
 
 /// `derive_local_fallback` / `normalise_git_url` slugs contain `/`; the
 /// segment must be percent-encoded so axum routes the whole slug into
 /// `{project_id}` instead of splitting on `/` (→ 404). See spelunk
 /// decision #106 (mirrors IMP-1's fix in spelunk-cli/server_client.rs).
-#[test]
-fn url_percent_encodes_local_fallback_slug() {
+///
+/// Note: URL construction now resolves slugs asynchronously (ADR-005), but for
+/// loopback base URLs the slug is used directly (loopback guard D6) — no
+/// network call, and the test is still effectively synchronous in semantics.
+#[tokio::test]
+async fn url_percent_encodes_local_fallback_slug() {
     let b = backend("local/9f2a8b3c4d5e6f70");
     assert_eq!(
-        b.url("memory/search"),
+        b.url("memory/search").await.unwrap(),
         "http://127.0.0.1:7777/v1/projects/local%2F9f2a8b3c4d5e6f70/memory/search"
     );
 }
 
-#[test]
-fn url_percent_encodes_github_remote_slug() {
+#[tokio::test]
+async fn url_percent_encodes_github_remote_slug() {
     let b = backend("github.com/spelunk-cloud/spelunk");
     assert_eq!(
-        b.url("memory"),
+        b.url("memory").await.unwrap(),
         "http://127.0.0.1:7777/v1/projects/github.com%2Fspelunk-cloud%2Fspelunk/memory"
     );
 }
@@ -46,12 +61,168 @@ fn encode_project_id_round_trips_through_percent_decode() {
     }
 }
 
-#[test]
-fn url_leaves_simple_slug_unchanged() {
+#[tokio::test]
+async fn url_leaves_simple_slug_unchanged() {
     let b = backend("my-project");
     assert_eq!(
-        b.url("memory"),
+        b.url("memory").await.unwrap(),
         "http://127.0.0.1:7777/v1/projects/my-project/memory"
+    );
+}
+
+// ── ADR-005: slug→UUID resolution tests ──────────────────────────────────────
+
+/// D5: A raw UUID in `project_id` must pass through to URLs without any
+/// network call (zero-cost path).
+#[tokio::test]
+async fn uuid_project_id_passthrough_no_resolution() {
+    let uuid = "018f4e2a-1234-7abc-8def-000000000001";
+    // Use a non-loopback base URL — if resolution were attempted it would
+    // fail because there's no mock server.
+    let b = backend_with_base(uuid, "http://api.spelunk.cloud");
+    let url = b.url("memory").await.unwrap();
+    assert_eq!(
+        url,
+        format!("http://api.spelunk.cloud/v1/projects/{uuid}/memory")
+    );
+}
+
+/// D6: Loopback servers skip resolution and use the slug directly.
+#[tokio::test]
+async fn loopback_server_skips_resolution() {
+    // "my-slug" is not a UUID, but the base_url is loopback → use slug as-is
+    let b = backend_with_base("my-slug", "http://127.0.0.1:7777");
+    let url = b.url("memory").await.unwrap();
+    assert_eq!(url, "http://127.0.0.1:7777/v1/projects/my-slug/memory");
+}
+
+/// D2 + D3: A slug resolves to UUID via GET /v1/projects.
+/// Tests `resolve_cloud_project_uuid` directly — the loopback guard in
+/// `effective_project_id` is exercised separately in `loopback_server_skips_resolution`.
+#[tokio::test]
+async fn slug_resolves_to_uuid_via_api() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "projects": [
+                {"id": "018f4e2a-1234-7abc-8def-000000000001", "slug": "spelunk"},
+                {"id": "00000000-0000-0000-0000-000000000002", "slug": "other-project"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let uuid = resolve_cloud_project_uuid(&client, &server.uri(), None, "spelunk", None)
+        .await
+        .unwrap();
+    assert_eq!(uuid, "018f4e2a-1234-7abc-8def-000000000001");
+}
+
+/// D4: Cache hit with matching slug returns cached UUID without hitting the API.
+#[tokio::test]
+async fn cache_hit_matching_slug_returns_cached_uuid() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let spelunk_dir = tmp.path();
+
+    write_cache(spelunk_dir, "my-slug", "018f4e2a-0000-0000-0000-000000000099");
+
+    // The API should NOT be called (mock returns 500 to detect unwanted calls)
+    Mock::given(method("GET"))
+        .and(path("/v1/projects"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let uuid =
+        resolve_cloud_project_uuid(&client, &server.uri(), None, "my-slug", Some(spelunk_dir))
+            .await
+            .unwrap();
+    assert_eq!(
+        uuid, "018f4e2a-0000-0000-0000-000000000099",
+        "expected cached UUID, got: {uuid}"
+    );
+}
+
+/// D4: Cache hit with mismatched slug discards cache and re-resolves.
+#[tokio::test]
+async fn cache_miss_stale_slug_triggers_resolution() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let spelunk_dir = tmp.path();
+
+    // Write a cache with a DIFFERENT slug
+    write_cache(spelunk_dir, "old-slug", "018f4e2a-0000-0000-0000-000000000099");
+
+    // The API MUST be called because the cached slug doesn't match
+    Mock::given(method("GET"))
+        .and(path("/v1/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "projects": [
+                {"id": "018f4e2a-1234-7abc-8def-aaaaaaaaaaaa", "slug": "new-slug"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let uuid =
+        resolve_cloud_project_uuid(&client, &server.uri(), None, "new-slug", Some(spelunk_dir))
+            .await
+            .unwrap();
+    assert_eq!(
+        uuid, "018f4e2a-1234-7abc-8def-aaaaaaaaaaaa",
+        "expected freshly resolved UUID, got: {uuid}"
+    );
+}
+
+/// Slug not found in project list → descriptive error message.
+#[tokio::test]
+async fn slug_not_found_returns_descriptive_error() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "projects": [
+                {"id": "00000000-0000-0000-0000-000000000001", "slug": "other-project"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let err =
+        resolve_cloud_project_uuid(&client, &server.uri(), None, "spelunk", None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+    assert!(
+        err.contains("project slug \"spelunk\" not found"),
+        "expected slug-not-found error, got: {err}"
+    );
+    assert!(
+        err.contains("spelunk projects list") || err.contains(".spelunk/config.toml"),
+        "expected actionable hint in error, got: {err}"
     );
 }
 
@@ -107,12 +278,14 @@ async fn search_sends_query_text_not_precomputed_embedding() {
         .mount(&server)
         .await;
 
-    let backend = RemoteMemoryBackend {
-        client: reqwest::Client::new(),
-        base_url: server.uri(),
-        project_id: "local/abc123".to_string(),
-        api_key: None,
-    };
+    // Use loopback base URL so the slug is used as-is (no slug resolution)
+    let backend = RemoteMemoryBackend::new(
+        reqwest::Client::new(),
+        server.uri(),
+        "local/abc123".to_string(),
+        None,
+        None,
+    );
 
     // `MemoryBackend::search` takes both a pre-computed query embedding
     // blob (used by local backends for KNN) *and* the raw query text

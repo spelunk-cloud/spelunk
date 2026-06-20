@@ -96,12 +96,16 @@ pub fn open_memory_backend(
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
-        Ok(Box::new(RemoteMemoryBackend {
+        // Derive the `.spelunk/` directory from `mem_path` (which is typically
+        // `.spelunk/memory.db`) for use by the slug→UUID cache (ADR-005).
+        let spelunk_dir = mem_path.parent().map(|p| p.to_path_buf());
+        Ok(Box::new(RemoteMemoryBackend::new(
             client,
-            base_url: url.clone(),
+            url.clone(),
             project_id,
-            api_key: cfg.server_key.clone(),
-        }))
+            cfg.server_key.clone(),
+            spelunk_dir,
+        )))
     } else {
         Ok(Box::new(LocalMemoryBackend::new(MemoryStore::open(
             mem_path,
