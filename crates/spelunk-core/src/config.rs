@@ -152,6 +152,8 @@ struct ProjectConfig {
     /// Chunks per embedding request. Lower it for slow or batch-limited embedding
     /// backends (CPU model servers, llama.cpp) to avoid request timeouts / 413s.
     batch_size: Option<usize>,
+    /// Cap on the character length of each chunk's embedding text (see Config).
+    max_embed_chars: Option<usize>,
 }
 
 /// Resolve the database path.
@@ -211,6 +213,13 @@ pub struct Config {
     /// recommended document format (e.g. nomic: `search_document: {body}`).
     #[serde(default)]
     pub document_prompt_template: Option<String>,
+
+    /// Optional cap on the character length of each chunk's embedding text.
+    /// Embedding backends served externally (e.g. llama.cpp) reject or skip
+    /// inputs longer than the model's context; this bounds the text so they
+    /// don't error. When unset, the embedding text is sent in full.
+    #[serde(default)]
+    pub max_embed_chars: Option<usize>,
 
     /// Base URL for the OpenAI-compatible API server (e.g. LM Studio, Ollama, vLLM).
     /// Default: `http://127.0.0.1:1234`
@@ -325,6 +334,7 @@ impl Default for Config {
             batch_size: Self::default_batch_size(),
             embedding_dim: Self::default_embedding_dim(),
             document_prompt_template: None,
+            max_embed_chars: None,
             api_base_url: Self::default_api_base_url(),
             server_url: None,
             server_key: None,
@@ -387,6 +397,9 @@ impl Config {
             }
             if let Some(v) = proj.batch_size {
                 cfg.batch_size = v;
+            }
+            if proj.max_embed_chars.is_some() {
+                cfg.max_embed_chars = proj.max_embed_chars;
             }
         }
 

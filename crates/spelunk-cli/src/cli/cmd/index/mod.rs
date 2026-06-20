@@ -65,6 +65,7 @@ pub async fn index(args: IndexArgs, cfg: Config) -> Result<()> {
 
     // Apply the per-model document embedding-text template (if configured).
     crate::indexer::chunker::set_document_template(cfg.document_prompt_template.clone());
+    crate::indexer::chunker::set_max_embed_chars(cfg.max_embed_chars);
 
     // If running inside a git linked worktree, resolve to the main worktree root
     // so all worktrees share one index without creating any symlink.

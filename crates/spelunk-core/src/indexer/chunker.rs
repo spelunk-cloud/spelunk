@@ -14,6 +14,26 @@ pub fn set_document_template(template: Option<String>) {
     let _ = DOC_TEMPLATE.set(template);
 }
 
+/// Process-wide cap on embedding-text length (chars), set once at the start of
+/// `index` from `Config::max_embed_chars`. Bounds input for external embedding
+/// backends that reject over-length text (e.g. llama.cpp).
+static MAX_EMBED_CHARS: OnceLock<Option<usize>> = OnceLock::new();
+
+/// Set the embedding-text character cap for this process. Idempotent.
+pub fn set_max_embed_chars(max_chars: Option<usize>) {
+    let _ = MAX_EMBED_CHARS.set(max_chars);
+}
+
+/// Truncate `text` to at most `max` chars on a UTF-8 boundary.
+fn cap_chars(text: String) -> String {
+    if let Some(Some(max)) = MAX_EMBED_CHARS.get()
+        && text.chars().count() > *max
+    {
+        return text.chars().take(*max).collect();
+    }
+    text
+}
+
 /// The semantic kind of an extracted code chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,13 +102,15 @@ impl Chunk {
             None => self.content.clone(),
         };
         // Per-model override (e.g. nomic: `search_document: {body}`).
-        if let Some(Some(tmpl)) = DOC_TEMPLATE.get() {
-            return tmpl.replace("{title}", title).replace("{body}", &body);
-        }
-        match &self.summary {
-            Some(summary) => format!("title: {title} | summary: {summary} | text: {body}"),
-            None => format!("title: {title} | text: {body}"),
-        }
+        let out = if let Some(Some(tmpl)) = DOC_TEMPLATE.get() {
+            tmpl.replace("{title}", title).replace("{body}", &body)
+        } else {
+            match &self.summary {
+                Some(summary) => format!("title: {title} | summary: {summary} | text: {body}"),
+                None => format!("title: {title} | text: {body}"),
+            }
+        };
+        cap_chars(out)
     }
 }
 
