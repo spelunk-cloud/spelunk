@@ -9,6 +9,51 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`spelunk login` / `spelunk logout`** — authenticate the CLI against
+  spelunk.cloud using the OAuth 2.0 Device Authorization Grant (RFC 8628).
+  `spelunk login` initiates the flow, prints a verification URL and user code to
+  enter in the browser, polls for approval (with back-off on
+  `authorization_pending` / `slow_down`), and on success stores the issued
+  `api_key` in `~/.config/spelunk/config.toml`. `spelunk logout` removes the
+  stored credential. `--cloud-url` (or `SPELUNK_CLOUD_URL`) overrides the
+  default `https://api.spelunk.cloud` endpoint. (ADR-037 P3, #430)
+
+- **Two-way memory sync with spelunk.cloud (`spelunk sync` / `spelunk memory
+  sync`).** When a team server is configured, `spelunk sync` (top-level alias
+  for `spelunk memory sync`) now performs a real two-way sync: it pushes local
+  memory entries the cloud has not seen and pulls remote entries into the local
+  `memory.db`, applying changes keep-both so concurrent edits on multiple
+  machines are preserved. A new `spelunk memory pull` does a one-way delta pull.
+  Sync is identity-keyed on a time-ordered UUID carried by each entry, so it is
+  idempotent (re-running never duplicates) and drift-free across machine clocks;
+  archived entries propagate as tombstones. (ADR-037 P1, #425)
+
+- **Sync modes (`mode = offline | local_first | cloud_first`).** A new `mode`
+  config field (and `SPELUNK_MODE` env override) controls how the CLI reconciles
+  local and cloud memory. The default preserves existing behaviour: with no
+  `server_url` the CLI is `offline`; with a `server_url` set it is `local_first`.
+  `SPELUNK_NO_SERVER=1` remains a hard kill-switch. (ADR-037 P1, #425)
+
+### Changed
+
+- **Cloud project slug auto-resolves to its server UUID.** When a team
+  `server_url` routes projects by an internal UUID, a human `project_id` slug is
+  now resolved to that UUID on first use via `GET /v1/projects` and cached in
+  `.spelunk/cloud-project-id.lock`; a raw-UUID `project_id` is used directly, and
+  a loopback/unset server is left untouched. The cache is invalidated
+  automatically if the slug changes, and `SPELUNK_NO_SLUG_CACHE=1` forces a fresh
+  lookup. This makes the human-readable `project_id` work transparently against
+  cloud-api routing. (ADR-005, #428)
+
+### Dependencies
+
+- `tower-http` 0.6.11 → 0.7.0 (#431)
+- `actions/checkout` 6 → 7 (CI) (#432)
+- Refreshed `Cargo.lock` to latest semver-compatible versions; no new advisories
+  (#433)
+
 ## [0.8.3] — 2026-06-17
 
 ### Changed
