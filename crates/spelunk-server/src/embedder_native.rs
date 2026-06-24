@@ -253,7 +253,7 @@ impl Qwen3EmbedWeights {
         let mut flat: Vec<u32> = Vec::with_capacity(b * max_seq);
         for ids in batch_ids {
             flat.extend_from_slice(ids);
-            flat.extend(std::iter::repeat(0u32).take(max_seq - ids.len()));
+            flat.extend(std::iter::repeat_n(0u32, max_seq - ids.len()));
         }
         let ids_t = Tensor::from_slice(&flat, (b, max_seq), &self.device)?;
 

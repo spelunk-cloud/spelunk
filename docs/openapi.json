@@ -158,13 +158,9 @@
         },
         "responses": {
           "200": {
-            "description": "Embedding vectors (not stored server-side)",
+            "description": "Embedding vectors as raw little-endian f32 bytes, row-major [n_chunks x dim] in request order (not stored server-side)",
             "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EmbedResponse"
-                }
-              }
+              "application/octet-stream": {}
             }
           },
           "400": {

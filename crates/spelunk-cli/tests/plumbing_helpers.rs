@@ -71,37 +71,31 @@ pub fn write_config_with_server(
 /// Dynamic responder for `POST /v1/projects/{id}/index/embed`.
 ///
 /// Parses the request body `{"chunks":[{"chunk_id":"…","content":"…"}]}` and
-/// returns `{"chunks":[{"chunk_id":"…","vector":[0.1,…,0.1]}]}` for each
-/// chunk so the CLI can store the (fake) vectors in the local DB.
+/// returns the server's wire format: raw little-endian f32 bytes, one constant
+/// 896-dim vector per request chunk in order (no chunk_id framing — the CLI maps
+/// response[i] → request chunk[i] by position).
 pub struct IndexEmbedResponder;
 
 impl wiremock::Respond for IndexEmbedResponder {
     fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
         #[derive(serde::Deserialize)]
         struct ReqBody {
-            chunks: Vec<ReqChunk>,
-        }
-        #[derive(serde::Deserialize)]
-        struct ReqChunk {
-            chunk_id: String,
+            chunks: Vec<serde_json::Value>,
         }
 
         let body: ReqBody =
             serde_json::from_slice(&request.body).unwrap_or(ReqBody { chunks: vec![] });
 
-        let resp_chunks: Vec<serde_json::Value> = body
-            .chunks
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "chunk_id": c.chunk_id,
-                    "vector": vec![0.1f32; 896],
-                })
-            })
-            .collect();
+        let mut bytes = Vec::with_capacity(body.chunks.len() * 896 * 4);
+        for _ in &body.chunks {
+            for _ in 0..896 {
+                bytes.extend_from_slice(&0.1f32.to_le_bytes());
+            }
+        }
 
         wiremock::ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!({ "chunks": resp_chunks }))
+            .insert_header("content-type", "application/octet-stream")
+            .set_body_bytes(bytes)
     }
 }
 
