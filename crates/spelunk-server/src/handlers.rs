@@ -718,7 +718,7 @@ pub struct EmbedResponse {
     ),
     request_body = EmbedRequest,
     responses(
-        (status = 200, description = "Embedding vectors (not stored server-side)", body = EmbedResponse),
+        (status = 200, description = "Embedding vectors as raw little-endian f32 bytes, row-major [n_chunks x dim] in request order (not stored server-side)", content_type = "application/octet-stream"),
         (status = 400, description = "No embedder configured", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 413, description = "Batch exceeds 256 chunks", body = ErrorBody),
@@ -756,7 +756,7 @@ pub async fn index_embed(
     })?;
 
     if body.chunks.is_empty() {
-        return Ok(Json(EmbedResponse { chunks: vec![] }).into_response());
+        return Ok(octet_stream(Vec::new()));
     }
 
     // Collect texts, preserving order for reassembly.
@@ -771,18 +771,29 @@ pub async fn index_embed(
         )));
     }
 
-    let out_chunks: Vec<EmbedChunkOut> = body
-        .chunks
-        .into_iter()
-        .zip(vectors)
-        .map(|(c, v)| EmbedChunkOut {
-            chunk_id: c.chunk_id,
-            vector: v,
-        })
-        .collect();
-
+    // Serialise as raw little-endian f32 bytes, one vector after another in
+    // request order. Avoids the per-element JSON float-array cost on both
+    // serialize (here) and parse (CLI); the client maps response[i] → request
+    // chunk[i] by position, so no chunk_id framing is needed.
+    // (Snowflake "byte serialization" optimisation.)
+    let dim = vectors.first().map_or(0, Vec::len);
+    let mut body_bytes = Vec::with_capacity(vectors.len() * dim * 4);
+    for v in &vectors {
+        for f in v {
+            body_bytes.extend_from_slice(&f.to_le_bytes());
+        }
+    }
     // Data promise: vectors are NOT stored on the server. We return them directly.
-    Ok(Json(EmbedResponse { chunks: out_chunks }).into_response())
+    Ok(octet_stream(body_bytes))
+}
+
+/// Build a `200 OK` response carrying raw bytes as `application/octet-stream`.
+fn octet_stream(bytes: Vec<u8>) -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response()
 }
 
 // ── Code search (query embedding proxy, spelunk#322) ─────────────────────────

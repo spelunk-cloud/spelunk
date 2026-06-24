@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -72,17 +72,6 @@ struct EmbedChunkIn<'a> {
 #[derive(Serialize)]
 struct EmbedReq<'a> {
     chunks: Vec<EmbedChunkIn<'a>>,
-}
-
-#[derive(Deserialize)]
-struct EmbedChunkOut {
-    chunk_id: String,
-    vector: Vec<f32>,
-}
-
-#[derive(Deserialize)]
-struct EmbedResp {
-    chunks: Vec<EmbedChunkOut>,
 }
 
 // ── Public message type (mirrors spelunk_core::llm::Message) ─────────────────
@@ -271,7 +260,8 @@ impl ServerInferenceClient {
             }],
         };
 
-        let resp: EmbedResp = self
+        // Response is raw little-endian f32 bytes (one vector, `dim` floats).
+        let bytes = self
             .authed(self.client.post(self.embed_url()))
             .json(&body)
             .send()
@@ -279,15 +269,18 @@ impl ServerInferenceClient {
             .context("POST /index/embed (query vector)")?
             .error_for_status()
             .context("spelunk-server returned an error for /index/embed")?
-            .json()
+            .bytes()
             .await
-            .context("parsing /index/embed response")?;
+            .context("reading /index/embed response")?;
 
-        resp.chunks
-            .into_iter()
-            .find(|c| c.chunk_id == chunk_id)
-            .map(|c| c.vector)
-            .ok_or_else(|| anyhow::anyhow!("embed response missing chunk_id {chunk_id}"))
+        let expected = spelunk_core::embeddings::EMBEDDING_DIM * 4;
+        anyhow::ensure!(
+            bytes.len() == expected,
+            "embed response is {} bytes, expected {expected} (one {}-dim f32 vector)",
+            bytes.len(),
+            spelunk_core::embeddings::EMBEDDING_DIM,
+        );
+        Ok(spelunk_core::embeddings::blob_to_vec(&bytes))
     }
 
     /// Call `POST /v1/projects/{id}/search` to embed a query server-side and

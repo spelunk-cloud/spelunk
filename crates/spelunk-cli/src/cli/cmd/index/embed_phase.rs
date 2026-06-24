@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use super::super::ui::{is_tty, progress_style};
 use crate::{capability::Tier, config::Config, storage::Database};
@@ -20,17 +20,6 @@ struct EmbedRequest {
 struct ReqChunk {
     chunk_id: String,
     content: String,
-}
-
-#[derive(Deserialize)]
-struct EmbedResponse {
-    chunks: Vec<RespChunk>,
-}
-
-#[derive(Deserialize)]
-struct RespChunk {
-    chunk_id: String,
-    vector: Vec<f32>,
 }
 
 /// Send pending chunks to `spelunk-server` for embedding and write the returned
@@ -100,22 +89,34 @@ pub(super) async fn run_embed_phase(
             req = req.bearer_auth(k);
         }
 
-        let resp: EmbedResponse = req
+        // Response is raw little-endian f32 bytes: one `dim`-float vector per
+        // request chunk, in request order. Map bytes[i] → batch[i].
+        let bytes = req
             .send()
             .await
             .with_context(|| format!("calling {url}"))?
             .error_for_status()
             .context("server returned an error for index/embed")?
-            .json()
+            .bytes()
             .await
-            .context("parsing index/embed response")?;
+            .context("reading index/embed response")?;
 
-        for item in &resp.chunks {
-            if let Ok(row_id) = item.chunk_id.parse::<i64>() {
-                db.insert_embedding(row_id, &item.vector)?;
-                embedded += 1;
-                bar.inc(1);
-            }
+        let dim = spelunk_core::embeddings::EMBEDDING_DIM;
+        let stride = dim * 4;
+        let expected = batch.len() * stride;
+        anyhow::ensure!(
+            bytes.len() == expected,
+            "index/embed returned {} bytes, expected {expected} ({} × {dim}-dim f32)",
+            bytes.len(),
+            batch.len(),
+        );
+
+        for (i, (row_id, _text)) in batch.iter().enumerate() {
+            let vector =
+                spelunk_core::embeddings::blob_to_vec(&bytes[i * stride..(i + 1) * stride]);
+            db.insert_embedding(*row_id, &vector)?;
+            embedded += 1;
+            bar.inc(1);
         }
     }
 
