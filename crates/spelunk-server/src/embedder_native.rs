@@ -18,6 +18,10 @@ pub const DIM: usize = 896;
 const MODEL_ID: &str = "codefuse-ai/F2LLM-v2-330M";
 /// Hard ceiling for token sequences (max_position_embeddings).
 const MAX_SEQ_LEN: usize = 40960;
+/// Number of sequences processed in one padded forward pass.
+/// Sequences within a sub-batch are sorted by length first so padding waste
+/// stays bounded.  Tune upward if BLAS efficiency plateaus at larger matrices.
+const EMBED_BATCH_SIZE: usize = 8;
 
 pub struct NativeEmbedder {
     inner: Arc<Mutex<EmbedderInner>>,
@@ -140,6 +144,59 @@ impl Qwen3EmbedWeights {
             h = self.layer_fwd(&h, layer, &mask)?;
         }
         Ok(self.final_norm.forward(&h)?)
+    }
+
+    /// Padded batch forward pass: all sequences in `batch_ids` are right-padded
+    /// to the longest sequence in the batch.  Returns one L2-normalised
+    /// embedding vector per input sequence in the same order.
+    ///
+    /// With right-padding and a standard causal mask, each sequence's EOS token
+    /// (the last real token, at position `seq_len-1`) only attends to real
+    /// tokens before it — the pad tokens appended after it are causally masked
+    /// out.  Padding token hidden states are discarded; only the EOS position is
+    /// extracted per sequence.
+    fn embed_batch(&self, batch_ids: &[&[u32]]) -> Result<Vec<Vec<f32>>> {
+        let b = batch_ids.len();
+        assert!(b > 0);
+
+        if b == 1 {
+            // Skip padding overhead for single sequences.
+            let ids = batch_ids[0];
+            let hidden = self.forward_one(ids)?;
+            let last = hidden.i((0, ids.len() - 1))?;
+            let mut v: Vec<f32> = last.to_dtype(DType::F32)?.to_vec1()?;
+            l2_normalise(&mut v);
+            return Ok(vec![v]);
+        }
+
+        let seq_lens: Vec<usize> = batch_ids.iter().map(|ids| ids.len()).collect();
+        let max_seq = *seq_lens.iter().max().unwrap();
+
+        // Build flat right-padded buffer [B × max_seq] with pad id = 0.
+        let mut flat: Vec<u32> = Vec::with_capacity(b * max_seq);
+        for ids in batch_ids {
+            flat.extend_from_slice(ids);
+            flat.extend(std::iter::repeat(0u32).take(max_seq - ids.len()));
+        }
+        let ids_t = Tensor::from_slice(&flat, (b, max_seq), &self.device)?;
+
+        // Forward pass: all layers work naturally with batch dim > 1.
+        let mut h = self.embed_tokens.forward(&ids_t)?; // [b, max_seq, hidden]
+        let mask = causal_mask(max_seq, h.dtype(), &self.device)?; // [1, 1, max_seq, max_seq]
+        for layer in &self.layers {
+            h = self.layer_fwd(&h, layer, &mask)?;
+        }
+        let h = self.final_norm.forward(&h)?; // [b, max_seq, hidden]
+
+        // Extract last real token per sequence → L2-normalise.
+        let mut out = Vec::with_capacity(b);
+        for (i, &seq_len) in seq_lens.iter().enumerate() {
+            let last = h.i((i, seq_len - 1))?; // [hidden]
+            let mut v: Vec<f32> = last.to_dtype(DType::F32)?.to_vec1()?;
+            l2_normalise(&mut v);
+            out.push(v);
+        }
+        Ok(out)
     }
 
     fn layer_fwd(&self, x: &Tensor, layer: &EmbedLayer, mask: &Tensor) -> Result<Tensor> {
@@ -358,9 +415,12 @@ fn l2_normalise(v: &mut [f32]) {
 impl spelunk_core::embeddings::EmbeddingBackend for NativeEmbedder {
     /// Embed a batch of strings using F2LLM-v2-330M.
     ///
-    /// Each string is tokenized with `add_special_tokens=true` (appends EOS),
-    /// forwarded through the Qwen3 decoder without KV cache, and the last
-    /// token's hidden state is L2-normalised to produce a 896-dim embedding.
+    /// Texts are tokenized, sorted by token length (to minimise padding waste),
+    /// then forwarded through the Qwen3 decoder in padded sub-batches of
+    /// `EMBED_BATCH_SIZE`.  Each sub-batch is one BLAS call with batch dim > 1,
+    /// which amortises the per-call overhead.  The last token's hidden state is
+    /// L2-normalised to produce a 896-dim embedding; results are returned in the
+    /// original input order.
     async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
         let inner = Arc::clone(&self.inner);
@@ -370,31 +430,38 @@ impl spelunk_core::embeddings::EmbeddingBackend for NativeEmbedder {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("native embedder lock poisoned"))?;
 
-            let mut results = Vec::with_capacity(owned.len());
-
+            // 1. Tokenize all texts upfront.
+            let mut id_vecs: Vec<Vec<u32>> = Vec::with_capacity(owned.len());
             for text in &owned {
                 let encoding = guard
                     .tokenizer
                     .encode(text.as_str(), true) // add_special_tokens=true → appends EOS
                     .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
-
                 let ids: Vec<u32> = encoding
                     .get_ids()
                     .iter()
                     .take(MAX_SEQ_LEN)
                     .copied()
                     .collect();
-                let seq_len = ids.len();
-                anyhow::ensure!(seq_len > 0, "empty token sequence after tokenization");
+                anyhow::ensure!(!ids.is_empty(), "empty token sequence after tokenization");
+                id_vecs.push(ids);
+            }
 
-                // [1, seq_len, 896]
-                let hidden = guard.weights.forward_one(&ids)?;
+            // 2. Sort by token length so sequences in the same sub-batch have
+            //    similar lengths, minimising padding waste.
+            let mut indexed: Vec<(usize, Vec<u32>)> =
+                id_vecs.into_iter().enumerate().collect();
+            indexed.sort_unstable_by_key(|(_, ids)| ids.len());
 
-                // Last token (EOS) hidden state → [896]
-                let last = hidden.i((0, seq_len - 1))?;
-                let mut vec: Vec<f32> = last.to_dtype(DType::F32)?.to_vec1()?;
-                l2_normalise(&mut vec);
-                results.push(vec);
+            // 3. Process in sub-batches; reassemble into original order.
+            let mut results: Vec<Vec<f32>> = vec![Vec::new(); owned.len()];
+            for sub_batch in indexed.chunks(EMBED_BATCH_SIZE) {
+                let batch_ids: Vec<&[u32]> =
+                    sub_batch.iter().map(|(_, ids)| ids.as_slice()).collect();
+                let vecs = guard.weights.embed_batch(&batch_ids)?;
+                for ((orig_idx, _), vec) in sub_batch.iter().zip(vecs) {
+                    results[*orig_idx] = vec;
+                }
             }
 
             Ok(results)
