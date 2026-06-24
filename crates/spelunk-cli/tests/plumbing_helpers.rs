@@ -95,7 +95,7 @@ impl wiremock::Respond for IndexEmbedResponder {
             .map(|c| {
                 serde_json::json!({
                     "chunk_id": c.chunk_id,
-                    "vector": vec![0.1f32; 768],
+                    "vector": vec![0.1f32; 896],
                 })
             })
             .collect();
@@ -140,7 +140,7 @@ pub fn index_fixture_project() -> (TempDir, PathBuf, PathBuf) {
         Mock::given(method("POST"))
             .and(path("/v1/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{ "embedding": vec![0.1f32; 768], "index": 0 }],
+                "data": [{ "embedding": vec![0.1f32; 896], "index": 0 }],
                 "model": "test-model",
                 "object": "list",
                 "usage": { "prompt_tokens": 5, "total_tokens": 5 },

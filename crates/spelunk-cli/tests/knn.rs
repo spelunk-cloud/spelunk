@@ -110,13 +110,13 @@ fn knn_returns_ndjson_results_for_valid_vector() {
 
     // Construct a unit vector of 768 dimensions.
     let vec: Vec<f32> = {
-        let mut v = vec![0.0f32; 768];
+        let mut v = vec![0.0f32; 896];
         v[0] = 1.0;
         v
     };
     let payload = serde_json::json!({
         "model": "test-model",
-        "dimensions": 768,
+        "dimensions": 896,
         "vector": vec,
     });
 
@@ -159,13 +159,13 @@ fn knn_lang_filter_restricts_to_language() {
     .unwrap();
 
     let vec: Vec<f32> = {
-        let mut v = vec![0.0f32; 768];
+        let mut v = vec![0.0f32; 896];
         v[0] = 1.0;
         v
     };
     let payload = serde_json::json!({
         "model": "test-model",
-        "dimensions": 768,
+        "dimensions": 896,
         "vector": vec,
     });
 
@@ -210,13 +210,13 @@ fn knn_min_score_filter_respects_threshold() {
     .unwrap();
 
     let vec: Vec<f32> = {
-        let mut v = vec![0.0f32; 768];
+        let mut v = vec![0.0f32; 896];
         v[0] = 1.0;
         v
     };
     let payload = serde_json::json!({
         "model": "test-model",
-        "dimensions": 768,
+        "dimensions": 896,
         "vector": vec,
     });
 

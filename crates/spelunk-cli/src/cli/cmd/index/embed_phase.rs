@@ -55,8 +55,11 @@ pub(super) async fn run_embed_phase(
     let project_id_owned = cfg.resolve_project_id(project_root);
     let project_id = project_id_owned.as_str();
 
+    // 600 s: the native CPU embedder can take ~400 ms/chunk; at MAX_BATCH=256
+    // that is ~100 s per request.  Give 6× headroom so large codebases and
+    // slow machines don't hit the deadline.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(600))
         .build()
         .context("building HTTP client for embed phase")?;
 

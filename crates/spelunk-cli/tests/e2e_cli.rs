@@ -98,7 +98,7 @@ async fn test_index_and_status() {
         .and(path_regex(r"^/v1/projects/.+/search$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "mode": "hybrid",
-            "query_vector": vec![0.1f32; 768],
+            "query_vector": vec![0.1f32; 896],
         })))
         .mount(&mock_server)
         .await;
@@ -486,7 +486,7 @@ async fn test_status_json_stable_schema() {
     Mock::given(method("POST"))
         .and(path("/v1/embeddings"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "data": [{ "embedding": vec![0.1f64; 768], "index": 0 }],
+            "data": [{ "embedding": vec![0.1f64; 896], "index": 0 }],
             "model": "test-model",
             "object": "list",
             "usage": { "prompt_tokens": 5, "total_tokens": 5 }
