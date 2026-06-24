@@ -36,6 +36,7 @@ sqlite-vec = { workspace = true }
 uuid = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { workspace = true }
+gethostname = "1"
 indicatif = "0.18"
 futures-util = "0.3"
 ignore = "0.4"
