@@ -150,23 +150,31 @@ impl Qwen3EmbedWeights {
     /// to the longest sequence in the batch.  Returns one L2-normalised
     /// embedding vector per input sequence in the same order.
     ///
-    /// With right-padding and a standard causal mask, each sequence's EOS token
-    /// (the last real token, at position `seq_len-1`) only attends to real
-    /// tokens before it — the pad tokens appended after it are causally masked
-    /// out.  Padding token hidden states are discarded; only the EOS position is
-    /// extracted per sequence.
+    /// On CPU, sequences are forwarded together as a single BLAS call (batch
+    /// dim > 1), amortising per-call overhead.  On Metal/GPU the sequential
+    /// path is used instead: Metal's buffer pool grows unboundedly with batched
+    /// inference because `(b × n_head × seq²)` attention tensors are never
+    /// compacted between forward passes, causing OOM for large codebases.
+    /// Sequential GPU inference was the pre-batching baseline and is still fast.
     fn embed_batch(&self, batch_ids: &[&[u32]]) -> Result<Vec<Vec<f32>>> {
         let b = batch_ids.len();
         assert!(b > 0);
 
-        if b == 1 {
-            // Skip padding overhead for single sequences.
-            let ids = batch_ids[0];
-            let hidden = self.forward_one(ids)?;
-            let last = hidden.i((0, ids.len() - 1))?;
-            let mut v: Vec<f32> = last.to_dtype(DType::F32)?.to_vec1()?;
-            l2_normalise(&mut v);
-            return Ok(vec![v]);
+        // Sequential path: single sequences, or any GPU/Metal device.
+        if b == 1 || !matches!(self.device, Device::Cpu) {
+            let mut out = Vec::with_capacity(b);
+            for ids in batch_ids {
+                let hidden = self.forward_one(ids)?;
+                let last = hidden.i((0, ids.len() - 1))?;
+                let mut v: Vec<f32> = last.to_dtype(DType::F32)?.to_vec1()?;
+                l2_normalise(&mut v);
+                anyhow::ensure!(
+                    v.iter().all(|x| x.is_finite()),
+                    "embedding vector contains NaN/inf — check model weights or sequence length"
+                );
+                out.push(v);
+            }
+            return Ok(out);
         }
 
         let seq_lens: Vec<usize> = batch_ids.iter().map(|ids| ids.len()).collect();
@@ -194,6 +202,10 @@ impl Qwen3EmbedWeights {
             let last = h.i((i, seq_len - 1))?; // [hidden]
             let mut v: Vec<f32> = last.to_dtype(DType::F32)?.to_vec1()?;
             l2_normalise(&mut v);
+            anyhow::ensure!(
+                v.iter().all(|x| x.is_finite()),
+                "embedding vector contains NaN/inf — check model weights or sequence length"
+            );
             out.push(v);
         }
         Ok(out)
