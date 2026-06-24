@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::io::Read as _;
 
 use super::PlumbingKnnArgs;
-use crate::{embeddings::vec_to_blob, storage::Database};
+use crate::storage::Database;
 
 pub(super) async fn knn(args: PlumbingKnnArgs, db: &Database) -> Result<()> {
     // Read entire stdin and parse as JSON: {"model":"...","dimensions":N,"vector":[...]}
@@ -25,9 +25,7 @@ pub(super) async fn knn(args: PlumbingKnnArgs, db: &Database) -> Result<()> {
         .collect::<Option<Vec<_>>>()
         .context("\"vector\" array must contain numbers")?;
 
-    let blob = vec_to_blob(&vector);
-
-    let mut results = db.search_similar(&blob, args.limit + 20)?;
+    let mut results = db.search_similar(&vector, args.limit + 20)?;
 
     // Filter by min_score (distance ≤ 1 - min_score for cosine) and language.
     // sqlite-vec returns cosine distance; convert to similarity for --min-score.

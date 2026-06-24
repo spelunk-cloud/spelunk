@@ -7,7 +7,6 @@
 mod common;
 
 use serial_test::serial;
-use spelunk_core::embeddings::vec_to_blob;
 use spelunk_core::indexer::graph::{Edge, EdgeKind};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -115,14 +114,11 @@ fn knn_returns_closest_vector_first() {
         .unwrap();
 
     // alpha at position 0, beta at position 1
-    db.insert_embedding(cid1, &vec_to_blob(&unit_vec(DIM, 0)))
-        .unwrap();
-    db.insert_embedding(cid2, &vec_to_blob(&unit_vec(DIM, 1)))
-        .unwrap();
+    db.insert_embedding(cid1, &unit_vec(DIM, 0)).unwrap();
+    db.insert_embedding(cid2, &unit_vec(DIM, 1)).unwrap();
 
     // Query near position 0 → alpha should be closer.
-    let query = vec_to_blob(&unit_vec(DIM, 0));
-    let results = db.search_similar(&query, 2).unwrap();
+    let results = db.search_similar(&unit_vec(DIM, 0), 2).unwrap();
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].name.as_deref(), Some("alpha"));
@@ -143,13 +139,10 @@ fn knn_limit_is_respected() {
         let cid = db
             .insert_chunk(fid, "function", Some(&format!("f{i}")), i, i, "x", None, 1)
             .unwrap();
-        db.insert_embedding(cid, &vec_to_blob(&unit_vec(DIM, i % DIM)))
-            .unwrap();
+        db.insert_embedding(cid, &unit_vec(DIM, i % DIM)).unwrap();
     }
 
-    let results = db
-        .search_similar(&vec_to_blob(&unit_vec(DIM, 0)), 3)
-        .unwrap();
+    let results = db.search_similar(&unit_vec(DIM, 0), 3).unwrap();
     assert!(results.len() <= 3);
 }
 

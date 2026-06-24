@@ -149,7 +149,7 @@ impl Database {
         let already: bool = self
             .conn
             .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_v896_embeddings'",
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_int8_embeddings'",
                 [],
                 |_| Ok(true),
             )
@@ -171,7 +171,10 @@ impl Database {
                 )
                 .optional()
                 .context("querying sqlite_master")?
-                .map(|sql| sql.contains("FLOAT[768]"))
+                // Any float-typed vector table (768 or 896 dim) is rebuilt as
+                // int8[896]; F2LLM embeddings are L2-normalised so int8 is
+                // lossless enough for ranking and 4× smaller on disk.
+                .map(|sql| sql.contains("FLOAT["))
                 .unwrap_or(false))
         };
 
@@ -180,12 +183,12 @@ impl Database {
                 .execute_batch(
                     "DROP TABLE IF EXISTS embeddings; \
                      CREATE VIRTUAL TABLE embeddings USING vec0(\
-                         chunk_id INTEGER PRIMARY KEY, embedding FLOAT[896]\
+                         chunk_id INTEGER PRIMARY KEY, embedding INT8[896]\
                      );",
                 )
-                .context("upgrading embeddings table to 896-dim")?;
+                .context("upgrading embeddings table to int8[896]")?;
             tracing::info!(
-                "embedding dim upgraded 768→896 (F2LLM-v2-330M); \
+                "embedding storage upgraded to int8[896] (F2LLM-v2-330M); \
                  re-run `spelunk index` to rebuild"
             );
         }
@@ -194,18 +197,18 @@ impl Database {
                 .execute_batch(
                     "DROP TABLE IF EXISTS snapshot_embeddings; \
                      CREATE VIRTUAL TABLE snapshot_embeddings USING vec0(\
-                         chunk_id INTEGER PRIMARY KEY, embedding FLOAT[896]\
+                         chunk_id INTEGER PRIMARY KEY, embedding INT8[896]\
                      );",
                 )
-                .context("upgrading snapshot_embeddings table to 896-dim")?;
+                .context("upgrading snapshot_embeddings table to int8[896]")?;
         }
 
         self.conn
             .execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_v896_embeddings \
+                "CREATE TABLE IF NOT EXISTS schema_int8_embeddings \
                  (sentinel INTEGER PRIMARY KEY);",
             )
-            .context("creating v896 migration marker")?;
+            .context("creating int8 migration marker")?;
         Ok(())
     }
 
@@ -221,10 +224,14 @@ impl Database {
 
     /// Insert or replace an embedding for a chunk.
     ///
-    /// `blob` must be raw little-endian F32 bytes (see `embeddings::vec_to_blob`).
-    pub fn insert_embedding(&self, chunk_id: i64, blob: &[u8]) -> Result<()> {
+    /// Takes the raw float vector; it is int8-quantised here for the
+    /// `embeddings` `int8[896]` column (see `embeddings::vec_to_int8_blob`).
+    pub fn insert_embedding(&self, chunk_id: i64, vector: &[f32]) -> Result<()> {
+        let blob = crate::embeddings::vec_to_int8_blob(vector);
+        // sqlite-vec treats a raw BLOB as float32; vec_int8() reinterprets the
+        // bytes as the int8 vector the column expects.
         self.conn.execute(
-            "INSERT OR REPLACE INTO embeddings (chunk_id, embedding) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO embeddings (chunk_id, embedding) VALUES (?1, vec_int8(?2))",
             rusqlite::params![chunk_id, blob],
         )?;
         Ok(())

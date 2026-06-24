@@ -1,14 +1,12 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor, gguf_file};
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{
-    Activation, Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_b,
-    linear_no_bias, rms_norm, rotary_emb::rope,
-};
+use candle_nn::{Activation, Embedding, Module, RmsNorm, rotary_emb::rope};
 use candle_transformers::models::qwen3::Config as Qwen3Config;
+use candle_transformers::utils::repeat_kv;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use tokenizers::Tokenizer;
 
@@ -29,6 +27,12 @@ const EMBED_BATCH_SIZE: usize = 8;
 /// At 512 tokens: 8 × 16 × 512² × 4 bytes ≈ 134 MB — well within budget.
 const BATCH_MAX_SEQ: usize = 512;
 
+/// Filename of the Q8_0-quantized GGUF cached next to the HF download. Projection
+/// matmuls and the token-embedding table are stored Q8_0; the small RMSNorm
+/// weights stay F32. Built once from the safetensors download (see
+/// `write_quantized_gguf`) so subsequent loads read ~355 MB instead of ~650 MB.
+const QUANT_GGUF: &str = "f2llm-v2-330m-q8_0.gguf";
+
 pub struct NativeEmbedder {
     inner: Arc<Mutex<EmbedderInner>>,
 }
@@ -38,14 +42,14 @@ struct EmbedderInner {
     tokenizer: Tokenizer,
 }
 
-// ── no-KV-cache Qwen3 embedder ────────────────────────────────────────────────
+// ── no-KV-cache Qwen3 embedder (Q8_0 quantized) ───────────────────────────────
 
 /// Qwen3 transformer weights loaded once; `forward_one` produces embeddings
 /// with no KV cache and no generation state.  Each text gets a fresh causal
 /// mask so no state leaks between texts in a batch.
 ///
-/// This avoids `Qwen3Model::clear_kv_cache`, which is `pub(crate)` in candle
-/// 0.10.2, while also eliminating the per-text model-recreation overhead.
+/// Projection weights are Q8_0-quantized `QMatMul`; activations run in F32 (the
+/// dtype candle's quantized matmul kernels consume on both CPU and Metal).
 struct Qwen3EmbedWeights {
     embed_tokens: Embedding,
     layers: Vec<EmbedLayer>,
@@ -60,68 +64,126 @@ struct Qwen3EmbedWeights {
 
 struct EmbedLayer {
     attn_norm: RmsNorm,
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: QMatMul,
+    k: QMatMul,
+    v: QMatMul,
+    o: QMatMul,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
     post_norm: RmsNorm,
 }
 
 impl Qwen3EmbedWeights {
-    fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+    /// Build the model from the cached Q8_0 GGUF, placing every tensor on
+    /// `device`. Q8_0 projection weights become `QMatMul`; the embedding table
+    /// is dequantized to F16 for the gather; RMSNorm weights are F32.
+    fn from_gguf(path: &Path, cfg: &Qwen3Config, device: &Device) -> Result<Self> {
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("opening quantized GGUF {}", path.display()))?;
+        let content = gguf_file::Content::read(&mut file)
+            .with_context(|| format!("reading GGUF header {}", path.display()))?;
 
-        // Pre-compute RoPE sin/cos tables once (matches Qwen3RotaryEmbedding in candle).
+        // Token-embedding table: stored Q8_0, dequantized to F16 for the gather.
+        let embed_w = read_qtensor(&content, &mut file, "model.embed_tokens.weight", device)?
+            .dequantize_f16(device)
+            .context("dequantizing embed_tokens")?;
+        let embed_tokens = Embedding::new(embed_w, cfg.hidden_size);
+
+        // Pre-compute RoPE sin/cos tables in F32 (activations run in F32).
         let half_hd = cfg.head_dim / 2;
         let inv_freq: Vec<f32> = (0..half_hd)
             .map(|i| 1.0f32 / (cfg.rope_theta as f32).powf(2.0 * i as f32 / cfg.head_dim as f32))
             .collect();
-        let inv_freq_t =
-            Tensor::from_vec(inv_freq, (1, half_hd), vb.device())?.to_dtype(DType::F32)?;
-        let t = Tensor::arange(0u32, MAX_SEQ_LEN as u32, vb.device())?
+        let inv_freq_t = Tensor::from_vec(inv_freq, (1, half_hd), device)?;
+        let t = Tensor::arange(0u32, MAX_SEQ_LEN as u32, device)?
             .to_dtype(DType::F32)?
             .reshape((MAX_SEQ_LEN, 1))?;
         let freqs = t.matmul(&inv_freq_t)?; // (MAX_SEQ_LEN, head_dim/2)
-        let dtype = vb.dtype();
-        let rope_cos = freqs.cos()?.to_dtype(dtype)?;
-        let rope_sin = freqs.sin()?.to_dtype(dtype)?;
+        let rope_cos = freqs.cos()?;
+        let rope_sin = freqs.sin()?;
 
-        let bias = cfg.attention_bias;
-        let h = cfg.hidden_size;
-        let inter = cfg.intermediate_size;
-        let nh = cfg.num_attention_heads;
-        let nkv = cfg.num_key_value_heads;
-        let hd = cfg.head_dim;
         let eps = cfg.rms_norm_eps;
-        let vb_l = vb.pp("model.layers");
-
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            let vb_i = vb_l.pp(i);
-            let vb_a = vb_i.pp("self_attn");
-            let vb_m = vb_i.pp("mlp");
+            let p = format!("model.layers.{i}");
             layers.push(EmbedLayer {
-                attn_norm: rms_norm(h, eps, vb_i.pp("input_layernorm"))?,
-                q: linear_b(h, nh * hd, bias, vb_a.pp("q_proj"))?,
-                k: linear_b(h, nkv * hd, bias, vb_a.pp("k_proj"))?,
-                v: linear_b(h, nkv * hd, bias, vb_a.pp("v_proj"))?,
-                o: linear_b(nh * hd, h, bias, vb_a.pp("o_proj"))?,
-                q_norm: rms_norm(hd, eps, vb_a.pp("q_norm"))?,
-                k_norm: rms_norm(hd, eps, vb_a.pp("k_norm"))?,
-                gate: linear_no_bias(h, inter, vb_m.pp("gate_proj"))?,
-                up: linear_no_bias(h, inter, vb_m.pp("up_proj"))?,
-                down: linear_no_bias(inter, h, vb_m.pp("down_proj"))?,
-                post_norm: rms_norm(h, eps, vb_i.pp("post_attention_layernorm"))?,
+                attn_norm: read_norm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.input_layernorm.weight"),
+                    eps,
+                    device,
+                )?,
+                q: read_qmm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    device,
+                )?,
+                k: read_qmm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    device,
+                )?,
+                v: read_qmm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    device,
+                )?,
+                o: read_qmm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    device,
+                )?,
+                q_norm: read_norm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.self_attn.q_norm.weight"),
+                    eps,
+                    device,
+                )?,
+                k_norm: read_norm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.self_attn.k_norm.weight"),
+                    eps,
+                    device,
+                )?,
+                gate: read_qmm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    device,
+                )?,
+                up: read_qmm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.mlp.up_proj.weight"),
+                    device,
+                )?,
+                down: read_qmm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    device,
+                )?,
+                post_norm: read_norm(
+                    &content,
+                    &mut file,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    eps,
+                    device,
+                )?,
             });
         }
 
-        let final_norm = rms_norm(h, eps, vb.pp("model.norm"))?;
-        let device = vb.device().clone();
+        let final_norm = read_norm(&content, &mut file, "model.norm.weight", eps, device)?;
 
         Ok(Self {
             embed_tokens,
@@ -129,10 +191,10 @@ impl Qwen3EmbedWeights {
             final_norm,
             rope_cos,
             rope_sin,
-            n_head: nh,
-            n_kv_head: nkv,
-            head_dim: hd,
-            device,
+            n_head: cfg.num_attention_heads,
+            n_kv_head: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            device: device.clone(),
         })
     }
 
@@ -140,7 +202,8 @@ impl Qwen3EmbedWeights {
     fn forward_one(&self, ids: &[u32]) -> Result<Tensor> {
         let seq = ids.len();
         let ids_t = Tensor::new(ids, &self.device)?.unsqueeze(0)?; // [1, seq]
-        let mut h = self.embed_tokens.forward(&ids_t)?; // [1, seq, hidden]
+        // Embedding table is F16; promote to F32 for the (quantized) transformer.
+        let mut h = self.embed_tokens.forward(&ids_t)?.to_dtype(DType::F32)?; // [1, seq, hidden]
 
         let mask = causal_mask(seq, h.dtype(), &self.device)?; // [1, 1, seq, seq]
         for layer in &self.layers {
@@ -190,12 +253,13 @@ impl Qwen3EmbedWeights {
         let mut flat: Vec<u32> = Vec::with_capacity(b * max_seq);
         for ids in batch_ids {
             flat.extend_from_slice(ids);
-            flat.extend(std::iter::repeat_n(0u32, max_seq - ids.len()));
+            flat.extend(std::iter::repeat(0u32).take(max_seq - ids.len()));
         }
         let ids_t = Tensor::from_slice(&flat, (b, max_seq), &self.device)?;
 
         // Forward pass: all layers work naturally with batch dim > 1.
-        let mut h = self.embed_tokens.forward(&ids_t)?; // [b, max_seq, hidden]
+        // Embedding table is F16; promote to F32 for the (quantized) transformer.
+        let mut h = self.embed_tokens.forward(&ids_t)?.to_dtype(DType::F32)?; // [b, max_seq, hidden]
         let mask = causal_mask(max_seq, h.dtype(), &self.device)?; // [1, 1, max_seq, max_seq]
         for layer in &self.layers {
             h = self.layer_fwd(&h, layer, &mask)?;
@@ -255,11 +319,15 @@ impl Qwen3EmbedWeights {
         let k = rope(&k.contiguous()?, &cos, &sin)?;
 
         // Grouped query attention: expand K, V from n_kv_heads to n_heads.
-        // repeat() produces a strided view; contiguous() materialises it so
-        // that downstream matmul kernels don't reject non-contiguous layouts.
+        // MUST repeat-interleave (each kv head duplicated n_rep times contiguously,
+        // [kv0,kv0,kv1,kv1,…]) so query head j attends through kv head j/n_rep —
+        // matching HF's repeat_kv. `Tensor::repeat` instead *tiles* the kv dim
+        // ([kv0,…,kvN, kv0,…,kvN]), silently pairing most query heads with the
+        // wrong K/V projection and collapsing retrieval quality (spelunk-oss#19).
+        // candle's repeat_kv returns the correct interleaved order, contiguous.
         let n_rep = self.n_head / self.n_kv_head;
-        let k = k.repeat(&[1, n_rep, 1, 1])?.contiguous()?;
-        let v = v.repeat(&[1, n_rep, 1, 1])?.contiguous()?;
+        let k = repeat_kv(k, n_rep)?;
+        let v = repeat_kv(v, n_rep)?;
 
         // Scaled dot-product attention + causal mask
         let scale = (self.head_dim as f64).powf(-0.5);
@@ -283,6 +351,43 @@ impl Qwen3EmbedWeights {
     }
 }
 
+/// Read one tensor from the open GGUF onto `device`.
+fn read_qtensor(
+    content: &gguf_file::Content,
+    file: &mut std::fs::File,
+    name: &str,
+    device: &Device,
+) -> Result<QTensor> {
+    content
+        .tensor(file, name, device)
+        .with_context(|| format!("reading tensor {name} from GGUF"))
+}
+
+/// Read an F32 RMSNorm weight from the GGUF and wrap it in an `RmsNorm`.
+fn read_norm(
+    content: &gguf_file::Content,
+    file: &mut std::fs::File,
+    name: &str,
+    eps: f64,
+    device: &Device,
+) -> Result<RmsNorm> {
+    let w = read_qtensor(content, file, name, device)?
+        .dequantize(device)
+        .with_context(|| format!("dequantizing norm {name}"))?;
+    Ok(RmsNorm::new(w, eps))
+}
+
+/// Read a Q8_0 projection weight from the GGUF as a quantized matmul.
+fn read_qmm(
+    content: &gguf_file::Content,
+    file: &mut std::fs::File,
+    name: &str,
+    device: &Device,
+) -> Result<QMatMul> {
+    let qt = read_qtensor(content, file, name, device)?;
+    QMatMul::from_qtensor(qt).with_context(|| format!("building QMatMul for {name}"))
+}
+
 /// Upper-triangular causal mask: 0.0 where attention is allowed, -∞ otherwise.
 fn causal_mask(seq: usize, dtype: DType, device: &Device) -> Result<Tensor> {
     let mask: Vec<f32> = (0..seq)
@@ -294,23 +399,24 @@ fn causal_mask(seq: usize, dtype: DType, device: &Device) -> Result<Tensor> {
 // ── NativeEmbedder ────────────────────────────────────────────────────────────
 
 impl NativeEmbedder {
-    /// Load (or download) the F2LLM-v2-330M model from HuggingFace Hub.
+    /// Load the F2LLM-v2-330M model, quantized to Q8_0.
     ///
-    /// On first call, weights (~650 MB safetensors) are downloaded into
-    /// `~/.local/share/spelunk/models/` via hf-hub cache. Subsequent calls
-    /// use the local cache with no network access. Uses Metal/GPU on macOS
-    /// when built with the `metal` cargo feature, CPU otherwise.
+    /// On first call the ~650 MB safetensors weights are downloaded into
+    /// `~/.local/share/spelunk/models/` via the hf-hub cache, quantized to Q8_0,
+    /// and written to a ~355 MB GGUF (`f2llm-v2-330m-q8_0.gguf`) in the same
+    /// directory. Subsequent calls read the GGUF directly with no network access
+    /// and no safetensors load. Uses Metal/GPU on macOS when built with the
+    /// `metal` cargo feature, CPU otherwise.
     pub fn load() -> Result<Self> {
         let cache_dir = model_cache_dir()?;
         std::fs::create_dir_all(&cache_dir)
             .with_context(|| format!("creating model cache dir {}", cache_dir.display()))?;
+        let gguf_path = cache_dir.join(QUANT_GGUF);
 
         let device = select_device();
         let on_gpu = !matches!(device, Device::Cpu);
-        // BF16 matmul is not supported on candle's CPU backend; use F32 there.
-        let dtype = if on_gpu { DType::BF16 } else { DType::F32 };
         tracing::info!(
-            "loading F2LLM-v2-330M via candle on {} (cache: {})",
+            "loading F2LLM-v2-330M (Q8_0) via candle on {} (cache: {})",
             if on_gpu { "Metal/GPU" } else { "CPU" },
             cache_dir.display()
         );
@@ -335,19 +441,20 @@ impl NativeEmbedder {
         )
         .context("parsing F2LLM-v2-330M config.json")?;
 
-        let weight_paths = download_weights(&repo)?;
-        // F2LLM-v2-330M uses architecture class Qwen3Model (not Qwen3ForCausalLM), so its
-        // safetensors keys have no "model." prefix (e.g. "embed_tokens.weight" not
-        // "model.embed_tokens.weight"). Qwen3EmbedWeights::load expects the prefixed form,
-        // so we add it here while loading.
-        let vb = load_weights_prefixed(&weight_paths, dtype, &device)
-            .context("loading F2LLM-v2-330M weights")?;
+        // Build the quantized GGUF once from the safetensors download.
+        if !gguf_path.exists() {
+            tracing::info!("quantizing F2LLM-v2-330M to Q8_0 GGUF (first run; one-time)…");
+            let weight_paths = download_weights(&repo)?;
+            write_quantized_gguf(&weight_paths, &gguf_path)
+                .context("writing quantized F2LLM-v2-330M GGUF")?;
+            tracing::info!("wrote quantized model to {}", gguf_path.display());
+        }
 
-        let weights =
-            Qwen3EmbedWeights::load(&config, vb).context("building F2LLM-v2-330M model")?;
+        let weights = Qwen3EmbedWeights::from_gguf(&gguf_path, &config, &device)
+            .context("loading quantized F2LLM-v2-330M weights")?;
 
         tracing::info!(
-            "F2LLM-v2-330M ready (dim={DIM}, device={})",
+            "F2LLM-v2-330M ready (dim={DIM}, Q8_0, device={})",
             if on_gpu { "Metal/GPU" } else { "CPU" }
         );
 
@@ -404,24 +511,58 @@ fn download_weights(repo: &hf_hub::api::sync::ApiRepo) -> Result<Vec<PathBuf>> {
     ])
 }
 
-/// Load safetensors weights and prefix every key with "model." so that
-/// Qwen3EmbedWeights::load (which calls vb.pp("model.embed_tokens") etc.) can
-/// find them. F2LLM stores keys without this prefix because it is saved as a
-/// plain Qwen3Model rather than a Qwen3ForCausalLM wrapper.
-fn load_weights_prefixed(
-    paths: &[PathBuf],
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'static>> {
-    let mut tensors: HashMap<String, candle_core::Tensor> = HashMap::new();
-    for path in paths {
-        let file_tensors = candle_core::safetensors::load(path, device)
+/// GGML dtype to quantize a given (prefixed) weight key to, or `None` to skip it.
+///
+/// Projection matmuls and the token-embedding table → Q8_0 (the disk/RAM win);
+/// the tiny RMSNorm weights → F32 (kept full-precision, negligible size).
+/// Unknown keys (e.g. a tied `lm_head.weight`) are skipped — the embedder reads
+/// the final hidden state directly and never needs an LM head.
+fn dtype_for_key(key: &str) -> Option<GgmlDType> {
+    if key == "model.embed_tokens.weight" || key.ends_with("_proj.weight") {
+        Some(GgmlDType::Q8_0)
+    } else if key.ends_with("norm.weight") {
+        Some(GgmlDType::F32)
+    } else {
+        None
+    }
+}
+
+/// Load the safetensors weights on CPU, quantize each to its target GGML dtype,
+/// and write a single GGUF to `gguf_path` (atomically, via a temp file). F2LLM
+/// stores keys without the `model.` prefix (saved as a plain `Qwen3Model`), so
+/// we add it to match the keys `from_gguf` reads back.
+fn write_quantized_gguf(weight_paths: &[PathBuf], gguf_path: &Path) -> Result<()> {
+    let cpu = Device::Cpu;
+    let mut tensors: Vec<(String, QTensor)> = Vec::new();
+
+    for path in weight_paths {
+        let file_tensors = candle_core::safetensors::load(path, &cpu)
             .with_context(|| format!("loading weights from {}", path.display()))?;
         for (k, v) in file_tensors {
-            tensors.insert(format!("model.{k}"), v.to_dtype(dtype)?);
+            let key = format!("model.{k}");
+            let Some(dtype) = dtype_for_key(&key) else {
+                continue;
+            };
+            // QTensor::quantize requires an F32 source.
+            let v = v.to_dtype(DType::F32)?;
+            let qt = QTensor::quantize(&v, dtype)
+                .with_context(|| format!("quantizing {key} to {dtype:?}"))?;
+            tensors.push((key, qt));
         }
     }
-    Ok(VarBuilder::from_tensors(tensors, dtype, device))
+    anyhow::ensure!(!tensors.is_empty(), "no weights found to quantize");
+
+    let tmp_path = gguf_path.with_extension("gguf.tmp");
+    {
+        let mut out = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("creating {}", tmp_path.display()))?;
+        let refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, q)| (k.as_str(), q)).collect();
+        gguf_file::write(&mut out, &[], &refs).context("serialising GGUF")?;
+        out.sync_all().context("flushing GGUF")?;
+    }
+    std::fs::rename(&tmp_path, gguf_path)
+        .with_context(|| format!("renaming {} -> {}", tmp_path.display(), gguf_path.display()))?;
+    Ok(())
 }
 
 fn model_cache_dir() -> Result<PathBuf> {
@@ -439,7 +580,7 @@ fn l2_normalise(v: &mut [f32]) {
 
 #[async_trait::async_trait]
 impl spelunk_core::embeddings::EmbeddingBackend for NativeEmbedder {
-    /// Embed a batch of strings using F2LLM-v2-330M.
+    /// Embed a batch of strings using F2LLM-v2-330M (Q8_0).
     ///
     /// Texts are tokenized, sorted by token length (to minimise padding waste),
     /// then forwarded through the Qwen3 decoder in padded sub-batches of

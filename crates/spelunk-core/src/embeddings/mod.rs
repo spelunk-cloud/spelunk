@@ -23,6 +23,26 @@ pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
+/// Quantise an L2-normalised float vector to `int8` bytes for a sqlite-vec
+/// `int8[N]` column. Embeddings produced by F2LLM are unit vectors (components
+/// in `[-1, 1]`), so each component maps to `round(x * 127)` clamped to
+/// `[-127, 127]`. This is 4× smaller than f32 storage; because the scaling is
+/// uniform, L2 distance ranking is preserved (a sqlite-vec int8 L2 distance is
+/// ~127× the corresponding f32 distance — callers rescale by `INT8_SCALE`).
+///
+/// Used only for the chunk/snapshot vector tables (`embeddings`,
+/// `snapshot_embeddings`); memory note vectors keep full-precision f32 storage.
+pub fn vec_to_int8_blob(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .map(|&x| ((x * 127.0).round().clamp(-127.0, 127.0) as i8) as u8)
+        .collect()
+}
+
+/// Factor by which a sqlite-vec `int8` L2 distance exceeds the equivalent f32
+/// distance, given the `* 127` quantisation in [`vec_to_int8_blob`]. Divide raw
+/// int8 distances by this to keep them on the same scale as the old f32 index.
+pub const INT8_SCALE: f32 = 127.0;
+
 /// Deserialise raw little-endian bytes back to a float vector.
 #[allow(dead_code)]
 pub fn blob_to_vec(b: &[u8]) -> Vec<f32> {

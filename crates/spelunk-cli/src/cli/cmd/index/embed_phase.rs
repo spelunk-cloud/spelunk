@@ -3,7 +3,7 @@ use indicatif::{MultiProgress, ProgressBar};
 use serde::{Deserialize, Serialize};
 
 use super::super::ui::{is_tty, progress_style};
-use crate::{capability::Tier, config::Config, embeddings::vec_to_blob, storage::Database};
+use crate::{capability::Tier, config::Config, storage::Database};
 
 /// Maximum chunks per request — server enforces 256 (returns 413 if exceeded).
 /// Keep well below that ceiling so each HTTP call completes within the client
@@ -112,8 +112,7 @@ pub(super) async fn run_embed_phase(
 
         for item in &resp.chunks {
             if let Ok(row_id) = item.chunk_id.parse::<i64>() {
-                let blob = vec_to_blob(&item.vector);
-                db.insert_embedding(row_id, &blob)?;
+                db.insert_embedding(row_id, &item.vector)?;
                 embedded += 1;
                 bar.inc(1);
             }

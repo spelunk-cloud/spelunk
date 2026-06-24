@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use super::tools::{ToolCall, parse_tool_call, tool_call_schema};
 use crate::{
-    embeddings::{EmbeddingBackend, vec_to_blob},
+    embeddings::EmbeddingBackend,
     llm::{LlmBackend, Message},
     storage::Database,
 };
@@ -181,11 +181,11 @@ impl<'a> Explorer<'a> {
                 // Async: embed the query.
                 let query_text = format!("task: code retrieval | query: {query}");
                 let vecs = self.embedder.embed(&[&query_text]).await?;
-                let blob = vec_to_blob(vecs.first().context("no embedding returned")?);
+                let query_vec = vecs.first().context("no embedding returned")?;
 
                 // Sync: open DB, query, drop before next await.
                 let db = Database::open(&self.db_path)?;
-                let results = db.search_similar(&blob, *limit)?;
+                let results = db.search_similar(query_vec, *limit)?;
                 drop(db);
 
                 for r in &results {

@@ -53,7 +53,6 @@ use super::ui::{print_results_text, spinner};
 use crate::{
     capability,
     config::Config,
-    embeddings::vec_to_blob,
     registry::{Project, resolve_project_context},
     search::{SearchResult, rag},
     storage::Database,
@@ -224,7 +223,6 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
                  semantic search, or use `--mode text` or `--mode ast-grep`."
             )
         })?;
-        let query_blob = vec_to_blob(&query_vec);
 
         // Budget mode overfetches a candidate pool; limit is applied after packing.
         let fetch_limit = if let Some(budget) = args.budget {
@@ -236,7 +234,7 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
         sp.set_message("Searching…");
         let res = if let Some(snap_id) = snapshot_id {
             let db = Database::open(&db_path)?;
-            db.search_snapshot(snap_id, &query_blob, fetch_limit)?
+            db.search_snapshot(snap_id, &query_vec, fetch_limit)?
         } else {
             search_all_dbs_linearrag(
                 &db_path,

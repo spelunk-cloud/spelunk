@@ -142,9 +142,14 @@ impl Database {
     }
 
     /// Insert an embedding for a snapshot chunk.
-    pub fn insert_snapshot_embedding(&self, chunk_id: i64, blob: &[u8]) -> Result<()> {
+    ///
+    /// Takes the raw float vector; int8-quantised here for the
+    /// `snapshot_embeddings` `int8[896]` column (see `vec_to_int8_blob`).
+    pub fn insert_snapshot_embedding(&self, chunk_id: i64, vector: &[f32]) -> Result<()> {
+        let blob = crate::embeddings::vec_to_int8_blob(vector);
+        // vec_int8() reinterprets the raw blob as int8 (sqlite-vec defaults to f32).
         self.conn.execute(
-            "INSERT OR REPLACE INTO snapshot_embeddings (chunk_id, embedding) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO snapshot_embeddings (chunk_id, embedding) VALUES (?1, vec_int8(?2))",
             rusqlite::params![chunk_id, blob],
         )?;
         Ok(())
@@ -164,15 +169,16 @@ impl Database {
     pub fn search_snapshot(
         &self,
         snapshot_id: i64,
-        query_blob: &[u8],
+        query: &[f32],
         limit: usize,
     ) -> Result<Vec<crate::search::SearchResult>> {
         let limit = limit.min(1_000);
+        let query_blob = crate::embeddings::vec_to_int8_blob(query);
         let sql = format!(
             "WITH knn AS (
                  SELECT chunk_id, distance
                  FROM   snapshot_embeddings
-                 WHERE  embedding MATCH ?1
+                 WHERE  embedding MATCH vec_int8(?1)
                    AND  k = {limit}
              )
              SELECT  sc.id,
@@ -192,10 +198,11 @@ impl Database {
              ORDER BY k.distance"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![query_blob, snapshot_id], |row| {
+        let rows = stmt.query_map(rusqlite::params![&query_blob, snapshot_id], |row| {
             Ok(crate::search::SearchResult {
                 chunk_id: row.get(0)?,
-                distance: row.get(1)?,
+                // int8 L2 distance is ~127× the f32 distance; rescale to match.
+                distance: row.get::<_, f32>(1)? / crate::embeddings::INT8_SCALE,
                 node_type: row.get(2)?,
                 name: row.get(3)?,
                 start_line: row.get::<_, i64>(4)? as usize,

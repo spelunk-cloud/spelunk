@@ -5,20 +5,21 @@ use super::Database;
 impl Database {
     /// K-nearest-neighbour search using sqlite-vec.
     ///
-    /// `query_blob` must be raw little-endian F32 bytes produced by
-    /// `vec_to_blob`. Returns results ordered by ascending distance
-    /// (closest first).
+    /// Takes the raw float query vector; it is int8-quantised here to match the
+    /// `embeddings` `int8[896]` column (see `embeddings::vec_to_int8_blob`).
+    /// Returns results ordered by ascending distance (closest first).
     pub fn search_similar(
         &self,
-        query_blob: &[u8],
+        query: &[f32],
         limit: usize,
     ) -> Result<Vec<crate::search::SearchResult>> {
+        let query_blob = crate::embeddings::vec_to_int8_blob(query);
         let limit = limit.min(1_000);
         let sql = format!(
             "WITH knn AS (
                  SELECT chunk_id, distance
                  FROM   embeddings
-                 WHERE  embedding MATCH ?1
+                 WHERE  embedding MATCH vec_int8(?1)
                    AND  k = {limit}
              )
              SELECT  k.chunk_id,
@@ -41,8 +42,10 @@ impl Database {
         const GRAPH_RANK_ALPHA: f32 = 0.15;
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![query_blob], |row| {
-            let raw_distance: f32 = row.get(1)?;
+        let rows = stmt.query_map(rusqlite::params![&query_blob], |row| {
+            // int8 L2 distance is ~127× the f32 distance; rescale to keep the
+            // graph-rank blend (and downstream `1 - distance`) on the old scale.
+            let raw_distance: f32 = row.get::<_, f32>(1)? / crate::embeddings::INT8_SCALE;
             let graph_rank: f32 = row.get(10)?;
             let blended = raw_distance * (1.0 - GRAPH_RANK_ALPHA) - graph_rank * GRAPH_RANK_ALPHA;
             Ok(crate::search::SearchResult {
@@ -129,9 +132,7 @@ impl Database {
         use std::collections::HashMap;
 
         let candidates = (limit * 3).max(20);
-        let query_blob = crate::embeddings::vec_to_blob(embedding);
-
-        let vec_results = self.search_similar(&query_blob, candidates)?;
+        let vec_results = self.search_similar(embedding, candidates)?;
         let text_results = self.search_text(query, candidates).unwrap_or_default();
 
         const K: f64 = 60.0;
