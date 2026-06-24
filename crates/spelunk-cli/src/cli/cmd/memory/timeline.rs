@@ -21,7 +21,12 @@ pub(super) async fn memory_timeline(
 
     let sp = super::super::ui::spinner("Embedding query…");
     let client = require_server_client(cfg, "memory timeline")?;
-    let blob = embed_query(&client, "question answering", &args.query).await?;
+    let blob = embed_query(
+        &client,
+        "Given a question, retrieve passages that answer the question",
+        &args.query,
+    )
+    .await?;
     sp.finish_and_clear();
 
     let backend = open_memory_backend(cfg, mem_path, backend_override)?;

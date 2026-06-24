@@ -1,9 +1,7 @@
 use anyhow::Result;
 
-/// The embedding vector dimension.
-/// `google/embeddinggemma-300m` and `BAAI/bge-base-en-v1.5` both output 768 dims.
-#[allow(dead_code)]
-pub const EMBEDDING_DIM: usize = 768;
+/// The embedding vector dimension produced by the default native model (F2LLM-v2-330M, 896-dim).
+pub const EMBEDDING_DIM: usize = 896;
 
 /// Trait every embedding backend must implement.
 ///

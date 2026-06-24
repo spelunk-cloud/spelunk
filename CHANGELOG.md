@@ -7,6 +7,28 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased] — 0.9.0-dev
+
+### Breaking changes — migration required
+
+**Default embedder is now F2LLM-v2-330M via candle, 896-dim, GPU-accelerated on macOS.**
+
+The bundled native embedder has switched from fastembed-rs / Nomic Embed Text v1.5
+(768-dim, ONNX) to **codefuse-ai/F2LLM-v2-330M** (896-dim, Qwen3 decoder, safetensors)
+served via the `candle` runtime. On macOS the prebuilt binary uses Metal GPU
+acceleration; Linux falls back to CPU.
+
+**Re-index required:** existing local indexes have 768-dim embeddings and will not
+produce correct results against the 896-dim model. Run `spelunk index <project>`
+after upgrading. The old embeddings table is automatically dropped and recreated
+on first open.
+
+**Model download on first run:** F2LLM-v2-330M weights (~650 MB) are downloaded
+from Hugging Face Hub into `~/.local/share/spelunk/models/` on first `spelunk-server`
+startup. Subsequent starts use the cached weights with no network access.
+
+---
+
 ## [Unreleased] — 0.8.0-dev
 
 ### Breaking changes — migration required

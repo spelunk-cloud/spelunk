@@ -35,13 +35,17 @@ pub(crate) fn require_server_client(cfg: &Config, feature: &str) -> Result<Serve
     })
 }
 
-/// Embed a query with the given task prefix and return the raw float vector.
+/// Embed a query with the given F2LLM instruction and return the raw float vector.
+///
+/// `task` is the full instruction string (e.g. "Given a question, retrieve …").
+/// The format matches F2LLM-v2-330M's expected query prompt:
+/// `Instruct: <task>\nQuery: <query>`.
 pub(crate) async fn embed_query_vec(
     client: &ServerInferenceClient,
     task: &str,
     query: &str,
 ) -> Result<Vec<f32>> {
-    let query_text = format!("task: {task} | query: {query}");
+    let query_text = format!("Instruct: {task}\nQuery: {query}");
     client.embed_text(&query_text).await
 }
 

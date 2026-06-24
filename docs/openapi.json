@@ -1043,7 +1043,7 @@
           "search"
         ],
         "summary": "Embed a search query server-side and return the vector for the CLI to use\nin its local KNN search.",
-        "description": "The server applies the code-retrieval query prefix\n(`task: code retrieval | query: {q}`) so the CLI does not need to know the\nembedding format.  The server does **not** perform the KNN step — the local\nSQLite index lives on the CLI side.\n\n- `\"semantic\"` / `\"hybrid\"`: embeds the query and returns `query_vector`.\n  Returns **400** if no embedder is configured on this server.\n- `\"text\"`: returns `query_vector: null`; the CLI falls back to FTS.",
+        "description": "The server applies the F2LLM code-retrieval query prefix\n(`Instruct: Given a code search query…\\nQuery: {q}`) so the CLI does not\nneed to know the embedding format.  The server does **not** perform the KNN\nstep — the local SQLite index lives on the CLI side.\n\n- `\"semantic\"` / `\"hybrid\"`: embeds the query and returns `query_vector`.\n  Returns **400** if no embedder is configured on this server.\n- `\"text\"`: returns `query_vector: null`; the CLI falls back to FTS.",
         "operationId": "project_search",
         "parameters": [
           {

@@ -29,7 +29,7 @@ jobs:
             features: rich-formats
           - os: macos-latest
             target: aarch64-apple-darwin
-            features: rich-formats
+            features: rich-formats,metal
 
     steps:
       - uses: actions/checkout@v6

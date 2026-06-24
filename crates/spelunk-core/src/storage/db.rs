@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
 /// Wraps the SQLite connection and provides typed access to the schema.
@@ -38,6 +38,7 @@ impl Database {
         db.apply_snapshot_vector_migration()?;
         db.apply_compound_graph_idx_migration()?;
         db.apply_conventions_migration()?;
+        db.apply_dim_upgrade_migration()?;
         Ok(db)
     }
 
@@ -134,6 +135,77 @@ impl Database {
         self.conn
             .execute_batch(include_str!("../../migrations/017_snapshot_vectors.sql"))
             .context("running snapshot vector migration")?;
+        Ok(())
+    }
+
+    /// Upgrade the sqlite-vec embedding tables from 768-dim (Nomic) to 896-dim (F2LLM-v2-330M).
+    ///
+    /// Idempotent — guarded by the `schema_v896_embeddings` marker table. On
+    /// fresh databases the tables are already created at 896-dim by
+    /// `apply_vector_migration` / `apply_snapshot_vector_migration`, so this
+    /// is a fast no-op. On existing 768-dim databases the tables are dropped
+    /// and recreated; a full `spelunk index` re-run is required afterwards.
+    pub fn apply_dim_upgrade_migration(&self) -> Result<()> {
+        let already: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_v896_embeddings'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .context("checking v896 migration marker")?
+            .is_some();
+        if already {
+            return Ok(());
+        }
+
+        // Detect whether existing vec0 tables were created with FLOAT[768].
+        let upgrade_needed = |table: &str| -> Result<bool> {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    rusqlite::params![table],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .context("querying sqlite_master")?
+                .map(|sql| sql.contains("FLOAT[768]"))
+                .unwrap_or(false))
+        };
+
+        if upgrade_needed("embeddings")? {
+            self.conn
+                .execute_batch(
+                    "DROP TABLE IF EXISTS embeddings; \
+                     CREATE VIRTUAL TABLE embeddings USING vec0(\
+                         chunk_id INTEGER PRIMARY KEY, embedding FLOAT[896]\
+                     );",
+                )
+                .context("upgrading embeddings table to 896-dim")?;
+            tracing::info!(
+                "embedding dim upgraded 768→896 (F2LLM-v2-330M); \
+                 re-run `spelunk index` to rebuild"
+            );
+        }
+        if upgrade_needed("snapshot_embeddings")? {
+            self.conn
+                .execute_batch(
+                    "DROP TABLE IF EXISTS snapshot_embeddings; \
+                     CREATE VIRTUAL TABLE snapshot_embeddings USING vec0(\
+                         chunk_id INTEGER PRIMARY KEY, embedding FLOAT[896]\
+                     );",
+                )
+                .context("upgrading snapshot_embeddings table to 896-dim")?;
+        }
+
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_v896_embeddings \
+                 (sentinel INTEGER PRIMARY KEY);",
+            )
+            .context("creating v896 migration marker")?;
         Ok(())
     }
 

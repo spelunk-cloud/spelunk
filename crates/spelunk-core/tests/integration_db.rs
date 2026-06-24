@@ -79,8 +79,8 @@ fn insert_and_delete_chunks() {
 
 // ── embeddings + KNN search ──────────────────────────────────────────────────
 
-// Must match the dimension in migrations/002_vectors.sql.
-const DIM: usize = 768;
+// Must match the dimension in migrations/002_vectors.sql (F2LLM-v2-330M, 896-dim).
+const DIM: usize = spelunk_core::embeddings::EMBEDDING_DIM;
 
 #[test]
 #[serial]

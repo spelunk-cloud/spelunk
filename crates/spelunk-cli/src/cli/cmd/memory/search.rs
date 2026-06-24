@@ -39,7 +39,12 @@ pub(super) async fn memory_search(
     } else {
         let sp = super::super::ui::spinner("Embedding query…");
         let client = require_server_client(cfg, "memory search")?;
-        let blob = embed_query(&client, "question answering", &args.query).await?;
+        let blob = embed_query(
+            &client,
+            "Given a question, retrieve passages that answer the question",
+            &args.query,
+        )
+        .await?;
         sp.finish_and_clear();
 
         if mode == "semantic" {

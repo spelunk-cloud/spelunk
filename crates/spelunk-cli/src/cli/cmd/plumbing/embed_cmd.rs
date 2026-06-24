@@ -32,9 +32,13 @@ pub(super) async fn embed_cmd(cfg: &Config, query_mode: bool) -> Result<()> {
             continue;
         }
         let vector = if query_mode {
-            embed_query_vec(&client, "code retrieval", &text)
-                .await
-                .with_context(|| format!("embedding line {idx}"))?
+            embed_query_vec(
+                &client,
+                "Given a code search query, retrieve the relevant code snippets",
+                &text,
+            )
+            .await
+            .with_context(|| format!("embedding line {idx}"))?
         } else {
             let input = format!("title: none | text: {text}");
             client

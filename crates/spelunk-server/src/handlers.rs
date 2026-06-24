@@ -393,8 +393,13 @@ pub async fn search_notes(
         )
     })?;
 
+    // F2LLM QA query prefix — matches the instruction format used for memory documents.
+    let query_text = format!(
+        "Instruct: Given a question, retrieve passages that answer the question\nQuery: {}",
+        body.query
+    );
     let query_vecs = embedder
-        .embed(&[body.query.as_str()])
+        .embed(&[query_text.as_str()])
         .await
         .map_err(AppError::Internal)?;
     let query_vec = query_vecs
@@ -822,10 +827,10 @@ pub struct CodeSearchResponse {
 /// Embed a search query server-side and return the vector for the CLI to use
 /// in its local KNN search.
 ///
-/// The server applies the code-retrieval query prefix
-/// (`task: code retrieval | query: {q}`) so the CLI does not need to know the
-/// embedding format.  The server does **not** perform the KNN step — the local
-/// SQLite index lives on the CLI side.
+/// The server applies the F2LLM code-retrieval query prefix
+/// (`Instruct: Given a code search query…\nQuery: {q}`) so the CLI does not
+/// need to know the embedding format.  The server does **not** perform the KNN
+/// step — the local SQLite index lives on the CLI side.
 ///
 /// - `"semantic"` / `"hybrid"`: embeds the query and returns `query_vector`.
 ///   Returns **400** if no embedder is configured on this server.
@@ -876,9 +881,12 @@ pub async fn project_search(
         )
     })?;
 
-    // Apply the code-retrieval query prefix so the vector space matches
-    // the indexed chunk vectors (Chunk::embedding_text format).
-    let query_text = format!("task: code retrieval | query: {}", body.query);
+    // F2LLM-v2-330M query prefix: instruction + query. Documents are embedded
+    // without a prefix; queries must use this format for correct retrieval.
+    let query_text = format!(
+        "Instruct: Given a code search query, retrieve the relevant code snippets\nQuery: {}",
+        body.query
+    );
     let vecs = embedder
         .embed(&[query_text.as_str()])
         .await

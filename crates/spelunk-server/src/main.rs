@@ -33,8 +33,8 @@ struct Args {
     key: Option<String>,
 
     /// Embedding dimension expected from clients (must match the team's model).
-    /// Default: 768 (EmbeddingGemma 300M).
-    #[arg(long, default_value = "768")]
+    /// Default: 896 (F2LLM-v2-330M).
+    #[arg(long, default_value = "896")]
     embedding_dim: usize,
 
     /// Cosine similarity threshold for conflict detection (0.0–1.0). New entries with

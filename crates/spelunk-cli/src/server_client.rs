@@ -284,8 +284,8 @@ impl ServerInferenceClient {
     /// Call `POST /v1/projects/{id}/search` to embed a query server-side and
     /// return the query vector for CLI-side KNN.
     ///
-    /// The server applies the code-retrieval prefix (`task: code retrieval | query: …`)
-    /// before embedding, so the caller does not need to know the format.
+    /// The server applies the F2LLM code-retrieval prefix before embedding, so
+    /// the caller does not need to know the format.
     ///
     /// Returns `None` when the server responds with `mode: "text"` (no embedding
     /// needed; caller should use FTS instead).
