@@ -22,6 +22,12 @@ const MAX_SEQ_LEN: usize = 40960;
 /// Sequences within a sub-batch are sorted by length first so padding waste
 /// stays bounded.  Tune upward if BLAS efficiency plateaus at larger matrices.
 const EMBED_BATCH_SIZE: usize = 8;
+/// Longest sequence (tokens) allowed in a batched forward pass.
+/// The attention score tensor is (b × n_head × max_seq²) so it grows
+/// quadratically; beyond this threshold we fall back to forward_one to
+/// avoid multi-GB allocations on long code chunks.
+/// At 512 tokens: 8 × 16 × 512² × 4 bytes ≈ 134 MB — well within budget.
+const BATCH_MAX_SEQ: usize = 512;
 
 pub struct NativeEmbedder {
     inner: Arc<Mutex<EmbedderInner>>,
@@ -160,8 +166,12 @@ impl Qwen3EmbedWeights {
         let b = batch_ids.len();
         assert!(b > 0);
 
-        // Sequential path: single sequences, or any GPU/Metal device.
-        if b == 1 || !matches!(self.device, Device::Cpu) {
+        let max_seq = batch_ids.iter().map(|ids| ids.len()).max().unwrap_or(0);
+
+        // Sequential path: single sequences, GPU/Metal devices (buffer pool grows
+        // unboundedly with batching), or long sequences where the attention tensor
+        // (b × n_head × max_seq²) would exceed BATCH_MAX_SEQ and cause OOM.
+        if b == 1 || !matches!(self.device, Device::Cpu) || max_seq > BATCH_MAX_SEQ {
             let mut out = Vec::with_capacity(b);
             for ids in batch_ids {
                 let hidden = self.forward_one(ids)?;
@@ -178,7 +188,6 @@ impl Qwen3EmbedWeights {
         }
 
         let seq_lens: Vec<usize> = batch_ids.iter().map(|ids| ids.len()).collect();
-        let max_seq = *seq_lens.iter().max().unwrap();
 
         // Build flat right-padded buffer [B × max_seq] with pad id = 0.
         let mut flat: Vec<u32> = Vec::with_capacity(b * max_seq);
