@@ -242,10 +242,12 @@ impl Qwen3EmbedWeights {
         let q = rope(&q.contiguous()?, &cos, &sin)?;
         let k = rope(&k.contiguous()?, &cos, &sin)?;
 
-        // Grouped query attention: expand K, V from n_kv_heads to n_heads
+        // Grouped query attention: expand K, V from n_kv_heads to n_heads.
+        // repeat() produces a strided view; contiguous() materialises it so
+        // that downstream matmul kernels don't reject non-contiguous layouts.
         let n_rep = self.n_head / self.n_kv_head;
-        let k = k.repeat(&[1, n_rep, 1, 1])?;
-        let v = v.repeat(&[1, n_rep, 1, 1])?;
+        let k = k.repeat(&[1, n_rep, 1, 1])?.contiguous()?;
+        let v = v.repeat(&[1, n_rep, 1, 1])?.contiguous()?;
 
         // Scaled dot-product attention + causal mask
         let scale = (self.head_dim as f64).powf(-0.5);
