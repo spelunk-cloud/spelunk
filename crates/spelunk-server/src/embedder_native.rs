@@ -20,7 +20,11 @@ pub struct NativeEmbedder {
 }
 
 struct EmbedderInner {
-    model: Qwen3Model,
+    // Weights stored as a cloneable VarBuilder; a fresh Qwen3Model is created per embed
+    // text so that the KV cache inside each model is always empty. Model::clear_kv_cache
+    // is pub(crate) in candle 0.10.2 and not callable here; this avoids the issue.
+    vb: VarBuilder<'static>,
+    config: Qwen3Config,
     tokenizer: Tokenizer,
     device: Device,
 }
@@ -39,6 +43,8 @@ impl NativeEmbedder {
 
         let device = select_device();
         let on_gpu = !matches!(device, Device::Cpu);
+        // BF16 matmul is not supported on candle's CPU backend; use F32 there.
+        let dtype = if on_gpu { DType::BF16 } else { DType::F32 };
         tracing::info!(
             "loading F2LLM-v2-330M via candle on {} (cache: {})",
             if on_gpu { "Metal/GPU" } else { "CPU" },
@@ -66,11 +72,15 @@ impl NativeEmbedder {
         .context("parsing F2LLM-v2-330M config.json")?;
 
         let weight_paths = download_weights(&repo)?;
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&weight_paths, DType::BF16, &device)
-                .context("memory-mapping F2LLM-v2-330M weights")?
-        };
-        let model = Qwen3Model::new(&config, vb).context("building F2LLM-v2-330M model")?;
+        // F2LLM-v2-330M uses architecture class Qwen3Model (not Qwen3ForCausalLM), so its
+        // safetensors keys have no "model." prefix (e.g. "embed_tokens.weight" not
+        // "model.embed_tokens.weight"). candle's Qwen3Model::new expects the prefixed form,
+        // so we add it here while loading.
+        let vb = load_weights_prefixed(&weight_paths, dtype, &device)
+            .context("loading F2LLM-v2-330M weights")?;
+
+        // Smoke-test: instantiate the model once to validate config/weights.
+        Qwen3Model::new(&config, vb.clone()).context("building F2LLM-v2-330M model")?;
 
         tracing::info!(
             "F2LLM-v2-330M ready (dim={DIM}, device={})",
@@ -79,7 +89,8 @@ impl NativeEmbedder {
 
         Ok(Self {
             inner: Arc::new(Mutex::new(EmbedderInner {
-                model,
+                vb,
+                config,
                 tokenizer,
                 device,
             })),
@@ -134,6 +145,27 @@ fn download_weights(repo: &hf_hub::api::sync::ApiRepo) -> Result<Vec<PathBuf>> {
     ])
 }
 
+/// Load safetensors weights and prefix every key with "model." so that
+/// candle's Qwen3Model::new (which calls vb.pp("model.embed_tokens") etc.) can
+/// find them. F2LLM stores keys without this prefix because it is saved as a
+/// plain Qwen3Model rather than a Qwen3ForCausalLM wrapper.
+fn load_weights_prefixed(
+    paths: &[PathBuf],
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'static>> {
+    use std::collections::HashMap;
+    let mut tensors: HashMap<String, candle_core::Tensor> = HashMap::new();
+    for path in paths {
+        let file_tensors = candle_core::safetensors::load(path, device)
+            .with_context(|| format!("loading weights from {}", path.display()))?;
+        for (k, v) in file_tensors {
+            tensors.insert(format!("model.{k}"), v.to_dtype(dtype)?);
+        }
+    }
+    Ok(VarBuilder::from_tensors(tensors, dtype, device))
+}
+
 fn model_cache_dir() -> Result<PathBuf> {
     dirs::data_local_dir()
         .map(|d| d.join("spelunk").join("models"))
@@ -159,7 +191,7 @@ impl spelunk_core::embeddings::EmbeddingBackend for NativeEmbedder {
         let inner = Arc::clone(&self.inner);
 
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner
+            let guard = inner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("native embedder lock poisoned"))?;
 
@@ -183,10 +215,16 @@ impl spelunk_core::embeddings::EmbeddingBackend for NativeEmbedder {
                 // [1, seq_len]
                 let input = Tensor::new(ids.as_slice(), &guard.device)?.unsqueeze(0)?;
 
-                // [1, seq_len, 896] — offset=0: full-sequence forward; causal masking
-                // ensures position seq_len-1 only attends positions 0..seq_len-1,
-                // so stale KV cache entries beyond seq_len-1 do not affect the result.
-                let hidden = guard.model.forward(&input, 0)?;
+                // A fresh model is created per text so the internal KV cache starts empty.
+                // Model::clear_kv_cache is pub(crate) in candle 0.10.2; recreating from the
+                // cloned VarBuilder is the safe alternative. Weight Tensors are Arc'd so the
+                // clone is cheap — only the KV cache allocations and RoPE sin/cos table are
+                // new per call.
+                let mut model = Qwen3Model::new(&guard.config, guard.vb.clone())
+                    .map_err(|e| anyhow::anyhow!("model instantiation failed: {e}"))?;
+
+                // [1, seq_len, 896]
+                let hidden = model.forward(&input, 0)?;
 
                 // Last token (EOS) hidden state → [896]
                 let last = hidden.i((0, seq_len - 1))?;
