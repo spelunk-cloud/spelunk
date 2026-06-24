@@ -640,3 +640,109 @@ impl spelunk_core::embeddings::EmbeddingBackend for NativeEmbedder {
         DIM
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `[1, n_kv, seq, head_dim]` tensor where every element of kv-head
+    /// `k` equals `k` — so the head index is recoverable from any of its values.
+    fn headed_kv(n_kv: usize, seq: usize, head_dim: usize) -> Tensor {
+        let data: Vec<f32> = (0..n_kv)
+            .flat_map(|k| vec![k as f32; seq * head_dim])
+            .collect();
+        Tensor::from_vec(data, (1, n_kv, seq, head_dim), &Device::Cpu).unwrap()
+    }
+
+    /// The source kv-head stamped on each output head, in order.
+    fn head_sources(t: &Tensor) -> Vec<usize> {
+        let (_, n_head, seq, head_dim) = t.dims4().unwrap();
+        let flat: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
+        let per_head = seq * head_dim;
+        (0..n_head).map(|h| flat[h * per_head] as usize).collect()
+    }
+
+    /// Regression test for spelunk-oss#19: grouped-query-attention K/V expansion
+    /// must **repeat-interleave** the kv-head dim (`[kv0,kv0,kv1,kv1,…]`) so query
+    /// head `j` attends through kv head `j / n_rep`. The original bug used
+    /// `Tensor::repeat`, which *tiles* (`[kv0..kvN, kv0..kvN]`) and silently paired
+    /// 15 of 16 query heads with the wrong K/V projection, collapsing retrieval.
+    /// This guards the `repeat_kv` call in `Qwen3EmbedWeights::attn`.
+    #[test]
+    fn repeat_kv_interleaves_gqa_heads_not_tiles() {
+        // F2LLM-v2-330M: 16 attention heads / 8 kv heads → n_rep = 2.
+        let (n_kv, n_rep, seq, head_dim) = (8usize, 2usize, 3usize, 4usize);
+        let kv = headed_kv(n_kv, seq, head_dim);
+
+        // Production path (the #19 fix).
+        let expanded = repeat_kv(kv.clone(), n_rep).unwrap();
+        assert_eq!(expanded.dims4().unwrap(), (1, n_kv * n_rep, seq, head_dim));
+
+        // Correct GQA ordering: each kv head duplicated n_rep times, contiguously.
+        let expected: Vec<usize> = (0..n_kv * n_rep).map(|h| h / n_rep).collect();
+        assert_eq!(
+            head_sources(&expanded),
+            expected,
+            "repeat_kv must repeat-interleave kv heads (spelunk-oss#19)"
+        );
+
+        // The #19 bug: `Tensor::repeat` tiles instead — [kv0..kv7, kv0..kv7].
+        let tiled = kv.repeat(&[1, n_rep, 1, 1]).unwrap();
+        let tiled_order: Vec<usize> = (0..n_kv).chain(0..n_kv).collect();
+        assert_eq!(head_sources(&tiled), tiled_order);
+        assert_ne!(
+            head_sources(&expanded),
+            head_sources(&tiled),
+            "interleave (repeat_kv) and tile (Tensor::repeat) must differ for n_rep > 1 — \
+             reverting to Tensor::repeat reintroduces spelunk-oss#19"
+        );
+    }
+
+    /// `repeat_kv` must return a **contiguous** tensor: candle's CPU matmul rejects
+    /// a non-contiguous rhs (`MatMulUnexpectedStriding`), which previously crashed
+    /// the embedder on the CPU backend. Guards against an expansion that leaves the
+    /// K/V views strided going into the attention matmuls.
+    #[test]
+    fn repeat_kv_output_is_contiguous() {
+        let kv = headed_kv(8, 3, 4);
+        let expanded = repeat_kv(kv, 2).unwrap();
+        assert!(
+            expanded.is_contiguous(),
+            "repeat_kv output must be contiguous for candle's CPU matmul"
+        );
+    }
+
+    /// End-to-end semantic-discrimination check over the real model. Ignored by
+    /// default: it downloads ~650 MB of weights and runs inference. Run with
+    /// `cargo test -p spelunk-server -- --ignored embeddings_discriminate`.
+    ///
+    /// With the #19 GQA bug present, related and unrelated pairs collapse to the
+    /// same cosine (~0.1–0.25); with the fix, related pairs sit well above
+    /// unrelated. This is the only test that exercises attention end-to-end.
+    #[test]
+    #[ignore = "downloads the F2LLM model and runs inference"]
+    fn embeddings_discriminate_related_from_unrelated() {
+        use spelunk_core::embeddings::EmbeddingBackend;
+
+        let embedder = NativeEmbedder::load().expect("load F2LLM-v2-330M");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let texts: [&str; 3] = [
+            "read the contents of a file from disk",
+            "open a file and return its bytes",
+            "the fall of the roman empire",
+        ];
+        let vecs = rt.block_on(embedder.embed(&texts)).expect("embed");
+
+        // Embeddings are L2-normalised, so dot product == cosine similarity.
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let related = cos(&vecs[0], &vecs[1]);
+        let unrelated = cos(&vecs[0], &vecs[2]);
+
+        assert!(
+            related > unrelated + 0.2,
+            "GQA-fixed embeddings must discriminate related from unrelated: \
+             related={related:.3} vs unrelated={unrelated:.3} (spelunk-oss#19)"
+        );
+    }
+}

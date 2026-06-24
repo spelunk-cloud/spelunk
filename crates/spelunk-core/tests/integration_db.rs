@@ -129,6 +129,57 @@ fn knn_returns_closest_vector_first() {
     );
 }
 
+/// int8 quantisation regression (PR #441 / spelunk-oss#9): `insert_embedding`
+/// stores vectors in the `int8[896]` column and `search_similar` must (a) preserve
+/// ranking through quantisation and (b) rescale the raw int8 L2 distance back to
+/// the f32 scale via `INT8_SCALE`. A forgotten rescale leaves distances ~127×
+/// too large — caught by the magnitude bounds below.
+#[test]
+#[serial]
+fn int8_knn_preserves_ranking_and_rescales_distance() {
+    let db = common::open_test_db();
+    let fid = db.upsert_file("vec.rs", Some("rust"), "h").unwrap();
+
+    // query = e0; `near` is mostly e0 with a little e1; `far` is orthogonal (e1).
+    let query = unit_vec(DIM, 0);
+    let mut near = zero_vec(DIM);
+    near[0] = 0.97;
+    near[1] = 0.243; // ≈ unit-norm, close to the query
+    let far = unit_vec(DIM, 1);
+
+    let c_near = db
+        .insert_chunk(fid, "function", Some("near"), 1, 1, "x", None, 1)
+        .unwrap();
+    let c_far = db
+        .insert_chunk(fid, "function", Some("far"), 2, 2, "x", None, 1)
+        .unwrap();
+    db.insert_embedding(c_near, &near).unwrap();
+    db.insert_embedding(c_far, &far).unwrap();
+
+    let results = db.search_similar(&query, 2).unwrap();
+    assert_eq!(results.len(), 2);
+
+    // (a) Ranking survives int8 quantisation.
+    assert_eq!(results[0].name.as_deref(), Some("near"));
+    assert_eq!(results[1].name.as_deref(), Some("far"));
+    assert!(results[0].distance < results[1].distance);
+
+    // (b) Distances are rescaled to the f32 scale. The raw int8 L2 distances here
+    // are ~31 (near) and ~180 (far); after dividing by INT8_SCALE (127) they land
+    // near ~0.2 and ~1.4 (then blended by 0.85). Without the rescale these bounds
+    // would be wildly exceeded.
+    assert!(
+        (0.0..0.5).contains(&results[0].distance),
+        "rescaled near-distance off f32 scale: {}",
+        results[0].distance
+    );
+    assert!(
+        results[1].distance < 2.0,
+        "rescaled far-distance off f32 scale: {}",
+        results[1].distance
+    );
+}
+
 #[test]
 #[serial]
 fn knn_limit_is_respected() {
