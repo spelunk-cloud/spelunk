@@ -47,9 +47,9 @@ Full reference: `SKILL.md` and `docs/agent-guide.md`.
 
 **Built-in (zero infrastructure):** git-notes memory, full-text search, code graph (AST + call edges), tree-sitter chunking. Works immediately with no setup.
 
-**Semantic search via spelunk-server:** from v0.9.0 the default UX runs a local `spelunk-server` (auto-bound on `127.0.0.1`). The server bundles a native embedder (codefuse-ai/F2LLM-v2-330M, 896-dim, candle runtime, Metal/GPU on macOS) — no external embedding endpoint required. Semantic search, `spelunk explore`, `spelunk memory harvest`, and LLM summaries all route through the server's inference endpoints; the CLI talks to it via `server_client.rs`. Manage the daemon with `spelunk server start|stop|status|logs`.
+**Semantic search via spelunk-server:** from v0.9.0 the default UX runs a local `spelunk-server` (auto-bound on `127.0.0.1`). The server bundles a native embedder (codefuse-ai/F2LLM-v2-330M, 896-dim, candle runtime, Metal/GPU on macOS) — no external embedding endpoint required. Semantic search, `spelunk explore`, `spelunk memory harvest`, and LLM summaries all route through the server's inference endpoints; the CLI talks to it via `server_client.rs`. Manage the daemon with `spelunk server start|stop|status|logs`. This **auto-discovered loopback server is an inference backend only** — it embeds queries and runs LLM calls, but it is **never** a memory store. A project's memory always lives in its local `memory.db`; the loopback server holds no authoritative memory.
 
-**Optional: team memory server** (`server_url` pointing at a shared instance): share memory (decisions, requirements) across a team. Each developer's code stays local.
+**Optional: team memory server** (`server_url` *explicitly* set in config, pointing at a shared instance): share memory (decisions, requirements) across a team. Setting an explicit `server_url` is the **only** way memory moves off the local `memory.db` — it relocates the store of record to the shared server. Each developer's code stays local. (Note the distinction: an auto-discovered loopback server provides inference and never owns memory; an explicit team `server_url` does own memory. They must not be conflated.) When a team server routes projects by an internal UUID, a human `project_id` slug is auto-resolved to that UUID on first use and cached in `.spelunk/cloud-project-id.lock` (see ADR-005); a raw UUID `project_id` is used directly.
 
 You search with spelunk, then reason over the results yourself.
 
@@ -125,7 +125,9 @@ storage/
   specs.rs       — spec record CRUD
   stats.rs       — aggregate statistics queries
   note_record.rs — NoteRecord struct (memory entry)
-  git_notes.rs   — git-notes read/write backend (write-through on memory add)
+  git_notes/
+    mod.rs         — GitNotesBackend struct + helpers; append_to_git_notes free function
+    backend_impl.rs — MemoryBackend trait impl for GitNotesBackend
   memory/
     mod.rs       — NoteStore: memory entries CRUD + list_filtered
     edges.rs     — memory relationship edges CRUD
@@ -133,7 +135,10 @@ storage/
     search.rs    — memory FTS + semantic search
     tests.rs     — integration tests for NoteStore
   backend.rs     — StorageBackend trait (local vs remote)
-  remote.rs      — remote storage backend (HTTP)
+  remote/
+    mod.rs         — RemoteMemoryBackend struct + URL helpers + MemoryBackend impl
+    wire_types.rs  — HTTP request/response structs (AddNoteRequest, NoteResponse, etc.)
+    tests.rs       — #[cfg(test)] tests for URL encoding and search wire format
 
 search/
   mod.rs         — SearchResult struct
@@ -188,6 +193,7 @@ cli/
       harvest_claude.rs — harvest from ~/.claude/history.jsonl (Claude Code sessions)
       list.rs         — memory list subcommand
       push.rs         — memory push subcommand
+      reconcile.rs    — memory reconcile subcommand (import from server.db)
       search.rs       — memory search subcommand
       show.rs         — memory show subcommand
       since.rs        — `spelunk memory since` handler
@@ -196,15 +202,15 @@ cli/
       watch.rs        — `spelunk memory watch`: SSE stream from spelunk-server
     plumbing/
       mod.rs               — PlumbingArgs/PlumbingCommand; dispatch; exit-2 on error
-      cat_chunks.rs        — emit indexed chunks for a file as NDJSON
-      embed_cmd.rs         — read stdin lines, emit embedding vectors as NDJSON
-      graph_edges.rs       — emit code graph edges as NDJSON
+      cat_chunks.rs        — emit indexed chunks for a file as JSONL
+      embed_cmd.rs         — read stdin lines, emit embedding vectors as JSONL
+      graph_edges.rs       — emit code graph edges as JSONL
       hash_file.rs         — blake3 hash a file; check index currency
-      knn.rs               — KNN vector search, NDJSON output
-      ls_files.rs          — list indexed files as NDJSON; exit 1 if no results
-      parse_file.rs        — parse a file and emit chunks as NDJSON (no DB write)
-      read_conventions.rs  — emit stored convention records as NDJSON
-      read_memory.rs       — emit memory entries as NDJSON
+      knn.rs               — KNN vector search, JSONL output
+      ls_files.rs          — list indexed files as JSONL; exit 1 if no results
+      parse_file.rs        — parse a file and emit chunks as JSONL (no DB write)
+      read_conventions.rs  — emit stored convention records as JSONL
+      read_memory.rs       — emit memory entries as JSONL
 ```
 
 ### spelunk-server (`crates/spelunk-server/src/`)
@@ -235,6 +241,8 @@ Concrete backends live in spelunk-server (not in this repo).
 
 `capability.rs` probes server availability at startup and exposes a `Tier`
 enum so commands degrade gracefully when no server is configured.
+
+**Inference vs. memory storage are separate concerns.** Reaching the server for inference (`ServerLlmClient` / `ServerEmbedClient`) does **not** mean memory is stored there. For an auto-discovered loopback server, memory CRUD (`add`, `list`, `search`, `timeline`, `context`, `harvest`, `read-memory`) resolves to the project's local `memory.db`; the server is used only to embed the query for `memory search`, with the vector KNN run locally against `memory.db`. Memory lives on a server **only** when an explicit team `server_url` is configured. See `docs/adr/004-unified-memory-storage.md`.
 
 ---
 
@@ -271,7 +279,13 @@ Changed files: delete old chunks + embeddings, reparse, re-embed.
 ### Multi-project registry
 `~/.config/spelunk/registry.db` tracks all indexed projects and their
 dependency links. `spelunk search` automatically queries all linked project DBs
-and merges results by distance.
+and merges results by distance. Additionally, `spelunk memory search`,
+`spelunk memory list`, and `spelunk context` surface `locked`- or
+`cross-project`-tagged `decision` and `requirement` entries from linked
+projects' memory stores (ADR-003). Each cross-project result is tagged with its
+source project so decisions remain attributable. Pass `--local-only` to any of
+these commands to query only the primary project's memory. See
+`docs/memory.md#cross-project-visibility`.
 
 ### Secret scanning
 `crates/spelunk-core/src/indexer/secrets.rs` runs before each chunk is stored. Chunks matching

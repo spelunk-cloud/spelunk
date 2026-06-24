@@ -112,7 +112,7 @@ pub struct HealthResponse {
     pub version: &'static str,
     /// List of feature capabilities supported by this server instance.
     pub capabilities: Vec<String>,
-    /// Persistent UUID v4 identifying this server instance across restarts.
+    /// Persistent UUID v7 identifying this server instance across restarts.
     pub instance_id: String,
     /// Effective UID of the process that started the server (Unix); `null` on Windows.
     pub started_by: Option<u32>,
@@ -1393,7 +1393,7 @@ mod tests {
         assert_eq!(
             id.len(),
             36,
-            "instance_id must be a UUID v4 (36 chars): {id}"
+            "instance_id must be a UUID v7 (36 chars): {id}"
         );
         assert!(
             json["started_by"].is_null(),

@@ -66,7 +66,7 @@ async fn embed_exits_0_with_empty_piped_stdin() {
 // ── happy path: single line → one JSON embedding ──────────────────────────────
 
 #[tokio::test]
-async fn embed_document_mode_produces_ndjson_vector() {
+async fn embed_document_mode_produces_jsonl_vector() {
     let mock = MockServer::start().await;
 
     // Health probe.
@@ -102,7 +102,7 @@ async fn embed_document_mode_produces_ndjson_vector() {
         .stdout
         .clone();
 
-    let rows = plumbing_helpers::parse_ndjson(&output);
+    let rows = plumbing_helpers::parse_jsonl(&output);
     assert_eq!(rows.len(), 1, "one stdin line → one embedding");
 
     let row = &rows[0];
@@ -121,7 +121,7 @@ async fn embed_document_mode_produces_ndjson_vector() {
 }
 
 #[tokio::test]
-async fn embed_query_mode_produces_ndjson_vector() {
+async fn embed_query_mode_produces_jsonl_vector() {
     let mock = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -156,7 +156,7 @@ async fn embed_query_mode_produces_ndjson_vector() {
         .stdout
         .clone();
 
-    let rows = plumbing_helpers::parse_ndjson(&output);
+    let rows = plumbing_helpers::parse_jsonl(&output);
     assert_eq!(rows.len(), 1);
     assert!(rows[0].get("vector").is_some(), "missing 'vector'");
 }
@@ -196,7 +196,7 @@ async fn embed_multiple_lines_produce_multiple_vectors() {
         .stdout
         .clone();
 
-    let rows = plumbing_helpers::parse_ndjson(&output);
+    let rows = plumbing_helpers::parse_jsonl(&output);
     assert_eq!(rows.len(), 3, "three stdin lines → three embeddings");
 }
 

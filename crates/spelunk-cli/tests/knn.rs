@@ -8,7 +8,7 @@
 //! Error-path tests (bad JSON on stdin, missing DB) run without a server.
 
 mod plumbing_helpers;
-use plumbing_helpers::{index_fixture_project, parse_ndjson, spelunk_cmd};
+use plumbing_helpers::{index_fixture_project, parse_jsonl, spelunk_cmd};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -94,8 +94,8 @@ fn knn_exits_1_or_error_for_wrong_dimension_vector() {
 
 #[test]
 #[ignore] // requires embedding server at 127.0.0.1:1234 AND an indexed project with real embeddings
-fn knn_returns_ndjson_results_for_valid_vector() {
-    // Run manually: cargo test knn_returns_ndjson -- --ignored
+fn knn_returns_jsonl_results_for_valid_vector() {
+    // Run manually: cargo test knn_returns_jsonl -- --ignored
     // Expected: a spelunk.db in the current directory with 768-dim embeddings.
 
     let tmp = TempDir::new().unwrap();
@@ -134,7 +134,7 @@ fn knn_returns_ndjson_results_for_valid_vector() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     for row in &rows {
         assert!(row.get("chunk_id").is_some(), "missing 'chunk_id': {row}");
         assert!(row.get("file_path").is_some(), "missing 'file_path': {row}");
@@ -184,7 +184,7 @@ fn knn_lang_filter_restricts_to_language() {
         .unwrap();
 
     if output.status.success() {
-        let rows = parse_ndjson(&output.stdout);
+        let rows = parse_jsonl(&output.stdout);
         for row in &rows {
             assert_eq!(
                 row["language"].as_str().unwrap_or(""),
@@ -235,7 +235,7 @@ fn knn_min_score_filter_respects_threshold() {
         .unwrap();
 
     if output.status.success() {
-        let rows = parse_ndjson(&output.stdout);
+        let rows = parse_jsonl(&output.stdout);
         for row in &rows {
             let score = row["score"].as_f64().unwrap_or(0.0);
             assert!(score >= 0.99, "score {score} below --min-score 0.99");

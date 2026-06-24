@@ -147,13 +147,13 @@ echo ""
 # Fetch metadata
 # ---------------------------------------------------------------------------
 echo "Fetching task metadata from HuggingFace..."
-METADATA_NDJSON="$(fetch_metadata)"
-if [[ -z "$METADATA_NDJSON" ]]; then
+METADATA_JSONL="$(fetch_metadata)"
+if [[ -z "$METADATA_JSONL" ]]; then
     echo "ERROR: Failed to fetch dataset metadata after retries." >&2
     exit 1
 fi
 
-TOTAL="$(echo "$METADATA_NDJSON" | grep -c . || true)"
+TOTAL="$(echo "$METADATA_JSONL" | grep -c . || true)"
 echo "Fetched metadata for ${TOTAL} tasks."
 echo ""
 
@@ -242,7 +242,7 @@ while IFS= read -r line; do
     echo "  Done: checked out ${BASE_COMMIT:0:12}"
     SUCCESS=$((SUCCESS + 1))
 
-done <<< "$METADATA_NDJSON"
+done <<< "$METADATA_JSONL"
 
 # ---------------------------------------------------------------------------
 # Summary

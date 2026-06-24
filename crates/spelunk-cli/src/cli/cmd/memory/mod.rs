@@ -32,18 +32,24 @@ pub enum MemoryCommand {
     Archive(MemoryArchiveArgs),
     /// Archive an entry and mark it as superseded by a newer entry
     Supersede(MemorySupersededArgs),
-    /// Push all local memory entries to the configured memory server
+    /// Push all local memory entries to the configured memory server (one-way)
     Push(MemoryPushArgs),
+    /// Pull new memory entries from the configured server into local memory.db
+    Pull(MemoryPullArgs),
+    /// Two-way sync: push local changes and pull remote changes (ADR-037)
+    Sync(MemorySyncArgs),
     /// Show how the team's understanding of a topic evolved over time
     Timeline(MemoryTimelineArgs),
     /// Show the relationship graph for a memory entry
     Graph(MemoryGraphArgs),
     /// List memory entries created after a given Unix timestamp
     Since(MemorySinceArgs),
-    /// Stream new memory entries from the server in real time (requires memory_server_url)
+    /// Stream new memory entries from the server in real time (requires server_url)
     Watch(MemoryWatchArgs),
     /// List all stored antipatterns (shortcut for `list --kind antipattern`)
     Failures(MemoryFailuresArgs),
+    /// Import unique notes from server.db into memory.db (one-time recovery after ADR-004 migration)
+    Reconcile(MemoryReconcileArgs),
 }
 
 #[derive(Args, Debug)]
@@ -135,6 +141,10 @@ pub struct MemorySearchArgs {
     /// Expand results by 1 hop along relates_to edges
     #[arg(long)]
     pub expand_graph: bool,
+
+    /// Search only the local project's memory, skipping linked project stores
+    #[arg(long)]
+    pub local_only: bool,
 }
 
 #[derive(Args, Debug)]
@@ -151,7 +161,7 @@ pub struct MemoryListArgs {
     #[arg(short, long, default_value = "20")]
     pub limit: usize,
 
-    /// Output format: text or json
+    /// Output format: text, json, or jsonl
     #[arg(long, default_value = "text")]
     pub format: String,
 
@@ -162,6 +172,10 @@ pub struct MemoryListArgs {
     /// Return only entries valid at this point in time (ISO 8601, e.g. 2026-03-15 or 2026-03-15T10:00:00)
     #[arg(long, value_name = "DATE")]
     pub as_of: Option<String>,
+
+    /// List only local project's memory, skipping linked project stores
+    #[arg(long)]
+    pub local_only: bool,
 }
 
 #[derive(Args, Debug)]
@@ -220,7 +234,25 @@ pub struct MemoryPushArgs {
     /// Local memory.db to push from (default: same as --db)
     #[arg(long)]
     pub source: Option<std::path::PathBuf>,
-    /// Push archived entries too
+    /// Push archived entries too (propagates tombstones)
+    #[arg(long)]
+    pub include_archived: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct MemoryPullArgs {
+    /// Reserved for future filters; pull currently fetches all entries after the
+    /// UUID cursor (`MAX(remote_id)` of locally-synced rows; decision #183).
+    #[arg(long, hide = true)]
+    pub all: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct MemorySyncArgs {
+    /// Local memory.db to sync (default: auto-detected memory.db)
+    #[arg(long)]
+    pub source: Option<std::path::PathBuf>,
+    /// Include archived entries in the push (propagates tombstones)
     #[arg(long)]
     pub include_archived: bool,
 }
@@ -248,7 +280,7 @@ pub struct MemorySinceArgs {
     #[arg(short, long, default_value_t = 100)]
     pub limit: usize,
 
-    /// Output format: text, json, or ndjson
+    /// Output format: text, json, or jsonl
     #[arg(long, default_value = "text")]
     pub format: String,
 }
@@ -292,20 +324,43 @@ pub struct MemoryFailuresArgs {
     pub as_of: Option<String>,
 }
 
+#[derive(Args, Debug)]
+pub struct MemoryReconcileArgs {
+    /// Path to the source server.db (default: ~/.local/state/spelunk/server.db).
+    /// Named --source-db to avoid conflicting with the global --db (memory.db path).
+    #[arg(long = "source-db")]
+    pub source_db: Option<std::path::PathBuf>,
+
+    /// Detect and report candidates without importing anything
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Reconcile every project slug found in server.db (default: active project only)
+    #[arg(long)]
+    pub all_projects: bool,
+
+    /// Output format: text or json (NDJSON summary object)
+    #[arg(long, default_value = "text")]
+    pub format: String,
+}
+
 use super::status::format_age;
 
 mod add;
 mod archive;
+pub(crate) mod cross_project;
 mod failures;
 mod graph_cmd;
 mod harvest;
 mod harvest_claude;
 mod list;
 pub mod push;
+pub(crate) mod reconcile;
 mod search;
 mod show;
 mod since;
 mod supersede;
+pub mod sync;
 mod timeline;
 mod watch;
 
@@ -324,11 +379,14 @@ pub async fn memory(args: MemoryArgs, cfg: crate::config::Config) -> Result<()> 
         MemoryCommand::Archive(a) => archive::memory_archive(a, &mem_path, &cfg, be).await,
         MemoryCommand::Supersede(a) => supersede::memory_supersede(a, &mem_path, &cfg, be).await,
         MemoryCommand::Push(a) => push::memory_push(a, &mem_path, &cfg, be).await,
+        MemoryCommand::Pull(a) => sync::memory_pull(a, &mem_path, &cfg).await,
+        MemoryCommand::Sync(a) => sync::memory_sync(a, &mem_path, &cfg).await,
         MemoryCommand::Timeline(a) => timeline::memory_timeline(a, &mem_path, &cfg, be).await,
         MemoryCommand::Graph(a) => graph_cmd::memory_graph(a, &mem_path, &cfg, be).await,
         MemoryCommand::Since(a) => since::memory_since(a, &mem_path, &cfg, be).await,
         MemoryCommand::Watch(a) => watch::memory_watch(a, &cfg).await,
         MemoryCommand::Failures(a) => failures::memory_failures(a, &mem_path, &cfg, be).await,
+        MemoryCommand::Reconcile(a) => reconcile::memory_reconcile(a, &mem_path, &cfg).await,
     }
 }
 
@@ -356,8 +414,13 @@ pub(super) fn print_note_summary(n: &crate::storage::memory::Note) {
     } else {
         ""
     };
+    let source_badge = n
+        .source_project
+        .as_deref()
+        .map(|p| format!("  \x1b[36m[from: {p}]\x1b[0m"))
+        .unwrap_or_default();
     println!(
-        "\x1b[1m#{id}\x1b[0m  \x1b[33m[{kind}]\x1b[0m  {title}{archived}{dist_fmt}",
+        "\x1b[1m#{id}\x1b[0m  \x1b[33m[{kind}]\x1b[0m  {title}{archived}{dist_fmt}{source}",
         id = n.id,
         kind = n.kind,
         title = n.title,
@@ -367,6 +430,7 @@ pub(super) fn print_note_summary(n: &crate::storage::memory::Note) {
         } else {
             format!("\x1b[2m{dist}\x1b[0m")
         },
+        source = source_badge,
     );
     println!("     \x1b[2m{}\x1b[0m", format_age(n.created_at));
     if let Some(valid_at) = n.valid_at {

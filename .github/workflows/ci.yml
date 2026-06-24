@@ -13,8 +13,9 @@ jobs:
   check:
     name: Check & Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         run: |
@@ -36,17 +37,11 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
       - name: Clippy (rich-formats)
         run: cargo clippy --all-targets --features rich-formats -- -D warnings
 
-      - name: Check
-        run: cargo check --all-targets
-
-      - name: Build
-        run: cargo build --all-targets
+      - name: Check (rich-formats)
+        run: cargo check --all-targets --features rich-formats
 
       - name: Build (rich-formats)
         run: cargo build --all-targets --features rich-formats
@@ -54,11 +49,23 @@ jobs:
   test:
     name: Test
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            # Linux links the native embedder (ort/fastembed) so the
+            # `embed-native` path stays under test on at least one platform.
+            test-flags: ""
+          - os: macos-latest
+            # macOS drops `embed-native`: ort's build script bakes absolute
+            # `-lclang_rt.osx` / ONNX-download-cache link paths that don't
+            # survive a restored `target/` cache or a runner-image rotation,
+            # producing `ld: library 'clang_rt.osx' not found`. The embedder is
+            # EXPERIMENTAL / NOT RECOMMENDED and is covered on the Linux leg.
+            test-flags: "--no-default-features"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         run: |
@@ -72,21 +79,25 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # `-v2` bump abandons the poisoned pre-2026-06-24 macOS caches that
+          # held stale ort link directives. Keep restore-keys on the same
+          # `-v2-` prefix so we never fall back into a poisoned cache.
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-v2-
 
       - name: Install ast-grep
         run: npm install --global @ast-grep/cli
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --verbose ${{ matrix.test-flags }}
 
   openapi-snapshot:
     name: OpenAPI snapshot check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         run: |

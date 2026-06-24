@@ -13,21 +13,21 @@ pub struct PlumbingArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum PlumbingCommand {
-    /// Emit indexed chunks for a file as NDJSON
+    /// Emit indexed chunks for a file as JSONL
     CatChunks(PlumbingCatChunksArgs),
-    /// List all indexed files as NDJSON
+    /// List all indexed files as JSONL
     LsFiles(PlumbingLsFilesArgs),
-    /// Parse a file and emit chunks as NDJSON (without storing)
+    /// Parse a file and emit chunks as JSONL (without storing)
     ParseFile(PlumbingParseFileArgs),
     /// Compute blake3 hash of a file and check index currency
     HashFile(PlumbingHashFileArgs),
-    /// KNN vector search returning NDJSON results
+    /// KNN vector search returning JSONL results
     Knn(PlumbingKnnArgs),
-    /// Read lines from stdin and emit embedding vectors as NDJSON
+    /// Read lines from stdin and emit embedding vectors as JSONL
     Embed(PlumbingEmbedArgs),
-    /// Emit code graph edges as NDJSON
+    /// Emit code graph edges as JSONL
     GraphEdges(PlumbingGraphEdgesArgs),
-    /// Emit memory entries as NDJSON
+    /// Emit memory entries as JSONL
     ReadMemory(PlumbingReadMemoryArgs),
 }
 

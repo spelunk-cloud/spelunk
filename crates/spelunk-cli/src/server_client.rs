@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::config::Config;
 
@@ -120,9 +121,17 @@ pub struct ServerInferenceClient {
 }
 
 impl ServerInferenceClient {
-    /// Build from config. Returns `None` when `server_url` is not configured.
+    /// Build from config. Returns `None` when no inference URL is available.
+    ///
+    /// Uses `Config::resolve_inference_url()` (ADR-004): an auto-discovered
+    /// loopback server sets `inference_url` while leaving `server_url` unset, so
+    /// inference reaches the server even though memory stays local. An explicit
+    /// team `server_url` is used for both.
     pub fn from_config(cfg: &Config) -> Option<Self> {
-        let base_url = cfg.server_url.as_deref()?.trim_end_matches('/').to_string();
+        let base_url = cfg
+            .resolve_inference_url()?
+            .trim_end_matches('/')
+            .to_string();
         let project_id = cfg.project_id.clone().unwrap_or_default();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
@@ -254,7 +263,7 @@ impl ServerInferenceClient {
     /// The `chunk_id` is prefixed `query:` per ADR-002 so it is trivially
     /// distinguishable from real chunk ids in server logs.
     pub async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        let chunk_id = format!("query:{}", uuid_v4_hex());
+        let chunk_id = format!("query:{}", Uuid::now_v7());
         let body = EmbedReq {
             chunks: vec![EmbedChunkIn {
                 chunk_id: &chunk_id,
@@ -322,19 +331,6 @@ impl ServerInferenceClient {
 
         Ok(resp.query_vector)
     }
-}
-
-// ── UUID helper (no dep needed) ───────────────────────────────────────────────
-
-fn uuid_v4_hex() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Cheap pseudo-unique id using time + process id; good enough for a chunk_id prefix.
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    format!("{t:x}{pid:x}")
 }
 
 // ── EmbeddingBackend adapter ──────────────────────────────────────────────────
@@ -448,5 +444,19 @@ mod tests {
     #[test]
     fn encode_project_id_leaves_simple_slug_unchanged() {
         assert_eq!(encode_project_id("my-project"), "my-project");
+    }
+
+    /// The synthetic query `chunk_id` is built from a fresh `uuid` crate v7
+    /// UUID. Two calls must differ (so concurrent queries never collide), and
+    /// the value must be a real version-7 UUID — the `query:` prefix is what
+    /// makes it distinguishable in server logs.
+    #[test]
+    fn query_chunk_id_is_unique_uuid_v7() {
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        assert_ne!(a, b, "two query nonces must not collide");
+        assert_eq!(a.get_version(), Some(uuid::Version::SortRand));
+        let chunk_id = format!("query:{a}");
+        assert!(chunk_id.starts_with("query:"));
     }
 }

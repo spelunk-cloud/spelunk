@@ -9,7 +9,7 @@ pub(super) async fn memory_supersede(
     cfg: &Config,
     backend_override: Option<&str>,
 ) -> Result<()> {
-    let backend = open_memory_backend(cfg, mem_path, backend_override)?;
+    let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     if backend.get(args.new_id).await?.is_none() {
         anyhow::bail!("No memory entry with id {} (new).", args.new_id);
     }

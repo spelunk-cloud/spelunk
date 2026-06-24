@@ -41,6 +41,28 @@ bench/memory/author_questions.py   — extracts git log for blind authoring
 bench/memory/decision_archaeology.py — runs four-condition comparison
 ```
 
+### Committed question sets
+
+Per #237, three blind-authored question sets are committed:
+
+- `bench/memory/questions-ripgrep.json` (11 questions)
+- `bench/memory/questions-ruff.json` (11 questions)
+- `bench/memory/questions-tokio.json` (11 questions)
+
+33 questions total, each with `question`, `ground_truth_commit` (full 40-char
+SHA), and `reviewed_by`. All three repos were cloned fresh into a scratch
+directory outside this worktree; `bench/memory/raw-commits-<repo>.json` was
+generated via `author_questions.py --num-commits 500` and used as the only
+source material (supplemented by reading the corresponding GitHub PR pages
+for commits with empty bodies). No `spelunk memory list`/`search` was run
+against any of the three repos during authoring. The previous
+`questions-ripgrep.json` (5 questions, derived from harvested memory) has
+been replaced rather than kept alongside the new set.
+
+Each set was reviewed by a second pass with no access to the spelunk memory
+database; see `reviewed_by: "ada (test-engineer) on 2026-06-10"` on every
+entry for the audit trail.
+
 ### Authoring workflow
 
 ```bash

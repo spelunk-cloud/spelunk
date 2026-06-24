@@ -5,7 +5,7 @@
 //! (e.g. `src/lib.rs`), so the path argument must match what was indexed.
 
 mod plumbing_helpers;
-use plumbing_helpers::{index_fixture_project, parse_ndjson, spelunk_cmd};
+use plumbing_helpers::{index_fixture_project, parse_jsonl, spelunk_cmd};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -15,7 +15,7 @@ use tempfile::TempDir;
 // ── happy path: file is indexed ───────────────────────────────────────────────
 
 #[test]
-fn hash_file_emits_valid_ndjson() {
+fn hash_file_emits_valid_jsonl() {
     let (_tmp, db_path, config_path) = index_fixture_project();
 
     // We use the absolute path; the command should hash it and emit JSON.
@@ -33,7 +33,7 @@ fn hash_file_emits_valid_ndjson() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     assert_eq!(rows.len(), 1, "hash-file should emit exactly one JSON line");
 
     let row = &rows[0];
@@ -76,7 +76,7 @@ fn hash_file_is_current_for_relative_indexed_path() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     assert_eq!(rows.len(), 1);
 
     // The file hash should match what we computed.
@@ -117,7 +117,7 @@ fn hash_file_reports_null_indexed_hash_for_unknown_file() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     assert_eq!(rows.len(), 1);
 
     let row = &rows[0];

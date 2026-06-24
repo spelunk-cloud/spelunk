@@ -24,13 +24,13 @@ spelunk search "<query>" --mode text
 # Call/import graph — no server needed
 spelunk graph <symbol-or-file>
 spelunk graph <symbol> --kind calls       # calls | imports | extends | implements
-spelunk graph <file> --format text|json|ndjson
+spelunk graph <file> --format text|json|jsonl
 
 # Semantic search — (requires server + index)
 spelunk search "<query>"
 spelunk search "<query>" --limit 20
 spelunk search "<query>" --graph          # include call-graph neighbours
-spelunk search "<query>" --format text|json|ndjson
+spelunk search "<query>" --format text|json|jsonl
 
 # Deep search — iterative, uses LLM (requires server with an LLM backend)
 spelunk explore "<question>"
@@ -38,12 +38,12 @@ spelunk explore "<question>" --max-steps 5
 spelunk explore "<question>" --format json   # {answer, sources, steps}
 
 # Status and checks
-spelunk status --format text|json|ndjson
-spelunk check --format text|json|ndjson
+spelunk status --format text|json|jsonl
+spelunk check --format text|json|jsonl
 
 # Inspect what was indexed for a file
 spelunk chunks <file-path>
-spelunk chunks <file-path> --format text|json|ndjson
+spelunk chunks <file-path> --format text|json|jsonl
 ```
 
 Use `search --mode text` for targeted lookups without a server. Use semantic `search` (with server) for concept-level queries. Use `explore` when the answer requires tracing across multiple files — it runs autonomously and reports back.
@@ -81,7 +81,7 @@ State lives under `~/.local/state/spelunk/` (`server.pid`, `server.port`, `serve
 
 ## Plumbing commands
 
-Plumbing commands emit NDJSON and are designed for scripts and pipelines.
+Plumbing commands emit JSONL and are designed for scripts and pipelines.
 Exit codes: `0` = success, `1` = no results, `2` = error. See [Plumbing and Porcelain](docs/plumbing-and-porcelain.md) for full details.
 
 ```bash
@@ -94,7 +94,7 @@ spelunk plumbing hash-file <file>
 # Emit code graph edges (no server)
 spelunk plumbing graph-edges --file <f> | --symbol <s>
 
-# Emit memory entries as NDJSON (no server)
+# Emit memory entries as JSONL (no server)
 spelunk plumbing read-memory [--kind <k>] [--limit N]
 
 # Emit indexed chunks for a file (requires index)

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use spelunk::indexer::parser::SourceParser;
+use spelunk_core::indexer::parser::SourceParser;
 
 /// Fuzz `SourceParser::parse` with arbitrary bytes across all supported languages.
 ///

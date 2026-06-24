@@ -101,6 +101,14 @@ server_key = "your-shared-api-key"
 > The legacy `memory_server_url` / `memory_server_key` keys remain accepted as
 > deprecated aliases for `server_url` / `server_key`.
 
+`project_id` is a human-readable slug. If the server routes projects by an
+internal UUID (as a team/cloud memory server does), the CLI resolves the slug to
+that UUID automatically on first use and caches it in
+`.spelunk/cloud-project-id.lock`. You don't need to look the UUID up by hand.
+The cache is keyed on the slug, so renaming the project re-resolves it
+automatically; set `SPELUNK_NO_SLUG_CACHE=1` to force a fresh lookup. A raw UUID
+in `project_id` is used as-is. (See [ADR-005](adr/005-cli-slug-uuid-resolution.md).)
+
 Or use the environment variable:
 
 ```bash

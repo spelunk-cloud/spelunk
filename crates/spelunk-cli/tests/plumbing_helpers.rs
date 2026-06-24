@@ -187,7 +187,7 @@ pub fn fixture_path() -> std::path::PathBuf {
 
 /// Parse every line of `stdout` as JSON; return the parsed values.
 /// Panics if any line is not valid JSON.
-pub fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
+pub fn parse_jsonl(stdout: &[u8]) -> Vec<serde_json::Value> {
     let text = std::str::from_utf8(stdout).expect("stdout is utf-8");
     text.lines()
         .filter(|l| !l.is_empty())

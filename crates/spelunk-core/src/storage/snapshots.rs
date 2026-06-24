@@ -218,13 +218,15 @@ impl Database {
     /// Return all versions of a symbol across all snapshots plus the live index.
     /// `name_fragment` is matched as a suffix.
     pub fn symbol_history(&self, name_fragment: &str) -> Result<Vec<SymbolVersion>> {
-        let pattern = format!("%{name_fragment}");
+        // Escape LIKE metacharacters in the user-supplied name fragment so that
+        // '%' and '_' are treated as literals, not wildcards.
+        let pattern = format!("%{}", super::escape_like(name_fragment));
 
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.node_type, c.name, c.start_line, c.end_line, c.content, f.path, NULL, NULL
              FROM chunks c
              JOIN files f ON f.id = c.file_id
-             WHERE c.name LIKE ?1
+             WHERE c.name LIKE ?1 ESCAPE '\\'
              ORDER BY f.path, c.start_line",
         )?;
         let live: Vec<SymbolVersion> = stmt
@@ -249,7 +251,7 @@ impl Database {
              FROM snapshot_chunks sc
              JOIN snapshot_files sf ON sf.id = sc.file_id
              JOIN snapshots s       ON s.id  = sc.snapshot_id
-             WHERE sc.name LIKE ?1
+             WHERE sc.name LIKE ?1 ESCAPE '\\'
              ORDER BY s.created_at ASC, sf.path, sc.start_line",
         )?;
         let snaps: Vec<SymbolVersion> = stmt2

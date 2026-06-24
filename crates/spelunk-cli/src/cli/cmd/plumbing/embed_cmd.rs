@@ -16,9 +16,7 @@ struct EmbedOutput {
 
 pub(super) async fn embed_cmd(cfg: &Config, query_mode: bool) -> Result<()> {
     if std::io::stdin().is_terminal() {
-        eprintln!(
-            "spelunk plumbing embed: reads lines from stdin, emits NDJSON embedding per line"
-        );
+        eprintln!("spelunk plumbing embed: reads lines from stdin, emits JSONL embedding per line");
         std::process::exit(2);
     }
 

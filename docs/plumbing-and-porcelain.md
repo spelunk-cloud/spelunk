@@ -2,17 +2,17 @@
 
 ## What is plumbing vs porcelain?
 
-Git popularised the distinction: *porcelain* commands are polished, human-friendly interfaces (coloured output, progress bars, readable prose), while *plumbing* commands are low-level, composable building blocks designed for scripts and pipelines. spelunk follows the same pattern. Porcelain commands like `spelunk search` and `spelunk memory list` format output for reading in a terminal; plumbing commands under `spelunk plumbing` emit raw NDJSON to stdout and are designed to be piped into other processes.
+Git popularised the distinction: *porcelain* commands are polished, human-friendly interfaces (coloured output, progress bars, readable prose), while *plumbing* commands are low-level, composable building blocks designed for scripts and pipelines. spelunk follows the same pattern. Porcelain commands like `spelunk search` and `spelunk memory list` format output for reading in a terminal; plumbing commands under `spelunk plumbing` emit raw JSONL to stdout and are designed to be piped into other processes.
 
 ## When to use plumbing
 
 Use plumbing commands when you are:
 
-- **Writing agent scripts** — parse NDJSON directly rather than scraping human-readable text.
+- **Writing agent scripts** — parse JSONL directly rather than scraping human-readable text.
 - **Composing pipelines** — chain plumbing commands with `jq`, `xargs`, or other plumbing commands.
 - **Running in CI** — exit codes are unambiguous (see table below); no ANSI codes pollute logs.
 - **Building reproducible queries** — the same plumbing invocation always produces the same schema, regardless of terminal width or colour settings.
-- **Integrating spelunk output into another tool** — NDJSON is trivially parsed in any language.
+- **Integrating spelunk output into another tool** — JSONL is trivially parsed in any language.
 
 ## When to use porcelain
 
@@ -34,7 +34,7 @@ Scripts should distinguish `1` (empty) from `2` (broken) rather than treating an
 
 ## Output format
 
-All plumbing commands write **one JSON object per line** (NDJSON) to **stdout**. Errors and warnings go to **stderr** only — stdout is always machine-parseable. There are no progress bars, no ANSI escape codes, and no trailing commas or array wrappers.
+All plumbing commands write **one JSON object per line** (JSONL) to **stdout**. Errors and warnings go to **stderr** only — stdout is always machine-parseable. There are no progress bars, no ANSI escape codes, and no trailing commas or array wrappers.
 
 Example: reading five results from `knn` into a shell array:
 
@@ -76,14 +76,14 @@ spelunk plumbing ls-files --stale --root . \
 
 | Command | Synopsis | Description |
 |---------|----------|-------------|
-| `cat-chunks` | `spelunk plumbing cat-chunks <file>` | Emit all indexed chunks for a file as NDJSON. Exits `1` if the file has no indexed chunks. |
-| `ls-files` | `spelunk plumbing ls-files [--prefix <p>] [--stale] [--root <dir>]` | List every indexed file as NDJSON. `--stale` restricts output to files whose on-disk hash differs from the stored hash. Exits `1` if no files match. |
-| `parse-file` | `spelunk plumbing parse-file <file>` | Parse a file using tree-sitter and emit chunks as NDJSON without writing to the index. |
+| `cat-chunks` | `spelunk plumbing cat-chunks <file>` | Emit all indexed chunks for a file as JSONL. Exits `1` if the file has no indexed chunks. |
+| `ls-files` | `spelunk plumbing ls-files [--prefix <p>] [--stale] [--root <dir>]` | List every indexed file as JSONL. `--stale` restricts output to files whose on-disk hash differs from the stored hash. Exits `1` if no files match. |
+| `parse-file` | `spelunk plumbing parse-file <file>` | Parse a file using tree-sitter and emit chunks as JSONL without writing to the index. |
 | `hash-file` | `spelunk plumbing hash-file <file>` | Compute the blake3 hash of a file and compare it to the stored hash, reporting whether the index is current for that file. |
 | `knn` | `spelunk plumbing knn [--limit N] [--min-score F] [--lang <lang>]` | Read a JSON embedding object from stdin and return the *N* nearest indexed chunks by cosine similarity. Exits `1` if no results pass the filters. |
-| `embed` | `spelunk plumbing embed [--query]` | Read lines from stdin and emit one NDJSON embedding vector per line. Pass `--query` to apply the query retrieval prefix (use this before piping into `knn`). |
-| `graph-edges` | `spelunk plumbing graph-edges --file <f> \| --symbol <s>` | Emit code graph edges (imports, calls, extends) for a file or symbol as NDJSON. At least one of `--file` or `--symbol` is required. Exits `1` if no edges found. |
-| `read-memory` | `spelunk plumbing read-memory [--kind <k>] [--id <n>] [--limit N]` | Emit memory entries as NDJSON. Filter by kind (`decision`, `question`, `note`, etc.) or fetch a single entry by id. |
+| `embed` | `spelunk plumbing embed [--query]` | Read lines from stdin and emit one JSONL embedding vector per line. Pass `--query` to apply the query retrieval prefix (use this before piping into `knn`). |
+| `graph-edges` | `spelunk plumbing graph-edges --file <f> \| --symbol <s>` | Emit code graph edges (imports, calls, extends) for a file or symbol as JSONL. At least one of `--file` or `--symbol` is required. Exits `1` if no edges found. |
+| `read-memory` | `spelunk plumbing read-memory [--kind <k>] [--id <n>] [--limit N]` | Emit memory entries as JSONL. Filter by kind (`decision`, `question`, `note`, etc.) or fetch a single entry by id. |
 
 ---
 

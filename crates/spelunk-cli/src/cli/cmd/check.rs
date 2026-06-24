@@ -93,6 +93,7 @@ pub async fn check(args: CheckArgs, cfg: Config) -> Result<()> {
         };
         let mem_path = resolve_db(args.db.as_deref(), &cfg.db_path).with_file_name("memory.db");
         let memory_backend_kind = open_memory_backend(&cfg, &mem_path, None)
+            .await
             .ok()
             .map(|b| b.backend_kind())
             .unwrap_or("sqlite");
@@ -159,7 +160,7 @@ pub async fn check(args: CheckArgs, cfg: Config) -> Result<()> {
     // Show active intent entries (text mode only; silently skip if memory unavailable).
     if effective == "text" || effective == "porcelain" {
         let mem_path = resolve_db(args.db.as_deref(), &cfg.db_path).with_file_name("memory.db");
-        if let Ok(backend) = open_memory_backend(&cfg, &mem_path, None)
+        if let Ok(backend) = open_memory_backend(&cfg, &mem_path, None).await
             && let Ok(intents) = backend.list(Some("intent"), 20, false, None).await
             && !intents.is_empty()
         {

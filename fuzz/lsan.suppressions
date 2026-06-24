@@ -1,0 +1,19 @@
+# LeakSanitizer suppressions for the fuzz targets.
+#
+# Scope: ONLY the upstream tree-sitter-sequel (SQL grammar) external scanner.
+# Leak detection stays ON for everything else, including all of our own Rust.
+#
+# tree-sitter-sequel 0.3.11 ships a hand-written C scanner (src/scanner.c) that
+# leaks the dollar-quote `start_tag` allocation on malformed PostgreSQL
+# dollar-quoted input (e.g. `4$64$$`):
+#   * deserialize() overwrites state->start_tag without freeing the old one
+#   * serialize() frees start_tag, violating the read-only serialize contract
+# 0.3.11 is the latest release, so there is no version to bump to.
+#
+# All allocations on the leak path unwind through the uniquely-named external
+# scanner entry points (tree_sitter_sql_external_scanner_{scan,deserialize,...}),
+# so this single substring suppresses the upstream leak without masking ours.
+#
+# TODO(upstream): remove once fixed in tree-sitter-sequel. Upstream project:
+# https://github.com/derekstride/tree-sitter-sql (leak in external scanner)
+leak:tree_sitter_sql_external_scanner

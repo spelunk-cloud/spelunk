@@ -13,8 +13,9 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         run: |
@@ -42,8 +43,9 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         run: |

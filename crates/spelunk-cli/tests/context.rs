@@ -63,8 +63,8 @@ fn setup_context_project() -> (TempDir, PathBuf, PathBuf) {
         ),
         (
             "decision",
-            "NDJSON for plumbing output",
-            "All plumbing commands emit NDJSON, one object per line.",
+            "JSONL for plumbing output",
+            "All plumbing commands emit JSONL, one object per line.",
         ),
         (
             "decision",

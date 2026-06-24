@@ -10,8 +10,9 @@ jobs:
   fuzz-parser:
     name: cargo-fuzz fuzz_parser
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly
         run: |
@@ -32,6 +33,20 @@ jobs:
 
       - name: Install cargo-fuzz
         run: cargo-fuzz --version 2>/dev/null || cargo +nightly install cargo-fuzz --locked
+
+      # LeakSanitizer suppressions (fuzz/lsan.suppressions) are matched against
+      # symbolized frames, so a working llvm-symbolizer must be discoverable;
+      # otherwise leak stacks stay raw and the suppression cannot match.
+      - name: Ensure leak-stack symbolization
+        run: |
+          SYM="$(command -v llvm-symbolizer || ls /usr/bin/llvm-symbolizer* /usr/lib/llvm-*/bin/llvm-symbolizer 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$SYM" ]; then
+            sudo apt-get update && sudo apt-get install -y llvm
+            SYM="$(ls /usr/bin/llvm-symbolizer* | sort -V | tail -1)"
+          fi
+          echo "Using symbolizer: $SYM"
+          echo "ASAN_SYMBOLIZER_PATH=$SYM" >> "$GITHUB_ENV"
+          echo "LSAN_OPTIONS=suppressions=$GITHUB_WORKSPACE/fuzz/lsan.suppressions" >> "$GITHUB_ENV"
 
       - name: Run fuzzer (60 s)
         run: cargo +nightly fuzz run fuzz_parser -- -max_total_time=60

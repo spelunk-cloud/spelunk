@@ -47,7 +47,7 @@ pub(super) async fn harvest_claude_code(
 ) -> Result<()> {
     // Tier-0 gate: harvest requires server inference.
     let server = ServerInferenceClient::from_config(cfg)
-        .ok_or_else(|| harvest_requires_server(cfg.server_url.as_deref()))?;
+        .ok_or_else(|| harvest_requires_server(cfg.resolve_inference_url()))?;
 
     // 1. Require explicit confirmation.
     if !args.confirm {
@@ -102,7 +102,7 @@ pub(super) async fn harvest_claude_code(
     };
 
     // 5. Load known source_refs.
-    let backend = open_memory_backend(cfg, mem_path, backend_override)?;
+    let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     let known_refs = backend.harvested_shas().await.map_err(backend_err)?;
 
     // 6. Stream-read history file; accumulate sessions relevant to this repo.

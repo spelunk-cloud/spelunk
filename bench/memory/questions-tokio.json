@@ -1,0 +1,57 @@
+[
+    {
+        "question": "What changed about how `Sleep`/timers behave when `.reset()` is called from a different runtime than the one the timer was originally registered on?",
+        "ground_truth_commit": "37ced33efddccc6721588af6fbe095d34fa17d7d",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Where does `Sleep`'s lazy timer-registration state now live, and what was it part of before?",
+        "ground_truth_commit": "923e72345c77aef4d11875d874ba67421b0412d3",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What bug existed in `write_all_vectored` related to advancing partially-written buffers, and how was it fixed?",
+        "ground_truth_commit": "c6af672353b428fb525cc34a522737924f523a93",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What change consolidated mutex locking behavior in the timer driver on a spurious poll?",
+        "ground_truth_commit": "ee0dc9092665a1f13df573dc5e5124999d8e9035",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "How does the local run queue handle overflow when it's full now, compared to how it worked before — which half of the tasks gets pushed to the global queue?",
+        "ground_truth_commit": "203af021261ab7399c18ab12f22c24f1934c7d42",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "How was `spawn_blocking` scalability improved, and what data structure replaced the previous queue?",
+        "ground_truth_commit": "1604bc335157be9a131e24cfde55cab3c90ebc92",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What is `LocalRuntime` and when did it become a stable API?",
+        "ground_truth_commit": "1fc450aefba4b05cdff9b7825ca5e39cccb3780e",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What was the bug in `Chan::recv_many` that caused a panic when called on an empty, closed channel, and how was the assertion fixed?",
+        "ground_truth_commit": "bf18ed452d6aae438e84ae008a01a74776abdc19",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What priority bug existed in `Notify::notify_waiters` versus `notify_one`, where an unpolled `Notified` future could incorrectly consume a permit?",
+        "ground_truth_commit": "9f132172dbb00b1f6b6bda64bb9b194382079499",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why do the `try_read`/`try_write` methods on `pipe::Sender`/`pipe::Receiver` return WouldBlock even when the operation could otherwise succeed if called before any `.await`?",
+        "ground_truth_commit": "1afb39135073a56d8983fed0bde85b9f70a1ec3b",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why was `LinesCodec`'s delimiter scan changed to use `libc::memchr`?",
+        "ground_truth_commit": "326bd2cc4484702260f2003697fbd1d4dcf9d20c",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    }
+]

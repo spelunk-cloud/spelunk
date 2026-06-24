@@ -78,7 +78,14 @@ pub async fn explore(args: ExploreArgs, cfg: Config) -> Result<()> {
         eprintln!("Exploring: {}\n", args.question);
     }
 
-    let explorer = Explorer::new(db_path.clone(), &embedder, &llm, args.max_steps, verbose);
+    let explorer = Explorer::new(
+        db_path.clone(),
+        project_root.to_path_buf(),
+        &embedder,
+        &llm,
+        args.max_steps,
+        verbose,
+    );
     let result = explorer.explore(&args.question).await?;
 
     if use_json {

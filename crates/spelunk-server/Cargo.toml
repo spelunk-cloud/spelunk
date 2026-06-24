@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-server"
-version = "0.8.0"
+version = "0.8.3"
 edition = "2024"
 description = "spelunk shared memory server"
 license = "MIT"
@@ -32,11 +32,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
+uuid = { workspace = true }
 reqwest = { workspace = true }
 openssl = { workspace = true }
 openssl-sys = { workspace = true }
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["auth"] }
+tower-http = { version = "0.7", features = ["auth"] }
 async-stream = "0.3"
 tokio-stream = "0.1"
 futures-util = "0.3"

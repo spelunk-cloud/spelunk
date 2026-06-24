@@ -1,7 +1,7 @@
 //! Component tests for `spelunk plumbing graph-edges`.
 
 mod plumbing_helpers;
-use plumbing_helpers::{index_fixture_project, parse_ndjson, spelunk_cmd};
+use plumbing_helpers::{index_fixture_project, parse_jsonl, spelunk_cmd};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -10,7 +10,7 @@ use tempfile::TempDir;
 // ── happy path: file filter ───────────────────────────────────────────────────
 
 #[test]
-fn graph_edges_file_filter_returns_valid_ndjson_or_exit1() {
+fn graph_edges_file_filter_returns_valid_jsonl_or_exit1() {
     let (_tmp, db_path, config_path) = index_fixture_project();
 
     // utils.rs has no imports — may have no outgoing edges.
@@ -21,9 +21,9 @@ fn graph_edges_file_filter_returns_valid_ndjson_or_exit1() {
         .output()
         .unwrap();
 
-    // Either exit 1 (no edges) or exit 0 with valid NDJSON.
+    // Either exit 1 (no edges) or exit 0 with valid JSONL.
     if result.status.success() {
-        let rows = parse_ndjson(&result.stdout);
+        let rows = parse_jsonl(&result.stdout);
         for row in &rows {
             assert!(
                 row.get("source_file").is_some(),
@@ -42,7 +42,7 @@ fn graph_edges_file_filter_returns_valid_ndjson_or_exit1() {
 }
 
 #[test]
-fn graph_edges_main_file_returns_valid_ndjson_or_exit1() {
+fn graph_edges_main_file_returns_valid_jsonl_or_exit1() {
     let (_tmp, db_path, config_path) = index_fixture_project();
 
     // main.rs uses `greet` from lib — there should be at least a call edge.
@@ -54,7 +54,7 @@ fn graph_edges_main_file_returns_valid_ndjson_or_exit1() {
         .unwrap();
 
     if result.status.success() {
-        let rows = parse_ndjson(&result.stdout);
+        let rows = parse_jsonl(&result.stdout);
         assert!(!rows.is_empty(), "expected edges for main.rs");
         for row in &rows {
             assert!(
@@ -75,7 +75,7 @@ fn graph_edges_main_file_returns_valid_ndjson_or_exit1() {
 // ── symbol filter ─────────────────────────────────────────────────────────────
 
 #[test]
-fn graph_edges_symbol_filter_returns_valid_ndjson_or_exit1() {
+fn graph_edges_symbol_filter_returns_valid_jsonl_or_exit1() {
     let (_tmp, db_path, config_path) = index_fixture_project();
 
     let result = spelunk_cmd(&db_path, &config_path)
@@ -86,7 +86,7 @@ fn graph_edges_symbol_filter_returns_valid_ndjson_or_exit1() {
         .unwrap();
 
     if result.status.success() {
-        let rows = parse_ndjson(&result.stdout);
+        let rows = parse_jsonl(&result.stdout);
         for row in &rows {
             assert!(
                 row.get("source_file").is_some(),

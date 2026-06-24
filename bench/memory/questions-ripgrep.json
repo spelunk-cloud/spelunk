@@ -1,27 +1,57 @@
 [
     {
-        "question": "Why was RIPGREP_CONFIG_PATH added?",
-        "answer_keywords": ["RIPGREP_CONFIG_PATH", "config path", "DEBUG"],
-        "ground_truth_commit": "cb66736f"
+        "question": "Why does ripgrep log a DEBUG message when RIPGREP_CONFIG_PATH is not set, even though that's not an error?",
+        "ground_truth_commit": "cb66736f146f093497f4dc537b33d0826f9af33c",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
     },
     {
-        "question": "What container types were added for Docker support?",
-        "answer_keywords": ["container", "Dockerfile", "Containerfile"],
-        "ground_truth_commit": "9b84e154"
+        "question": "How was cmd_exists changed to fix compression tests under QEMU cross-compilation, and why did the old check not work there?",
+        "ground_truth_commit": "0a88cccd5188074de96f54a4b6b44a63971ac157",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
     },
     {
-        "question": "What change was made to path checking in ignore logic?",
-        "answer_keywords": ["path checking", "Ignore", "stat calls"],
-        "ground_truth_commit": "85edf4c7"
+        "question": "Why did ripgrep stop unconditionally calling stat on `.jj` directories during ignore-file processing?",
+        "ground_truth_commit": "85edf4c79671b00002123a2a43ff5238b6a27891",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
     },
     {
-        "question": "How was command existence verification updated?",
-        "answer_keywords": ["command existence", "spawned process", "verify"],
-        "ground_truth_commit": "0a88cccd"
+        "question": "What was the bug with global gitignore files (from core.excludesFile or --ignore-file) when absolute paths were involved, and how should those patterns be interpreted?",
+        "ground_truth_commit": "b610d1cb1506feab33459c5853e4c0d0cb16a6e2",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
     },
     {
-        "question": "What version was ripgrep updated to recently?",
-        "answer_keywords": ["version", "15.1.0"],
-        "ground_truth_commit": "af60c2de"
+        "question": "What performance bug affected -A/--after-context with large context values, and how does the fix avoid the slowdown?",
+        "ground_truth_commit": "d4b77a8d8967ce1bf701ec65ceb9a75e85e5f2e0",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why did searching stdin with a large -A/--after-context value behave so differently (exponentially slower) than searching the same data from a regular file?",
+        "ground_truth_commit": "8c6595c215d1e24bed5b7b86e2b18f3c871439ef",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Where does the 'max matches' limit get enforced now, and why was it moved out of the printer?",
+        "ground_truth_commit": "a6e0be3c909c5c09e5fb402c907f3beb88cfb4c4",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why did the project move to Rust 2024 across the workspace?",
+        "ground_truth_commit": "a60e62d9ac559b1468d4dd27b80a7b662a600e0c",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What does the globset `allow_unclosed_class` toggle do, and what's the default behavior it changes?",
+        "ground_truth_commit": "f596a5d8750a6a6db1b87ad95a78667322c06cbd",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why was the decompression reader changed to not be built unless it's actually needed, and what was the original reason it was eager?",
+        "ground_truth_commit": "916415857f084e63efda03cf25a67fe7f6d24244",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What new option mimicking walkdir's behavior was added to the ignore crate's directory traversal?",
+        "ground_truth_commit": "2924d0c4c0c87a147623d9254fbdbe7b28e7f872",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
     }
 ]

@@ -6,6 +6,9 @@ use std::path::Path;
 mod edges;
 mod notes;
 mod search;
+mod sync;
+
+pub use sync::SyncRow;
 
 #[cfg(test)]
 mod tests;
@@ -49,9 +52,25 @@ pub struct Note {
     /// Fused relevance score — only populated by hybrid search, None otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    /// Set only for notes returned via cross-project dep pass. None for local notes.
+    /// Contains the dep project's display name (final path component of root_path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_project: Option<String>,
+    /// Set alongside source_project: the dep project's root path, for disambiguation
+    /// when two linked projects share a display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_project_path: Option<String>,
 }
 
 impl MemoryStore {
+    /// Execute a raw SQL batch statement on the connection.
+    ///
+    /// Exposed for transaction management in callers that need BEGIN/COMMIT/ROLLBACK
+    /// without access to the private `conn` field (e.g. `memory reconcile`).
+    pub fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        self.conn.execute_batch(sql)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -102,6 +121,32 @@ impl MemoryStore {
         self.conn
             .execute_batch(include_str!("../../../migrations/015_memory_edges.sql"))
             .context("running memory edges migration")?;
+        // Migration 020 (ADR-037): UUID identity columns (`uuid`, `remote_id`).
+        // ALTER TABLE can't be IF NOT EXISTS; guard the duplicate-column case so
+        // re-opening an already-migrated store is a no-op. The unique indexes are
+        // CREATE … IF NOT EXISTS and safe to run unconditionally.
+        for stmt in [
+            "ALTER TABLE notes ADD COLUMN uuid TEXT",
+            "ALTER TABLE notes ADD COLUMN remote_id TEXT",
+        ] {
+            match self.conn.execute_batch(stmt) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {}
+                Err(e) => return Err(e).context("running memory uuid migration"),
+            }
+        }
+        self.conn
+            .execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_uuid \
+                 ON notes(uuid) WHERE uuid IS NOT NULL; \
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_remote_id \
+                 ON notes(remote_id) WHERE remote_id IS NOT NULL;",
+            )
+            .context("creating memory uuid indexes")?;
+        // No sync-state watermark table (decision #183): the pull cursor is
+        // derived from `MAX(remote_id)` over `notes`, so there is no separate
+        // watermark to persist. The unique `idx_notes_remote_id` above is what
+        // makes that cursor lookup and the `remote_id` dedupe cheap.
         Ok(())
     }
 }

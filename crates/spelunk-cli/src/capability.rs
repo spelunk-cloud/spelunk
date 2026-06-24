@@ -177,20 +177,34 @@ impl Tier {
     /// explicitly or discovered via the loopback probe.
     ///
     /// Loopback auto-discovery sets the capability `Tier` WITHOUT populating
-    /// `cfg.server_url`. Commands that route through `from_config` /
-    /// `open_memory_backend` gate on `server_url`, so they wrongly report
+    /// `cfg.server_url`. Commands that route inference through `from_config`
+    /// gate on a server URL, so without this bridge they wrongly report
     /// "requires spelunk-server" even though `spelunk status` shows `Server`.
-    /// This bridges that gap: when the tier is `Server` but `cfg.server_url`
-    /// is unset (the auto-discovered case), fill in the discovered URL and
-    /// derive the `project_id` from `project_root` (mirroring `embed_phase`,
-    /// see spelunk#307). When `cfg.server_url` is already set, the config is
-    /// returned unchanged.
+    ///
+    /// ## ADR-004: inference vs memory storage are routed separately
+    ///
+    /// An auto-discovered loopback server is an **inference** backend only; it
+    /// is never a memory store. So when the tier is `Server` and `server_url`
+    /// is unset (the auto-discovered case), the discovered URL is written to
+    /// `inference_url` — NOT `server_url`. `ServerInferenceClient::from_config`
+    /// reads `inference_url` (falling back to `server_url`), so inference still
+    /// reaches the loopback server; `open_memory_backend` reads only
+    /// `server_url`, so memory stays on the project's local `memory.db`. This
+    /// is what removes the split-brain where `memory add` wrote `memory.db`
+    /// while `memory search` read the server's `server.db`.
+    ///
+    /// `project_id` is derived (mirroring `embed_phase`, see spelunk#307) so the
+    /// inference client can address the project on the server. When an explicit
+    /// `cfg.server_url` is already set (a team/remote server), it owns both
+    /// inference and memory and the config is returned unchanged.
     pub fn effective_config(&self, cfg: &Config, project_root: &std::path::Path) -> Config {
         let mut out = cfg.clone();
         if let Tier::Server { url, .. } = self
             && out.server_url.is_none()
         {
-            out.server_url = Some(url.clone());
+            // Auto-discovered loopback server: route inference here, but leave
+            // `server_url` unset so memory selection stays local (ADR-004).
+            out.inference_url = Some(url.clone());
             if out.project_id.is_none() {
                 out.project_id = Some(cfg.resolve_project_id(project_root));
             }
@@ -219,10 +233,26 @@ impl Tier {
 /// = one config), but unsuitable for long-running daemons that may use multiple
 /// configs — they would always see the tier determined by the first call.
 pub async fn get_tier(cfg: &Config) -> &'static Tier {
+    // ADR-037 D1: an *explicit* offline mode (config `mode = "offline"`,
+    // `SPELUNK_MODE=offline`, or the `SPELUNK_NO_SERVER=1` kill-switch) skips all
+    // server probes — the user has asked for a provable no-cloud run.
+    //
+    // The *defaulted* offline (no `server_url` and no explicit `mode`) must NOT
+    // skip probing: loopback auto-discovery is inference-only (it never owns
+    // memory, ADR-004) and is what gives a local-only project semantic search.
+    // Conflating the two would silently disable the loopback embedder.
+    let explicit_offline = spelunk_core::config::no_server_env_set()
+        || cfg.mode == Some(spelunk_core::config::SyncMode::Offline);
     let url = cfg.server_url.clone();
     let key = cfg.server_key.clone();
-    TIER.get_or_init(|| async move { probe(url.as_deref(), key.as_deref()).await })
-        .await
+    TIER.get_or_init(|| async move {
+        if explicit_offline {
+            tracing::debug!("sync mode is explicitly offline — skipping all server probes");
+            return Tier::Offline;
+        }
+        probe(url.as_deref(), key.as_deref()).await
+    })
+    .await
 }
 
 /// Remote-server probe timeout (explicit `server_url` in config/env).
@@ -565,6 +595,74 @@ mod tests {
         assert!(auto.is_auto_discovered());
         assert!(!explicit.is_auto_discovered());
         assert!(!Tier::Offline.is_auto_discovered());
+    }
+
+    // ── effective_config (ADR-004 inference-vs-memory routing) ───────────────
+
+    #[test]
+    fn effective_config_auto_discovered_sets_inference_url_not_server_url() {
+        // An auto-discovered loopback server is inference-only: its URL must
+        // land in `inference_url` so memory selection (`open_memory_backend`,
+        // which reads only `server_url`) stays local. This is the core of the
+        // ADR-004 split-brain fix.
+        let tier = Tier::Server {
+            url: "http://127.0.0.1:7777".to_string(),
+            caps: Capabilities::all(),
+            auto_discovered: true,
+        };
+        let cfg = Config::default(); // server_url = None
+        let eff = tier.effective_config(&cfg, std::path::Path::new("/tmp/proj"));
+
+        assert_eq!(
+            eff.server_url, None,
+            "auto-discovered server must NOT populate server_url (memory stays local)"
+        );
+        assert_eq!(
+            eff.inference_url.as_deref(),
+            Some("http://127.0.0.1:7777"),
+            "auto-discovered server URL must route inference via inference_url"
+        );
+        assert!(
+            eff.project_id.is_some(),
+            "project_id should be derived so the inference client can address the project"
+        );
+        // Inference resolves to the loopback server; memory selection does not.
+        assert_eq!(eff.resolve_inference_url(), Some("http://127.0.0.1:7777"));
+    }
+
+    #[test]
+    fn effective_config_explicit_server_url_left_unchanged() {
+        // An explicitly-configured team server owns BOTH inference and memory
+        // (team-memory tier). `effective_config` must not touch it.
+        let tier = Tier::Server {
+            url: "http://team.example.com:7777".to_string(),
+            caps: Capabilities::all(),
+            auto_discovered: false,
+        };
+        let cfg = Config {
+            server_url: Some("http://team.example.com:7777".to_string()),
+            project_id: Some("team/proj".to_string()),
+            ..Default::default()
+        };
+        let eff = tier.effective_config(&cfg, std::path::Path::new("/tmp/proj"));
+
+        assert_eq!(
+            eff.server_url.as_deref(),
+            Some("http://team.example.com:7777"),
+            "explicit team server_url must be preserved (memory stays remote)"
+        );
+        assert_eq!(
+            eff.inference_url, None,
+            "explicit server_url path should not synthesise a separate inference_url"
+        );
+    }
+
+    #[test]
+    fn effective_config_offline_tier_is_noop() {
+        let cfg = Config::default();
+        let eff = Tier::Offline.effective_config(&cfg, std::path::Path::new("/tmp/proj"));
+        assert_eq!(eff.server_url, None);
+        assert_eq!(eff.inference_url, None);
     }
 
     // ── require_tier1 ────────────────────────────────────────────────────────

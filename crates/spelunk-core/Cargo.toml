@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-core"
-version = "0.8.0"
+version = "0.8.3"
 edition = "2024"
 description = "Core library for spelunk — storage, indexer, search, embeddings"
 license = "MIT"
@@ -52,6 +52,7 @@ tree-sitter-hcl = "1.1"
 tree-sitter-proto = "0.4"
 tree-sitter-sequel = "0.3"
 
+uuid = { workspace = true }
 regex = { version = "1", default-features = false, features = ["std"] }
 blake3 = "1"
 ignore = "0.4"

@@ -1,6 +1,7 @@
 //! Batch LLM summarisation for indexed chunks.
 use anyhow::Result;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::llm::{LlmBackend, Message};
 
@@ -8,8 +9,10 @@ use crate::llm::{LlmBackend, Message};
 ///
 /// Each entry is `(chunk_id, name, kind, content)`.
 /// Returns a `Vec` of `(chunk_id, summary)` in the same order as the input.
-/// The prompt packs all chunks separated by `===CHUNK {id}===` delimiters
-/// and asks for one-sentence summaries returned as a JSON array:
+/// The prompt packs all chunks separated by a UUID-keyed delimiter that is
+/// generated fresh for each batch invocation, making it impossible for source
+/// code content to spoof the boundary and confuse the LLM (fixes #404).
+/// The LLM is asked to return one-sentence summaries as a JSON array:
 /// `[{"id": N, "summary": "..."}]`.
 ///
 /// Partial results are handled gracefully — unparseable entries are skipped.
@@ -21,10 +24,18 @@ pub async fn summarise_batch(
         return Ok(vec![]);
     }
 
+    // Generate a UUID delimiter once per batch.  Because the UUID is chosen at
+    // random at call time, no source-code content can predict or reproduce it,
+    // so a chunk cannot spoof a boundary and confuse the LLM (security fix
+    // for https://github.com/spelunk-cloud/spelunk/issues/404).
+    let batch_uuid = Uuid::new_v4();
+
     // Build the prompt body: one block per chunk.
     let mut body = String::new();
     for (id, name, kind, content) in chunks {
-        body.push_str(&format!("===CHUNK {id}===\n"));
+        // Each separator embeds both the batch UUID (unpredictable by chunk
+        // content) and the numeric chunk id.
+        body.push_str(&format!("===CHUNK-{batch_uuid}={id}===\n"));
         body.push_str(&format!("name: {name}\nkind: {kind}\n"));
         // Truncate very long chunks to avoid blowing the context window.
         // Use floor_char_boundary so we never split a multi-byte codepoint.

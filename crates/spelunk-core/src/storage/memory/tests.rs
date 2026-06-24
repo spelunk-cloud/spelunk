@@ -148,3 +148,161 @@ fn add_edge_duplicate_silently_ignored() {
         "duplicate edge must not produce a second row"
     );
 }
+
+// ── ADR-037 D2: UUID identity + cursor + idempotent apply ────────────────────
+
+#[test]
+fn ensure_uuid_backfills_and_is_idempotent() {
+    let store = open_store();
+    let id = store
+        .add_note("decision", "D", "body", &[], &[], None, None)
+        .unwrap();
+
+    // No UUID until first sync.
+    assert_eq!(store.uuid_for(id).unwrap(), None);
+
+    let u1 = store.ensure_uuid(id).unwrap();
+    assert!(!u1.is_empty());
+    // UUIDv7 string form is 36 chars.
+    assert_eq!(u1.len(), 36);
+
+    // Re-running keeps the same UUID (idempotent backfill).
+    let u2 = store.ensure_uuid(id).unwrap();
+    assert_eq!(u1, u2);
+    assert_eq!(store.uuid_for(id).unwrap(), Some(u1));
+}
+
+#[test]
+fn rows_for_sync_assigns_uuids_and_is_text_only() {
+    let store = open_store();
+    store
+        .add_note("decision", "One", "first", &[], &[], None, None)
+        .unwrap();
+    store
+        .add_note("note", "Two", "second", &[], &[], None, None)
+        .unwrap();
+
+    let rows = store.rows_for_sync(false).unwrap();
+    assert_eq!(rows.len(), 2);
+    // Every row carries a freshly-assigned UUID; SyncRow has no embedding field
+    // at all (text-only by construction — ADR-037 D3).
+    for r in &rows {
+        assert_eq!(r.uuid.len(), 36);
+        assert!(r.remote_id.is_none());
+    }
+    // Ordered oldest-first so supersede targets precede referrers.
+    assert_eq!(rows[0].title, "One");
+    assert_eq!(rows[1].title, "Two");
+}
+
+#[test]
+fn apply_remote_note_is_idempotent_no_dupes() {
+    let store = open_store();
+    let remote_id = "01890000-0000-7000-8000-000000000001";
+
+    let inserted = store
+        .apply_remote_note(
+            remote_id,
+            "decision",
+            "Remote",
+            "body",
+            None,
+            1_700_000_000,
+            false,
+        )
+        .unwrap();
+    assert!(inserted, "first apply inserts");
+
+    // Re-applying the same remote_id must NOT create a duplicate.
+    let inserted2 = store
+        .apply_remote_note(
+            remote_id,
+            "decision",
+            "Remote",
+            "body",
+            None,
+            1_700_000_000,
+            false,
+        )
+        .unwrap();
+    assert!(!inserted2, "second apply is a no-op");
+
+    let n: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE remote_id = ?1",
+            rusqlite::params![remote_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "exactly one local row for the remote id");
+}
+
+#[test]
+fn apply_remote_note_tombstone_archives_existing() {
+    let store = open_store();
+    let remote_id = "01890000-0000-7000-8000-000000000002";
+
+    store
+        .apply_remote_note(remote_id, "note", "T", "b", None, 1_700_000_000, false)
+        .unwrap();
+    let local_id = store.note_id_for_remote_id(remote_id).unwrap().unwrap();
+    assert_eq!(store.get(local_id).unwrap().unwrap().status, "active");
+
+    // A pulled tombstone archives the local copy (never un-archives).
+    let inserted = store
+        .apply_remote_note(remote_id, "note", "T", "b", None, 1_700_000_000, true)
+        .unwrap();
+    assert!(!inserted);
+    assert_eq!(store.get(local_id).unwrap().unwrap().status, "archived");
+}
+
+#[test]
+fn max_remote_id_is_the_pull_cursor() {
+    let store = open_store();
+
+    // Nothing synced yet → no cursor (caller does a full catch-up).
+    assert_eq!(store.max_remote_id().unwrap(), None);
+
+    // Record a few cloud ids. UUIDv7 strings sort lexically == time order, so
+    // MAX() returns the newest one regardless of insertion order.
+    let a = store
+        .add_note("note", "A", "b", &[], &[], None, None)
+        .unwrap();
+    let b = store
+        .add_note("note", "B", "b", &[], &[], None, None)
+        .unwrap();
+    let c = store
+        .add_note("note", "C", "b", &[], &[], None, None)
+        .unwrap();
+    store
+        .set_remote_id(b, "01890000-0000-7000-8000-000000000002")
+        .unwrap();
+    store
+        .set_remote_id(a, "01890000-0000-7000-8000-000000000001")
+        .unwrap();
+    store
+        .set_remote_id(c, "01890000-0000-7000-8000-000000000003")
+        .unwrap();
+
+    assert_eq!(
+        store.max_remote_id().unwrap().as_deref(),
+        Some("01890000-0000-7000-8000-000000000003"),
+        "cursor must be the max (newest) remote_id"
+    );
+}
+
+#[test]
+fn set_remote_id_records_and_dedupes() {
+    let store = open_store();
+    let id = store
+        .add_note("note", "N", "b", &[], &[], None, None)
+        .unwrap();
+    store.ensure_uuid(id).unwrap();
+    let remote_id = "01890000-0000-7000-8000-0000000000ff";
+
+    assert!(!store.has_remote_id(remote_id).unwrap());
+    store.set_remote_id(id, remote_id).unwrap();
+    assert!(store.has_remote_id(remote_id).unwrap());
+    assert_eq!(store.note_id_for_remote_id(remote_id).unwrap(), Some(id));
+}

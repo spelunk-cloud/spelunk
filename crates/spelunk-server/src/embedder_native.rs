@@ -29,6 +29,7 @@ const EMBED_BATCH_SIZE: usize = 8;
 /// At 512 tokens: 8 × 16 × 512² × 4 bytes ≈ 134 MB — well within budget.
 const BATCH_MAX_SEQ: usize = 512;
 
+
 pub struct NativeEmbedder {
     inner: Arc<Mutex<EmbedderInner>>,
 }

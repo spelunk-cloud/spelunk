@@ -29,7 +29,245 @@ startup. Subsequent starts use the cached weights with no network access.
 
 ---
 
-## [Unreleased] — 0.8.0-dev
+## [Unreleased] — 0.8.4-dev
+
+### Added
+
+- **`spelunk login` / `spelunk logout`** — authenticate the CLI against
+  spelunk.cloud using the OAuth 2.0 Device Authorization Grant (RFC 8628).
+  `spelunk login` initiates the flow, prints a verification URL and user code to
+  enter in the browser, polls for approval (with back-off on
+  `authorization_pending` / `slow_down`), and on success stores the issued
+  token as `server_key` in `~/.config/spelunk/config.toml`. `spelunk logout`
+  removes the stored credential. `--cloud-url` (or `SPELUNK_CLOUD_URL`)
+  overrides the default `https://api.spelunk.cloud` endpoint. (ADR-037 P3,
+  #430)
+
+- **Two-way memory sync with spelunk.cloud (`spelunk sync` / `spelunk memory
+  sync`).** When a team server is configured, `spelunk sync` (top-level alias
+  for `spelunk memory sync`) now performs a real two-way sync: it pushes local
+  memory entries the cloud has not seen and pulls remote entries into the local
+  `memory.db`, applying changes keep-both so concurrent edits on multiple
+  machines are preserved. A new `spelunk memory pull` does a one-way delta pull.
+  Sync is identity-keyed on a time-ordered UUID carried by each entry, so it is
+  idempotent (re-running never duplicates) and drift-free across machine clocks;
+  archived entries propagate as tombstones. (ADR-037 P1, #425)
+
+- **Sync modes (`mode = offline | local_first | cloud_first`).** A new `mode`
+  config field (and `SPELUNK_MODE` env override) controls how the CLI reconciles
+  local and cloud memory. The default preserves existing behaviour: with no
+  `server_url` the CLI is `offline`; with a `server_url` set it is `local_first`.
+  `SPELUNK_NO_SERVER=1` remains a hard kill-switch. (ADR-037 P1, #425)
+
+### Changed
+
+- **`spelunk login` token is now actually used for auth.** The device-flow
+  token is written to the canonical `server_key` config field that every auth
+  path already reads, so a freshly logged-in CLI authenticates against the
+  cloud without further config. Previously the token was written to a separate
+  `api_key` field that no auth consumer read, leaving login effectively inert;
+  that field has been removed. `SPELUNK_SERVER_KEY` remains the environment
+  override for CI and headless use (no new env var was introduced). (#438,
+  spelunk#437)
+
+- **Cloud project slug auto-resolves to its server UUID.** When a team
+  `server_url` routes projects by an internal UUID, a human `project_id` slug is
+  now resolved to that UUID on first use via `GET /v1/projects` and cached in
+  `.spelunk/cloud-project-id.lock`; a raw-UUID `project_id` is used directly, and
+  a loopback/unset server is left untouched. The cache is invalidated
+  automatically if the slug changes, and `SPELUNK_NO_SLUG_CACHE=1` forces a fresh
+  lookup. This makes the human-readable `project_id` work transparently against
+  cloud-api routing. (ADR-005, #428)
+
+### Fixed
+
+- **`spelunk login` no longer fails with `411 Length Required` on Cloud Run /
+  GFE-fronted hosts.** The device-init request (`POST /v1/auth/device`) was a
+  bodyless POST, so no `Content-Length` header was set and Google Front End
+  (Cloud Run's fronting proxy) rejected it before it reached cloud-api,
+  breaking login on its very first request against prod. The request now sends
+  a JSON body, so `Content-Length` and `Content-Type` are set; the body also
+  carries the machine hostname as `client_hint` (falling back to an empty
+  object when the hostname cannot be resolved). (#436, GH #434)
+
+### Dependencies
+
+- `tower-http` 0.6.11 → 0.7.0 (#431)
+- `actions/checkout` 6 → 7 (CI) (#432)
+- Refreshed `Cargo.lock` to latest semver-compatible versions; no new advisories
+  (#433)
+
+## [0.8.3] — 2026-06-17
+
+### Changed
+
+- **Server instance_id now uses UUID v7 instead of v4.** The persistent instance ID (returned by `/v1/health` and stored in the server database) is now a time-ordered UUID v7 minted by the `uuid` crate (`Uuid::now_v7`) and persisted verbatim, so the high 48 bits encode the millisecond Unix timestamp of creation and the value is stable for the life of the database. It remains a standard 36-char UUID string. (#416)
+
+- **Generate UUIDs with the `uuid` crate instead of hand-rolled helpers.** The bespoke `format_uuid_v7()` byte-formatter in spelunk-server and the `query_nonce_hex()` helper in the spelunk-cli server client (the latter previously the misnamed `uuid_v4_hex()`) have both been removed; the server instance id and the synthetic `query:<id>` embed chunk id are now produced by `Uuid::now_v7()`. (#416)
+
+### Security
+
+- **`explore` `read_file` confined to indexed files within the project root.**
+  The `explore` tool loop previously read whatever path the LLM supplied, so
+  adversarial instructions embedded in indexed source content could steer it
+  into reading an arbitrary file the process could access (for example
+  `~/.ssh/id_rsa` or a `../../etc/passwd` traversal) and returning the contents
+  in the answer or step log. `read_file` now resolves every requested path
+  against an allow-list: absolute, drive, UNC, and NUL inputs are rejected, `..`
+  escapes are rejected lexically, the path must match an indexed file in the
+  `files` table, and the canonicalized target must stay under the canonical
+  project root (symlink backstop). A denied read is a recoverable tool result
+  that echoes only the caller-supplied path, never a resolved path or file
+  contents, and no longer aborts the session. (#403)
+- **Storage SQL `IN (...)` queries are now fully parameterised and bind-limit
+  chunked.** The four list-based query methods (`chunks_by_ids`,
+  `graph_neighbor_chunks`, `mention_edges_for_chunks`, `chunks_mentioning_symbols`)
+  previously assembled their `IN (...)` placeholder list at runtime with `format!`.
+  No caller value was ever interpolated into the SQL text, so there was no active
+  injection vector, but the hand-built placeholder construction was a latent
+  hazard. A shared `placeholders(n)` helper now emits the placeholder list and all
+  values are bound positionally via rusqlite params, so no caller-supplied id,
+  name, or symbol can reach the SQL string. Each method also chunks its input at
+  the SQLite bind-parameter limit (halved for the two-clause `graph_neighbor_chunks`)
+  and merges results with unchanged semantics, removing the prior cap on input
+  list size. Internal change only; no user-facing behaviour change.
+  ([#405](https://github.com/spelunk-cloud/spelunk/issues/405))
+
+### Internal
+
+- Repaired the fuzz crate after the three-crate workspace migration and suppressed an upstream tree-sitter-sequel LeakSanitizer false positive so the fuzz CI job runs clean. ([#417](https://github.com/spelunk-cloud/spelunk/pull/417), [#418](https://github.com/spelunk-cloud/spelunk/pull/418))
+
+## [0.8.2] — 2026-06-15
+
+### Security
+
+- **gix/gitoxide Dependabot alerts verified resolved (P1-2).** All 7 open Dependabot
+  security alerts (6 high, 1 medium) for gix-related crates were already cleared by
+  previous bumps (PRs #307, #327, #334). Cargo.lock contains patched versions:
+  gix 0.84.0 (>=0.83.0), gix-fs 0.21.2 (>=0.21.1), gix-pack 0.71.0 (>=0.69.0),
+  gix-transport 0.57.1 (>=0.56.0). `cargo audit` returns zero vulnerabilities
+  (exit 0); the unmaintained `paste` crate surfaces as a non-failing warning
+  (RUSTSEC-2024-0436), and the one advisory suppressed in audit.toml is
+  RUSTSEC-2026-0097 (rand 0.10.0 via lopdf, no patched release yet).
+  Affected advisories: GHSA-fr8x-3vfx-f45h, GHSA-pg4w-g64p-qwhj, GHSA-f26g-jm89-4g65,
+  GHSA-p3hw-mv63-rf9w, GHSA-f89h-2fjh-2r9q, GHSA-x494-mj8g-cj27, GHSA-9857-6mw7-fq2m.
+
+- **`spelunk memory add` blocks the entire write on secret detection.** When a
+  secret is detected at input time, both the SQLite backend write and the
+  git-notes write are now aborted — no partial write occurs. Previously only
+  the git-notes path was guarded; the SQLite path could still persist a
+  credential-containing entry. (#344)
+
+### Added
+
+- **Cross-project memory visibility (`spelunk memory search|list|context`).** When
+  projects are linked with `spelunk link`, `memory search`, `memory list`, and
+  `context` now also query each linked project's memory store and surface
+  `locked` or `cross-project`-tagged `decision` and `requirement` entries
+  alongside local results. Each cross-project result is tagged with its source
+  project (`[from: <project>]` in text mode; `source_project` /
+  `source_project_path` fields in JSON) so conflicting decisions remain
+  attributable. `handoff` and `question` entries remain strictly project-local.
+  (ADR-003)
+
+- **`--local-only` flag for `memory search`, `memory list`, and `context`.**
+  Suppresses the cross-project dep pass and queries only the primary project's
+  memory store -- matching the existing `spelunk search --local-only` behaviour.
+  (ADR-003)
+
+- **`spelunk memory reconcile`** — imports notes from a local `spelunk-server`
+  database (`server.db`) into the project's `memory.db` by content-hash dedup,
+  without running the server. Reads `server.db` in read-only mode; never writes
+  to it. Flags: `--source-db <path>` (override the default source path
+  `~/.local/state/spelunk/server.db`), `--dry-run` (report candidates without
+  importing), `--all-projects` (reconcile every project slug found in
+  `server.db`), and `--format json` (machine-readable summary). Exits with code
+  0 when there is nothing to import. (#391, ADR-004 follow-up)
+
+### Fixed
+
+- **SQLite LIKE queries now escape metacharacters in file paths and symbol names.** File
+  paths and symbol names containing `%` or `_` were causing over-matching in
+  `file_paths_under`, `chunks_for_file`, `symbol_history`, and `stale_specs` queries.
+  An `escape_like()` helper now escapes these characters before binding, with
+  `ESCAPE '\\'` on the SQL clause. ([#406](https://github.com/spelunk-cloud/spelunk/issues/406))
+- **Batch summariser: use per-batch UUID delimiter to prevent chunk-content
+  spoofing.** The batch summariser was using a static `===CHUNK {id}===` delimiter
+  between chunks in the LLM prompt. Source code chunks whose content contained
+  that string could spoof chunk boundaries and confuse the model. Now uses a
+  per-batch UUID: `===CHUNK-{uuid}={id}===`. (#404)
+
+- **`spelunk memory watch --help` now references `server_url` correctly.** The
+  subcommand doc-comment previously said `requires memory_server_url` (the
+  deprecated alias); corrected to `requires server_url`.
+  ([#400](https://github.com/spelunk-cloud/spelunk/issues/400))
+
+- **`explore` now appears in `spelunk --help`.** The `explore` subcommand was
+  inadvertently hidden from the top-level help output; the hide attribute has
+  been removed so users can discover it alongside the other subcommands.
+  ([#400](https://github.com/spelunk-cloud/spelunk/issues/400))
+
+### Dependencies
+
+- `openssl` 0.10.80 → 0.10.81 (#408)
+- `openssl-sys` 0.9.116 → 0.9.117 (#410)
+- `regex` 1.12.3 → 1.12.4 (#409)
+
+---
+
+## [0.8.1] — 2026-06-10
+
+### Fixed
+
+- **`spelunk search` honors auto-discovered loopback server.** Explicit
+  `--mode semantic`/`--mode hybrid` no longer error with "requires
+  spelunk-server", and `--mode auto` no longer silently falls back to
+  ast-grep, when no `server_url` is configured but a local `spelunk-server`
+  was auto-discovered via the loopback probe (the default v0.8.0 UX).
+
+- **Native embedder: fixed memory spike, CPU saturation, and index timeout.**
+  Indexing large projects no longer triggers a ~20 GB memory spike, ~750%
+  CPU usage across 31 threads, or HTTP timeouts during the embed phase.
+  Adds a new `--embed-threads` CLI arg (default 4, env
+  `SPELUNK_EMBED_THREADS`). Verified: 124-file / 1330-chunk index completes
+  in 7m30s with stable ~3.5 GB memory and ~350-400% CPU.
+
+- **Native embedder: reduced CoreML activation footprint and added compiled-model
+  cache** for hardware EP builds (`embed-coreml` / `embed-xnnpack` /
+  `embed-directml`), cutting peak memory from ~4 GB to ~1 GB and avoiding
+  CoreML recompilation on every server start. These hardware EP features
+  remain experimental and are not recommended over the default CPU EP — see
+  `docs/server.md`.
+
+### Security
+
+- **Auto-spawned `spelunk-server` now binds to `127.0.0.1` only.** Previously
+  the server started by `spelunk init` / `ensure_server_running` defaulted to
+  `0.0.0.0`, making the unauthenticated local server LAN-reachable.
+  (THREAT-MODEL req #9, decision #88)
+
+### Added
+
+- **`spelunk status`/`check --format json`** now include a `memory_backend`
+  field (`"sqlite"`, `"remote"`, or `"git-notes"`); `spelunk status` text mode
+  shows a "Memory backend: <kind>" line. (#308)
+
+### Changed
+
+- **NDJSON terminology renamed to JSONL** throughout the CLI, docs, and tests.
+  The `--format` flag value `ndjson` is now `jsonl` for `search`, `graph`, and
+  `memory` commands. (#348)
+
+- **Internal refactor:** `storage::remote` and `storage::git_notes` split into
+  module directories to stay under the 400-line file limit. No public API
+  changes.
+
+- **Homebrew tap moved to a separate repo** (`spelunk-cloud/homebrew-spelunk`);
+  the release workflow now publishes the formula there directly.
+
+---
+
+## [0.8.0] — 2026-06-08
 
 ### Breaking changes — migration required
 
@@ -240,7 +478,7 @@ memory list/show/archive) continue to work offline without `server_url`.
   history.
 
 - **Expanded fuzzer coverage** — fuzzer targets now cover secrets, chunker,
-  `escape_xml`, NDJSON, and history entry parsing.
+  `escape_xml`, JSONL, and history entry parsing.
 
 ### Fixed
 
@@ -260,9 +498,9 @@ memory list/show/archive) continue to work offline without `server_url`.
 ### Added
 
 - **Unix plumbing/porcelain architecture** — 8 new `spelunk spelunk` plumbing
-  subcommands emit machine-readable NDJSON to stdout and use conventional exit
+  subcommands emit machine-readable JSONL to stdout and use conventional exit
   codes (0 = ok, 1 = no results, 2 = error). All porcelain commands now accept
-  `--format text|json|ndjson` for structured output in scripts and agents.
+  `--format text|json|jsonl` for structured output in scripts and agents.
   Plumbing commands: `cat-chunks`, `embed`, `graph-edges`, `hash-file`, `knn`,
   `ls-files`, `parse-file`, `read-memory`.
 

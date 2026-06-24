@@ -6,7 +6,7 @@ Memory entries are stored in a local SQLite database by default, and — with
 `store_in_git_notes` enabled (the default) — also written through to
 `refs/notes/spelunk` on `HEAD`, so they travel with the repository. No external
 database or server is required. (You can make git-notes the primary backend with
-`--backend git-notes`, or point at a shared server with `server_url`.) Entries
+`--backend git-notes`, or point at a shared server with `server_url`.) The auto-started local `spelunk-server` (loopback) is used only for *inference* (embeddings/LLM for semantic search) — it does **not** store memory. Memory lives on a server only when you *explicitly* configure a team `server_url`. Entries
 are searchable by full text at all times; semantic search (by meaning) is
 available when a server is running — the local one is autostarted on demand.
 
@@ -141,6 +141,81 @@ spelunk memory list --source-ref abc1234
 
 `question` and `answer` entries show titles only in list view to avoid context saturation. Use `spelunk memory show <id>` to read the full body.
 
+## Cross-project visibility
+
+When projects are linked with `spelunk link`, `spelunk memory search`,
+`spelunk memory list`, and `spelunk context` automatically surface relevant
+memory from linked projects alongside local results. This is how settled
+decisions recorded in one project (for example, a Cloud-only architecture
+constraint in `cloud-api`) remain visible to agents working in a sibling
+project (for example, `spelunk-oss`).
+
+### What crosses project boundaries
+
+Not all memory propagates. Only entries that match **all three** of the
+following criteria are surfaced from a linked project:
+
+- **Kind:** `decision` or `requirement` (never `handoff`, `question`, or `note`).
+- **Tag:** must carry the tag `locked` (for settled v1 decisions) or
+  `cross-project` (for cross-cutting items that are not otherwise locked). Tags
+  like `auth` or `database` alone are not sufficient.
+- **Status:** `active` only. Archived or superseded cross-project decisions do
+  not resurface after they are retracted in the source project.
+
+Decisions and requirements that do not carry `locked` or `cross-project` remain
+strictly project-local, regardless of which `spelunk link` edges are configured.
+
+### Source attribution
+
+Every result from a linked project is labelled with its origin so conflicting
+decisions between projects are visible and attributable:
+
+- **Text output:** a `[from: <project>]` badge appended to the entry line.
+- **JSON output:** `source_project` and `source_project_path` fields on the
+  note object (absent on local results, so existing JSON consumers are
+  unaffected).
+
+Local results always appear first; cross-project results are appended, in
+registry dependency order, after all local results. The existing `--limit` flag
+applies only to the local query; cross-project results are additional and not
+counted against the limit.
+
+### Skipping the dep pass
+
+Pass `--local-only` to any of `memory search`, `memory list`, or `context` to
+query only the primary project's memory store:
+
+```bash
+spelunk memory search "auth decisions" --local-only
+spelunk memory list --kind decision --local-only
+spelunk context --local-only
+```
+
+### Tagging decisions for cross-project visibility
+
+```bash
+# Tag a decision as locked so linked projects can see it
+spelunk memory add --kind decision \
+  --title "SSE memory stream is Cloud-only" \
+  --body "OSS spelunk-server must not expose SSE; Cloud API owns that surface." \
+  --tags v1,locked
+
+# Tag a requirement that applies across all linked projects
+spelunk memory add --kind requirement \
+  --title "All writes validated for secrets before storage" \
+  --body "Applies to cloud-api and spelunk-oss alike." \
+  --tags security,cross-project
+```
+
+### Privacy boundary
+
+The dep pass reads each linked project's `memory.db` directly from disk (local
+SQLite only). It does not route through `spelunk-server` or any remote endpoint.
+A linked project's memory is only reachable if its `memory.db` file is
+accessible on the local filesystem (same machine, same user). Remote or
+server-backed linked projects whose memory lives exclusively on a remote server
+are not queried by the dep pass in v1.
+
 ## Showing a single entry
 
 ```bash
@@ -182,6 +257,51 @@ Install the git hook and harvesting happens on every commit:
 ```bash
 spelunk hooks install
 ```
+
+## Importing from a local server
+
+`spelunk memory reconcile` imports notes that were recorded by a running
+`spelunk-server` daemon into the project's local `memory.db`. This is useful
+after a session where entries were written through `server_url` and need to be
+pulled into the project's local store, or when migrating from server-backed to
+local storage.
+
+Dedup is by content hash: notes already present in `memory.db` (same kind,
+title, body, tags, files, and creation time) are skipped. The source `server.db`
+is opened read-only; it is never modified.
+
+```bash
+# Import notes for the active project (default source: ~/.local/state/spelunk/server.db)
+spelunk memory reconcile
+
+# Preview what would be imported without writing anything
+spelunk memory reconcile --dry-run
+
+# Import notes for all projects found in server.db
+spelunk memory reconcile --all-projects
+
+# Override the source path
+spelunk memory reconcile --source-db /var/run/spelunk/server.db
+
+# Machine-readable summary
+spelunk memory reconcile --format json
+```
+
+Exit codes: `0` on success or when there is nothing to import, non-zero on
+hard errors (unreadable source DB, write failure). When `server.db` does not
+exist the command is a no-op and exits 0.
+
+If reconcilable notes are detected at startup, spelunk prints a one-time nudge
+to stderr. Set `SPELUNK_NO_RECONCILE_NUDGE=1` to suppress it in CI or scripts.
+
+### Security notes
+
+`reconcile` opens `server.db` with `SQLITE_OPEN_READONLY` and `PRAGMA
+journal_mode=WAL` to avoid blocking the daemon's writers. No content from
+`server.db` is executed or passed to an LLM; the only write target is the
+project's own `memory.db`. Embeddings are re-generated from the imported text
+via the configured server (best-effort; notes import successfully even when the
+server is unreachable).
 
 ## Using memory as context
 

@@ -81,7 +81,7 @@ spelunk search <query> [options]
 |------|---------|-------------|
 | `-l, --limit <n>` | 10 | Number of results (max 100); mutually exclusive with `--budget` |
 | `--budget <n>` | — | Return best chunks fitting within this token budget |
-| `--format text\|json\|ndjson` | text | Output format |
+| `--format text\|json\|jsonl` | text | Output format |
 | `-g, --graph` | false | Enrich results with 1-hop call-graph neighbours |
 | `--graph-limit <n>` | 10 | Max graph-expanded results to add (with `--graph`) |
 | `--mode <mode>` | auto | `auto`, `text` (FTS only), `semantic`/`hybrid` (LinearRAG), or `ast-grep` |
@@ -130,6 +130,13 @@ spelunk explore "how does incremental indexing work?"
 spelunk explore "what guards the context window in the LLM pipeline?" --verbose
 AGENT=true spelunk explore "where is authentication enforced?" --format json
 ```
+
+**Security note:** the loop's `read_file` tool can only return content from
+files that are part of the index, resolved relative to the project root.
+Absolute paths, `..` traversals, and any path outside the indexed project are
+denied, so adversarial instructions hidden in indexed source cannot steer the
+LLM into reading files such as `~/.ssh/id_rsa`. A denied read is reported back
+to the loop without exposing a resolved path or file contents.
 
 ---
 
@@ -198,12 +205,19 @@ spelunk context [options]
 | `--path <path>` | — | Only show entries tagged with this file/directory |
 | `--format text\|json` | text | Output format |
 | `--no-conventions` | false | Skip the conventions section |
+| `--local-only` | false | Skip cross-project dep pass; query only the primary project's memory |
+
+When projects are linked with `spelunk link`, `context` also surfaces `locked`
+or `cross-project`-tagged `decision` and `requirement` entries from linked
+projects' memory stores, each labelled with its source project. Pass
+`--local-only` to suppress this behaviour. See [Memory](memory.md#cross-project-visibility).
 
 **Example:**
 
 ```bash
 spelunk context
 spelunk context --kind decision
+spelunk context --local-only      # primary project only, no dep pass
 AGENT=true spelunk context        # JSON for machine processing
 ```
 
@@ -220,7 +234,7 @@ spelunk graph <symbol> [options]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--kind <type>` | all | Filter: `imports`, `calls`, `extends`, `implements` |
-| `--format text\|json\|ndjson` | text | Output format |
+| `--format text\|json\|jsonl` | text | Output format |
 | `-d, --db <path>` | auto | Override database path |
 | `--no-stale-check` | false | Suppress the stale-index warning |
 | `--live` | false | Skip the index and scan live files with ast-grep (requires `ast-grep` in PATH) |
@@ -246,7 +260,7 @@ spelunk chunks <path> [options]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--format text\|json\|ndjson` | text | Output format |
+| `--format text\|json\|jsonl` | text | Output format |
 | `-d, --db <path>` | auto | Override database path |
 
 ```bash
@@ -269,7 +283,9 @@ spelunk languages
 ## spelunk link / spelunk unlink / spelunk links
 
 Add or remove a project dependency. When linked, `spelunk search` also queries
-the linked project's index. `spelunk links` inspects existing links.
+the linked project's index, and `spelunk memory search|list|context` surfaces
+`locked`/`cross-project`-tagged decisions and requirements from the linked
+project's memory store. `spelunk links` inspects existing links.
 
 ```
 spelunk link <path>
@@ -347,8 +363,8 @@ Store and query project context, decisions, and requirements. See
 ```
 spelunk memory add --title "..." [--body "..."] [--kind decision] [--tags auth,db] [--files src/auth.rs]
 spelunk memory add --from-url <url> [--title "override"] [--kind requirement]
-spelunk memory search <query> [--limit 10] [--format text|json]
-spelunk memory list [--kind decision] [--limit 20] [--format text|json]
+spelunk memory search <query> [--limit 10] [--format text|json] [--local-only]
+spelunk memory list [--kind decision] [--limit 20] [--format text|json] [--local-only]
 spelunk memory show <id> [--format text|json]
 spelunk memory harvest [--git-range HEAD~10..HEAD] [--source git|claude-code|failures]
 spelunk memory failures                    # list all antipatterns
@@ -359,10 +375,16 @@ spelunk memory graph <id>
 spelunk memory since <unix-ts>
 spelunk memory push                         # push local entries to the configured server
 spelunk memory watch                        # stream new entries from the server (SSE)
+spelunk memory reconcile [--dry-run] [--all-projects] [--source-db <path>]
 ```
 
 All `memory` subcommands accept `--backend sqlite|git-notes` (default `sqlite`)
 and `--db <path>`.
+
+`memory search` and `memory list` accept `--local-only` to skip the
+cross-project dep pass (see [Cross-project visibility](memory.md#cross-project-visibility)).
+Results from linked projects carry a `[from: <project>]` badge in text output
+and `source_project` / `source_project_path` fields in JSON.
 
 **Memory kinds:** `decision` · `context` · `requirement` · `note` · `intent` ·
 `answer` · `handoff` · `question` · `antipattern`
@@ -388,7 +410,7 @@ spelunk sync
 
 ## spelunk plumbing
 
-Low-level commands for agents and scripts. All emit NDJSON and exit non-zero on
+Low-level commands for agents and scripts. All emit JSONL and exit non-zero on
 error (exit 1 for "no results", exit 2 for errors). See
 [plumbing-and-porcelain.md](plumbing-and-porcelain.md).
 
@@ -400,7 +422,7 @@ spelunk plumbing hash-file <file>      # blake3 hash + index currency
 spelunk plumbing knn <query>           # KNN vector search
 spelunk plumbing embed                 # read stdin lines, emit vectors
 spelunk plumbing graph-edges           # code graph edges
-spelunk plumbing read-memory           # memory entries as NDJSON
+spelunk plumbing read-memory           # memory entries as JSONL
 ```
 
 ---

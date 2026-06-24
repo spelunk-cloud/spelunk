@@ -29,7 +29,7 @@ pub(super) async fn memory_timeline(
     .await?;
     sp.finish_and_clear();
 
-    let backend = open_memory_backend(cfg, mem_path, backend_override)?;
+    let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     let notes = backend
         .search_timeline(&blob, &args.query, args.limit)
         .await

@@ -7,13 +7,18 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# Keep the fuzz crate out of the root Cargo workspace. cargo-fuzz walks up the
+# directory tree and would otherwise treat this manifest as a stray member of
+# the workspace at ../Cargo.toml, which fails the build.
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-[dependencies.spelunk]
-path = ".."
+[dependencies.spelunk-core]
+path = "../crates/spelunk-core"
 
 # Disable LTO for faster fuzzer builds.
 [profile.release]
@@ -45,8 +50,8 @@ test = false
 doc = false
 
 [[bin]]
-name = "fuzz_ndjson_parse"
-path = "fuzz_targets/fuzz_ndjson_parse.rs"
+name = "fuzz_jsonl_parse"
+path = "fuzz_targets/fuzz_jsonl_parse.rs"
 test = false
 doc = false
 

@@ -1,0 +1,57 @@
+[
+    {
+        "question": "How does `ruff:ignore` suppression handle a diagnostic whose range only partially overlaps the suppression comment, such as a multi-line list literal?",
+        "ground_truth_commit": "b78e92bf9de4c0965902a18f0221d34317586dfe",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why was `ruff rule` changed to allow rule names instead of only rule codes, and why couldn't this be preview-gated?",
+        "ground_truth_commit": "10b729da9c4ad273e81b1afcf36fca32d3434a9f",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What out-of-bounds panic occurred in Jupyter notebooks when using suppression comments, and how was it fixed?",
+        "ground_truth_commit": "8b630c748545726909daa7b4b8b32eb84cb049ad",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What does ty's support for `Callable()` in match statement class patterns cover (e.g., reachability, narrowing, sub-patterns)?",
+        "ground_truth_commit": "267af002fb9431f6f2db5ab849c1dcd6d7752733",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why did the project switch from the `lsp-types` crate to `gen-lsp-types` for LSP type definitions?",
+        "ground_truth_commit": "612f2f28501fc65ce90d970c86463657a2c840a0",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why was the generated rule code for `noqa_code` match arms causing incremental build invalidation, and how was it stabilized?",
+        "ground_truth_commit": "2bb936cb39b6b054d3525829b4d06587492dd2fa",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why was the autofix for `np.in1d` to `np.isin` (NPY201) dropped in favor of a manual fix?",
+        "ground_truth_commit": "85ba4a3243ee5764666859211a716e5fe11f704a",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "What new ty lint rule detects generic types used without explicit type parameters, and what existing tools' behavior is it equivalent to?",
+        "ground_truth_commit": "dc79edf868725c5e611f7e3ec1b6d75f2a5d9d65",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "How does UP032 (pyupgrade) now handle leading empty string literals when converting `.format()` calls to f-strings, and what bug did this fix?",
+        "ground_truth_commit": "e5b5f5c6d2b1824fcd2a6d171657db213708f9ac",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "How was flake8-pytest-style extended to also check `pytest_asyncio` fixtures, and which function implements the detection?",
+        "ground_truth_commit": "f293d70613261a5dcd1649aa9b726b6cb8289417",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    },
+    {
+        "question": "Why was the new RUF076 rule added to ban `pytest` autouse fixtures?",
+        "ground_truth_commit": "43fefbaf3463be7082f88a5f60ece4011a000107",
+        "reviewed_by": "ada (test-engineer) on 2026-06-10"
+    }
+]

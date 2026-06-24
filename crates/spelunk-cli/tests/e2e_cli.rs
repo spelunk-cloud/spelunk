@@ -725,7 +725,9 @@ async fn test_index_prints_note_when_no_server_configured() {
         .arg(&project_dir)
         .assert()
         .success()
-        .stderr(predicate::str::contains("configure server_url"));
+        .stderr(predicate::str::contains(
+            "Skipping summaries (no server_url configured)",
+        ));
 }
 
 #[test]
@@ -898,7 +900,9 @@ fn test_search_explicit_hybrid_no_embedder_falls_back_to_text() {
         .assert()
         .success();
 
-    // Explicit --mode hybrid with no server → succeeds with text search + notice.
+    // Explicit --mode hybrid with no server → succeeds with text search silently
+    // (ADR-004: inference-only routing; fallback is resolved at capability detection,
+    // no per-query notice is emitted).
     Command::cargo_bin("spelunk")
         .unwrap()
         .current_dir(&project_dir)
@@ -910,9 +914,7 @@ fn test_search_explicit_hybrid_no_embedder_falls_back_to_text() {
         .arg("foo")
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "[server unreachable — using text search]",
-        ));
+        .stderr(predicate::str::is_empty());
 }
 
 /// Explicit `--mode semantic` with no reachable server must also fall through.
@@ -936,9 +938,9 @@ fn test_search_explicit_semantic_no_server_falls_back_to_text() {
         .assert()
         .success();
 
-    // Explicit --mode semantic with no server configured (and auto-discovery
-    // disabled via SPELUNK_NO_SERVER=1) should fall through to text search
-    // and succeed with an informational warning.
+    // Explicit --mode semantic with no server configured → silent fallback to
+    // text search (ADR-004: no explicit server_url = inference-only routing,
+    // fallback notice is suppressed; same as the hybrid test above).
     Command::cargo_bin("spelunk")
         .unwrap()
         .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
@@ -951,7 +953,7 @@ fn test_search_explicit_semantic_no_server_falls_back_to_text() {
         .arg("foo")
         .assert()
         .success()
-        .stderr(predicate::str::contains("server unreachable"));
+        .stderr(predicate::str::is_empty());
 }
 
 // ── spelunk server error-path tests ──────────────────────────────────────────
@@ -1064,12 +1066,21 @@ fn test_init_non_tty_prints_skip_notice() {
 
 // ── memory commands against an auto-discovered (loopback) server ─────────────
 //
-// IMP-3 / spelunk#316 / PR #349 (qa-v080-test-plan.md §Fix 3): `memory search`,
-// `memory timeline`, `memory harvest`, and `explore` used to gate directly on
-// `cfg.server_url`, so they reported "requires spelunk-server" even when a
-// server was reachable via loopback auto-discovery (no `server_url` in config).
-// The fix routes these commands through `Tier::effective_config`, which fills
-// in `server_url`/`project_id` from the discovered tier.
+// ADR-004 (unified memory storage): `.spelunk/memory.db` is the single
+// canonical store for every CLI memory read and write. An auto-discovered
+// loopback server is an INFERENCE backend only (embeddings + LLM); it is never
+// a memory store. So `memory add`, `memory search`, and `memory timeline` all
+// resolve to the same local `memory.db`, and the server is consulted only to
+// embed the query — never to fetch memory rows.
+//
+// Historical context: IMP-3 / spelunk#316 / PR #349 first taught these commands
+// to honour an auto-discovered server (so they no longer errored "requires
+// spelunk-server"), but routed BOTH inference and memory storage to the server
+// via a synthesised `server_url`. That produced the split-brain Johan flagged
+// on PR #386: a note added (to local `memory.db`) was invisible to
+// `memory search` (which read the server's `server.db`). ADR-004 fixes this by
+// routing inference via `inference_url` while leaving `server_url` unset for
+// auto-discovered servers, so `open_memory_backend` keeps memory local.
 //
 // These tests reproduce the auto-discovery path end-to-end: NO `server_url` in
 // config, `SPELUNK_NO_SERVER` unset, and a mock server reachable on loopback —
@@ -1080,16 +1091,12 @@ fn test_init_non_tty_prints_skip_notice() {
 // real default port 7777 (which may be occupied — or unoccupied — on the test
 // host) and without touching the developer's real `~/.local/state`.
 //
-// Coverage note: `memory search` and `memory timeline` share the exact
-// `effective_config` bridging path exercised here (see `memory_search` /
-// `memory_timeline` doc comments referencing IMP-3) and both are covered
-// below. `memory harvest` and `explore` route through the *same* bridging
-// code, but harvesting requires mocking `git log` plus a streaming
-// `/llm/complete` SSE extraction round-trip, and `explore` requires mocking a
-// multi-step tool-calling `Explorer` loop over `/llm/complete` SSE — both
-// disproportionately heavy relative to what's actually under test (the
-// auto-discovery → `effective_config` wiring, not the LLM pipelines
-// themselves, which have their own coverage elsewhere). Left uncovered here;
+// Coverage note: `memory harvest` and `explore` route through the same
+// `effective_config` bridging code, but harvesting requires mocking `git log`
+// plus a streaming `/llm/complete` SSE extraction round-trip, and `explore`
+// requires mocking a multi-step tool-calling `Explorer` loop over
+// `/llm/complete` SSE — both disproportionately heavy relative to what's under
+// test (the auto-discovery → inference-vs-storage split). Left uncovered here;
 // flagged honestly rather than thrashing on heavyweight SSE mocks.
 
 /// Write `<home>/.local/state/spelunk/server.port` so `capability::get_tier`'s
@@ -1111,13 +1118,18 @@ fn port_from_uri(uri: &str) -> u16 {
         .expect("uri port is numeric")
 }
 
-/// Mount the three endpoints the auto-discovery path needs on `server`:
-/// - `GET /v1/health` — capability probe (must report `memory` + `search.semantic`
-///   so `effective_config` and `require_server_client` both succeed)
-/// - `POST /v1/projects/{id}/index/embed` — query embedding (`embed_query`)
-/// - `POST /v1/projects/{id}/memory/search` — `RemoteMemoryBackend::search`
-///   (backs both `memory search` hybrid/semantic mode and `memory timeline`)
-async fn mount_auto_discovery_memory_endpoints(server: &wiremock::MockServer) {
+/// Mount the endpoints an INFERENCE-ONLY auto-discovered server needs:
+/// - `GET /v1/health` — capability probe (reports `memory` + `search.semantic`
+///   so `effective_config` and the inference client build successfully)
+/// - `POST /v1/projects/{id}/index/embed` — query/note embedding (`embed_query`
+///   / `try_embed_via_server`); returns a constant 768-dim vector so KNN over
+///   the LOCAL store is deterministic.
+///
+/// Deliberately does NOT mount `POST /v1/projects/{id}/memory/search`. Under
+/// ADR-004 an auto-discovered server is never a memory backend, so the CLI must
+/// not call it for memory rows. The `expect(0)` guard below turns any such call
+/// into a test failure, locking in the inference-vs-storage split.
+async fn mount_auto_discovery_inference_endpoints(server: &wiremock::MockServer) {
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, ResponseTemplate};
 
@@ -1137,44 +1149,31 @@ async fn mount_auto_discovery_memory_endpoints(server: &wiremock::MockServer) {
         .mount(server)
         .await;
 
+    // Guard: the server's memory endpoint must NEVER be hit by an auto-discovered
+    // server. If it is, the split-brain has regressed. `expect(0)` fails the test
+    // on any matching request when the `MockServer` is dropped.
     Mock::given(method("POST"))
         .and(path_regex(r"^/v1/projects/.+/memory/search$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {
-                "id": 1,
-                "kind": "decision",
-                "title": "Use loopback auto-discovery for local servers",
-                "body": "Probe 127.0.0.1:7777 (or the server.port file) when no server_url is configured.",
-                "tags": ["capability", "auto-discovery"],
-                "linked_files": [],
-                "created_at": 1_770_000_000_i64,
-                "status": "active",
-                "superseded_by": null,
-                "source_ref": null,
-                "valid_at": null,
-                "invalid_at": null,
-                "distance": 0.12
-            }
-        ])))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
         .mount(server)
         .await;
 }
 
-/// `memory search` (default hybrid mode) succeeds against a server that was
-/// discovered via the loopback probe — no `server_url` in config.
+/// ADR-004 round-trip: with a loopback server auto-discovered (no `server_url`
+/// in config), a note written by `memory add` is found by `memory search` — and
+/// the note's content comes from the LOCAL `memory.db`, not the server. The
+/// server is consulted ONLY to embed (it has no `/memory/search` mount, and the
+/// `expect(0)` guard fails the test if memory rows are ever requested from it).
 ///
-/// Exercises: `capability::get_tier` → loopback auto-discovery →
-/// `Tier::effective_config` (fills in `server_url`/`project_id`) →
-/// `require_server_client` + `embed_query` → `RemoteMemoryBackend::search`
-/// → `POST /v1/projects/{id}/memory/search`.
-///
-/// Before PR #349 this errored "'spelunk memory search' requires
-/// spelunk-server" despite the server being reachable (qa-v080-test-plan.md
-/// §Fix 3a).
+/// This is the exact split-brain the ADR removes: before ADR-004 the
+/// auto-discovered server synthesised a `server_url`, so `memory add` wrote
+/// `memory.db` while `memory search` read the server's `server.db` and could not
+/// see the note.
 #[tokio::test]
-async fn test_memory_search_with_auto_discovered_server() {
+async fn test_memory_add_then_search_round_trip_on_local_store_with_auto_discovered_server() {
     let mock_server = MockServer::start().await;
-    mount_auto_discovery_memory_endpoints(&mock_server).await;
+    mount_auto_discovery_inference_endpoints(&mock_server).await;
 
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
@@ -1199,7 +1198,7 @@ async fn test_memory_search_with_auto_discovered_server() {
     )
     .unwrap();
 
-    // Build a local index so `memory search` has a DB to resolve `mem_path`
+    // Build a local index so memory commands have a DB to resolve `mem_path`
     // from (offline embedding — SPELUNK_NO_SERVER keeps `index` from probing).
     Command::cargo_bin("spelunk")
         .unwrap()
@@ -1212,7 +1211,9 @@ async fn test_memory_search_with_auto_discovered_server() {
         .assert()
         .success();
 
-    // No SPELUNK_NO_SERVER here: this is the auto-discovery path under test.
+    // Add a note via the auto-discovery path. No SPELUNK_NO_SERVER, so the
+    // loopback server embeds the note (via /index/embed) while the note text +
+    // metadata are written to the LOCAL memory.db.
     Command::cargo_bin("spelunk")
         .unwrap()
         .env("HOME", &home)
@@ -1220,30 +1221,64 @@ async fn test_memory_search_with_auto_discovered_server() {
         .current_dir(&project_dir)
         .arg("--config")
         .arg(&config_path)
-        .arg("memory")
-        .arg("search")
-        .arg("loopback auto-discovery")
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "Unified memory storage round-trip",
+            "--body",
+            "Memory lives in memory.db; the loopback server is inference-only.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Stored [decision]"));
+
+    // Search for it via the same auto-discovery path. The result must be the
+    // locally-stored note — proving add and search share one store. The server
+    // only embedded the query; the `/memory/search` guard ensures no memory rows
+    // were fetched from the server.
+    Command::cargo_bin("spelunk")
+        .unwrap()
+        .env("HOME", &home)
+        .env_remove("SPELUNK_NO_SERVER")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .args(["memory", "search", "unified memory storage"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Use loopback auto-discovery for local servers",
+            "Unified memory storage round-trip",
         ))
-        .stdout(predicate::str::contains("#1"))
         .stdout(predicate::str::contains("[decision]"));
+
+    // Cross-check: `memory list` (which has always read memory.db) sees the same
+    // note. Before ADR-004 `search` and `list` could disagree; now they cannot.
+    Command::cargo_bin("spelunk")
+        .unwrap()
+        .env("HOME", &home)
+        .env_remove("SPELUNK_NO_SERVER")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .args(["memory", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Unified memory storage round-trip",
+        ));
 }
 
-/// `memory timeline` succeeds against a server that was discovered via the
-/// loopback probe — no `server_url` in config.
-///
-/// Same bridging path as `memory search` (see above): `get_tier` →
-/// `effective_config` → `embed_query` → `RemoteMemoryBackend::search_timeline`
-/// → `POST /v1/projects/{id}/memory/search`. Before PR #349 this errored
-/// "'spelunk memory timeline' requires spelunk-server" (qa-v080-test-plan.md
-/// §Fix 3b).
+/// `memory timeline` against an auto-discovered loopback server returns notes
+/// from the LOCAL `memory.db` (the server only embeds the query). Companion to
+/// the add→search round-trip above; guards that `timeline` does not regress to
+/// reading the server's store.
 #[tokio::test]
-async fn test_memory_timeline_with_auto_discovered_server() {
+async fn test_memory_timeline_reads_local_store_with_auto_discovered_server() {
     let mock_server = MockServer::start().await;
-    mount_auto_discovery_memory_endpoints(&mock_server).await;
+    mount_auto_discovery_inference_endpoints(&mock_server).await;
 
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
@@ -1283,15 +1318,33 @@ async fn test_memory_timeline_with_auto_discovered_server() {
         .current_dir(&project_dir)
         .arg("--config")
         .arg(&config_path)
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "Loopback server is inference-only",
+            "--body",
+            "Probe 127.0.0.1 when no server_url is configured; memory stays local.",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("spelunk")
+        .unwrap()
+        .env("HOME", &home)
+        .env_remove("SPELUNK_NO_SERVER")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
         .arg("memory")
         .arg("timeline")
-        .arg("loopback auto-discovery")
+        .arg("loopback server")
         .assert()
         .success()
+        .stdout(predicate::str::contains("Timeline: loopback server"))
         .stdout(predicate::str::contains(
-            "Timeline: loopback auto-discovery",
-        ))
-        .stdout(predicate::str::contains(
-            "Use loopback auto-discovery for local servers",
+            "Loopback server is inference-only",
         ));
 }

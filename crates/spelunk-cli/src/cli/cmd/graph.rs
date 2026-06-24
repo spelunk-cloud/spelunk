@@ -11,7 +11,7 @@ pub struct GraphArgs {
     #[arg(long)]
     pub kind: Option<String>,
 
-    /// Output format: text, json, or ndjson
+    /// Output format: text, json, or jsonl
     #[arg(long, default_value = "text")]
     pub format: String,
 
@@ -85,7 +85,7 @@ pub fn graph(args: GraphArgs, cfg: Config) -> Result<()> {
 
     match crate::utils::effective_format(&args.format) {
         "json" => println!("{}", serde_json::to_string_pretty(&edges)?),
-        "ndjson" => {
+        "jsonl" => {
             for edge in &edges {
                 println!("{}", serde_json::to_string(edge)?);
             }
@@ -149,7 +149,7 @@ fn graph_live(symbol: &str, format: &str, kind_filter: &Option<String>, root: &P
 
     match crate::utils::effective_format(format) {
         "json" => println!("{}", serde_json::to_string_pretty(&edges)?),
-        "ndjson" => {
+        "jsonl" => {
             for edge in &edges {
                 println!("{}", serde_json::to_string(edge)?);
             }

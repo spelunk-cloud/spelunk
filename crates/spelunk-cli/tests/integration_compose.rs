@@ -8,22 +8,22 @@
 //! non-deterministic; tests assert structure and non-emptiness only.
 
 mod plumbing_helpers;
-use plumbing_helpers::{index_fixture_project, parse_ndjson, spelunk_cmd};
+use plumbing_helpers::{index_fixture_project, parse_jsonl, spelunk_cmd};
 
 use assert_cmd::Command;
 use std::path::Path;
 
-// ── Test 1: search --format ndjson vs embed | knn ────────────────────────────
+// ── Test 1: search --format jsonl vs embed | knn ────────────────────────────
 //
-// Both pipelines should return valid NDJSON with `chunk_id` fields.
+// Both pipelines should return valid JSONL with `chunk_id` fields.
 // Ordering is non-deterministic (all mock embeddings are identical), so we
 // only assert structural validity and non-emptiness.
 
 #[test]
-fn porcelain_search_ndjson_returns_valid_chunk_ids() {
+fn porcelain_search_jsonl_returns_valid_chunk_ids() {
     let (_tmp, db_path, config_path) = index_fixture_project();
 
-    // `spelunk search "test" --db <db> --format ndjson --no-stale-check`
+    // `spelunk search "test" --db <db> --format jsonl --no-stale-check`
     let output = Command::cargo_bin("spelunk")
         .unwrap()
         .arg("--config")
@@ -33,7 +33,7 @@ fn porcelain_search_ndjson_returns_valid_chunk_ids() {
         .arg("--db")
         .arg(&db_path)
         .arg("--format")
-        .arg("ndjson")
+        .arg("jsonl")
         .arg("--no-stale-check")
         .arg("--mode")
         .arg("text") // text mode: no embedding call needed
@@ -43,10 +43,10 @@ fn porcelain_search_ndjson_returns_valid_chunk_ids() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     assert!(
         !rows.is_empty(),
-        "spelunk search --format ndjson should return at least one result"
+        "spelunk search --format jsonl should return at least one result"
     );
     for row in &rows {
         assert!(
@@ -94,7 +94,7 @@ fn plumbing_knn_returns_valid_chunk_ids() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&knn_output);
+    let rows = parse_jsonl(&knn_output);
     assert!(
         !rows.is_empty(),
         "plumbing embed | knn should return at least one result"
@@ -151,7 +151,7 @@ fn status_json_file_count_matches_ls_files_count() {
         .as_u64()
         .expect("status JSON must have 'file_count'");
 
-    // `spelunk plumbing ls-files` — counts NDJSON lines.
+    // `spelunk plumbing ls-files` — counts JSONL lines.
     let ls_output = spelunk_cmd(&db_path, &config_path)
         .arg("ls-files")
         .assert()
@@ -160,7 +160,7 @@ fn status_json_file_count_matches_ls_files_count() {
         .stdout
         .clone();
 
-    let ls_rows = parse_ndjson(&ls_output);
+    let ls_rows = parse_jsonl(&ls_output);
     let ls_count = ls_rows.len() as u64;
 
     assert_eq!(
@@ -197,7 +197,7 @@ fn parse_file_content_appears_in_cat_chunks() {
         .stdout
         .clone();
 
-    let parse_rows = parse_ndjson(&parse_output);
+    let parse_rows = parse_jsonl(&parse_output);
     assert!(
         !parse_rows.is_empty(),
         "parse-file should produce at least one chunk for lib.rs"
@@ -213,7 +213,7 @@ fn parse_file_content_appears_in_cat_chunks() {
         .stdout
         .clone();
 
-    let cat_rows = parse_ndjson(&cat_output);
+    let cat_rows = parse_jsonl(&cat_output);
     assert!(
         !cat_rows.is_empty(),
         "cat-chunks should return at least one indexed chunk for lib.rs"

@@ -69,10 +69,12 @@ impl Database {
 
     /// List all indexed file paths under the given root prefix.
     pub fn file_paths_under(&self, root: &str) -> Result<Vec<(i64, String)>> {
-        let prefix = format!("{root}%");
+        // Escape LIKE metacharacters in the user-supplied root so that '%' and '_'
+        // in real directory names are treated as literals.
+        let prefix = format!("{}%", super::escape_like(root));
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT id, path FROM files WHERE path LIKE ?1")?;
+            .prepare_cached("SELECT id, path FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
         let rows = stmt.query_map(rusqlite::params![prefix], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -82,9 +84,11 @@ impl Database {
 
     /// List all indexed files under the given root prefix, including hash and indexed_at.
     pub fn file_records_under(&self, root: &str) -> Result<Vec<FileRecord>> {
-        let prefix = format!("{root}%");
+        // Escape LIKE metacharacters in the user-supplied root so that '%' and '_'
+        // in real directory names are treated as literals.
+        let prefix = format!("{}%", super::escape_like(root));
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, path, language, hash, indexed_at FROM files WHERE path LIKE ?1",
+            "SELECT id, path, language, hash, indexed_at FROM files WHERE path LIKE ?1 ESCAPE '\\'",
         )?;
         let rows = stmt.query_map(rusqlite::params![prefix], |r| {
             Ok(FileRecord {

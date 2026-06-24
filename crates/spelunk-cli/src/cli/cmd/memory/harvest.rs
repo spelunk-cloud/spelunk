@@ -17,19 +17,23 @@ pub(super) async fn memory_harvest(
 ) -> Result<()> {
     // Honor the auto-discovered server tier (IMP-3 / spelunk#316): loopback
     // auto-discovery sets the capability tier without populating
-    // `cfg.server_url`, so the plain `cfg.server_url.is_none()` gate below
-    // wrongly reports "requires spelunk-server" even when `spelunk status`
-    // shows the `Server` tier. Build an effective config that fills in
-    // `server_url`/`project_id` from the tier (mirrors `explore`) and use it
-    // for the remainder of this call tree, including the git/failures/
-    // claude-code sub-harvesters and `ServerInferenceClient::from_config`.
+    // `cfg.server_url`. Build an effective config that fills in the inference
+    // URL / `project_id` from the tier (mirrors `explore`) and use it for the
+    // remainder of this call tree, including the git/failures/claude-code
+    // sub-harvesters and `ServerInferenceClient::from_config`.
+    //
+    // ADR-004: harvest is an inference-driven command. It needs the server for
+    // embeddings + LLM extraction (gate on the inference URL), but its memory
+    // CRUD goes to the project's local `memory.db` via `open_memory_backend`
+    // (which reads only `server_url`). For an auto-discovered server that means
+    // local storage; for an explicit team `server_url` memory stays remote.
     let project_root = mem_path.parent().unwrap_or(mem_path);
     let tier = capability::get_tier(cfg).await;
     let eff_cfg = tier.effective_config(cfg, project_root);
     let cfg = &eff_cfg;
 
-    // Tier-0: harvest requires server (#259 locked-feature error).
-    if cfg.server_url.is_none() {
+    // Tier-0: harvest requires server inference (#259 locked-feature error).
+    if cfg.resolve_inference_url().is_none() {
         return Err(harvest_requires_server(None));
     }
 
@@ -93,7 +97,7 @@ async fn memory_harvest_git(
         return Ok(());
     }
 
-    let backend = open_memory_backend(cfg, mem_path, backend_override)?;
+    let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     let known_shas = backend.harvested_shas().await.map_err(backend_err)?;
     let new_commits: Vec<_> = commits
         .iter()
@@ -160,7 +164,7 @@ async fn memory_harvest_git(
     });
 
     let server = ServerInferenceClient::from_config(cfg)
-        .ok_or_else(|| harvest_requires_server(cfg.server_url.as_deref()))?;
+        .ok_or_else(|| harvest_requires_server(cfg.resolve_inference_url()))?;
 
     let mut stored = 0usize;
     let mut dedup_skipped = 0usize;
@@ -494,7 +498,7 @@ async fn memory_harvest_failures(
         return Ok(());
     }
 
-    let backend = open_memory_backend(cfg, mem_path, backend_override)?;
+    let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     let known_shas = backend.harvested_shas().await.map_err(backend_err)?;
     let new_commits: Vec<_> = failure_commits
         .into_iter()
@@ -544,7 +548,7 @@ async fn memory_harvest_failures(
     });
 
     let server = ServerInferenceClient::from_config(cfg)
-        .ok_or_else(|| harvest_requires_server(cfg.server_url.as_deref()))?;
+        .ok_or_else(|| harvest_requires_server(cfg.resolve_inference_url()))?;
 
     let mut stored = 0usize;
     let mut dedup_skipped = 0usize;

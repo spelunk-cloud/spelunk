@@ -1,7 +1,7 @@
 //! Component tests for `spelunk plumbing read-memory`.
 
 mod plumbing_helpers;
-use plumbing_helpers::{parse_ndjson, spelunk_cmd, write_config};
+use plumbing_helpers::{parse_jsonl, spelunk_cmd, write_config};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -82,7 +82,7 @@ fn indexed_project_with_memory_note() -> (tempfile::TempDir, std::path::PathBuf,
 // ── happy path: list all ──────────────────────────────────────────────────────
 
 #[test]
-fn read_memory_emits_ndjson_when_notes_exist() {
+fn read_memory_emits_jsonl_when_notes_exist() {
     let (_tmp, db_path, config_path) = indexed_project_with_memory_note();
 
     let output = spelunk_cmd(&db_path, &config_path)
@@ -93,7 +93,7 @@ fn read_memory_emits_ndjson_when_notes_exist() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     assert!(!rows.is_empty(), "expected at least one memory note");
 
     for row in &rows {
@@ -120,7 +120,7 @@ fn read_memory_kind_filter_returns_matching_notes() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     assert!(!rows.is_empty(), "expected at least one 'note' kind entry");
     for row in &rows {
         assert_eq!(
@@ -146,7 +146,7 @@ fn read_memory_by_id_returns_single_note() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&list_output);
+    let rows = parse_jsonl(&list_output);
     let first_id = rows[0]["id"].as_i64().expect("id should be integer");
 
     let output = spelunk_cmd(&db_path, &config_path)
@@ -159,7 +159,7 @@ fn read_memory_by_id_returns_single_note() {
         .stdout
         .clone();
 
-    let detail_rows = parse_ndjson(&output);
+    let detail_rows = parse_jsonl(&output);
     assert_eq!(detail_rows.len(), 1, "expected exactly one note for --id");
     assert_eq!(detail_rows[0]["id"].as_i64(), Some(first_id));
 }

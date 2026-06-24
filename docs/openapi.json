@@ -1494,7 +1494,7 @@
           },
           "instance_id": {
             "type": "string",
-            "description": "Persistent UUID v4 identifying this server instance across restarts."
+            "description": "Persistent UUID v7 identifying this server instance across restarts."
           },
           "started_by": {
             "type": [

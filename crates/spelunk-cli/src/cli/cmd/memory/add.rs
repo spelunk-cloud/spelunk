@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 
 use super::MemoryAddArgs;
 use crate::{
+    capability,
     config::Config,
+    indexer::secrets::contains_secret,
     server_client::ServerInferenceClient,
     storage::{NoteInput, NoteRecord, append_to_git_notes, now_secs, open_memory_backend},
 };
@@ -13,6 +15,17 @@ pub(super) async fn memory_add(
     cfg: &Config,
     backend_override: Option<&str>,
 ) -> Result<()> {
+    // Honor the auto-discovered server tier (ADR-004): loopback auto-discovery
+    // sets the capability tier without populating `cfg.server_url`, so without
+    // this bridge `try_embed_via_server` cannot reach the local embedder and the
+    // note is stored without a vector (invisible to semantic `memory search`).
+    // Build an effective config that routes inference to the discovered server
+    // while leaving `server_url` unset, so `open_memory_backend` still writes the
+    // note to the project's local `memory.db` (the single canonical store).
+    let project_root = mem_path.parent().unwrap_or(mem_path);
+    let tier = capability::get_tier(cfg).await;
+    let eff_cfg = tier.effective_config(cfg, project_root);
+    let cfg = &eff_cfg;
     let (title, body) = if let Some(url) = &args.from_url {
         let (fetched_title, fetched_body) = fetch_url_content(url)
             .await
@@ -50,6 +63,17 @@ pub(super) async fn memory_add(
         .map(|s| s.split(',').map(|f| f.trim().to_string()).collect())
         .unwrap_or_default();
 
+    // ── Secret-scan gate (binding requirement #8) ────────────────────────────
+    // Checked before ANY persistence (SQLite or git-notes) so no credential
+    // can reach either store.  Error message deliberately does not echo the
+    // matched text.
+    if contains_secret(&title) || contains_secret(&body) {
+        anyhow::bail!(
+            "memory add: refusing to store entry — title or body matches a secret pattern. \
+             Remove the credential and try again. (No data was written to SQLite or git notes.)"
+        );
+    }
+
     let embed_text = format!("title: {title} | text: {body}");
     let embedding = try_embed_via_server(cfg, &embed_text).await;
 
@@ -57,7 +81,7 @@ pub(super) async fn memory_add(
         .valid_at
         .and_then(|s| super::parse_as_of(Some(&s)).ok().flatten());
 
-    let backend = open_memory_backend(cfg, mem_path, backend_override)?;
+    let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     let id = backend
         .add(NoteInput {
             kind: args.kind.clone(),
@@ -90,6 +114,7 @@ pub(super) async fn memory_add(
             superseded_by: None,
         };
         // Use process CWD (None) — the CLI is always run from the project root.
+        // Secret scan already ran above; no second check needed here.
         if let Err(e) = append_to_git_notes(None, &record).await {
             tracing::warn!("git-notes write-through failed (non-fatal): {e}");
         }

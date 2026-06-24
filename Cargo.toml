@@ -18,12 +18,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite    = { version = "0.40", features = ["bundled"] }
 sqlite-vec  = "0.1"
 reqwest     = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+uuid        = { version = "1", features = ["v4", "v7", "serde"] }
 openssl     = { version = "0.10", features = ["vendored"] }
 openssl-sys = { version = "0.9", features = ["vendored"] }
 tempfile    = "3"
 pretty_assertions = "1"
 serial_test = "3"
 wiremock    = "0.6"
+
+[patch.crates-io]
+# Local patch: adds `disable_memory_pattern` to InitOptions so the native
+# embedder can prevent ONNX Runtime from holding multi-GB arena buffers
+# indefinitely. Remove once the option is merged upstream.
+fastembed = { path = "vendor/fastembed" }
 
 [profile.release]
 lto           = true

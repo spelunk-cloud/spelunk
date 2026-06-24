@@ -1,7 +1,7 @@
 //! Component tests for `spelunk plumbing cat-chunks`.
 
 mod plumbing_helpers;
-use plumbing_helpers::{index_fixture_project, parse_ndjson, spelunk_cmd};
+use plumbing_helpers::{index_fixture_project, parse_jsonl, spelunk_cmd};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -10,7 +10,7 @@ use tempfile::TempDir;
 // ── happy path ────────────────────────────────────────────────────────────────
 
 #[test]
-fn cat_chunks_emits_ndjson_for_indexed_file() {
+fn cat_chunks_emits_jsonl_for_indexed_file() {
     let (_tmp, db_path, config_path) = index_fixture_project();
 
     // Use path suffix matching — the DB stores absolute paths.
@@ -23,7 +23,7 @@ fn cat_chunks_emits_ndjson_for_indexed_file() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     assert!(!rows.is_empty(), "expected at least one chunk for lib.rs");
 
     for row in &rows {
@@ -57,7 +57,7 @@ fn cat_chunks_output_includes_function_name() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         names.contains(&"greet"),

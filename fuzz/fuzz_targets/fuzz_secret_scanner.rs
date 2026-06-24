@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use spelunk::indexer::secrets::contains_secret;
+use spelunk_core::indexer::secrets::contains_secret;
 
 /// Fuzz `contains_secret` with arbitrary UTF-8 text.
 ///

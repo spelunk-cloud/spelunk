@@ -2,12 +2,17 @@ use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
 
+use super::memory::cross_project::collect_dep_cross_cutting;
 use super::memory::print_note_summary;
 use crate::storage::memory::Note;
 use crate::{config::Config, storage::open_memory_backend};
 
 /// Fallback per-section limit when `--kind` names a kind not in SECTIONS.
 const DEFAULT_UNKNOWN_KIND_LIMIT: usize = 20;
+
+/// Kinds for which the cross-project dep pass runs (§3 ADR-003).
+/// `handoff` and `question` are strictly local — session/project-scoped noise.
+const DEP_PASS_KINDS: &[&str] = &["decision", "requirement"];
 
 /// Agent-facing entry-point command: pull the most relevant memory sections
 /// in one shot (handoffs → questions → decisions → requirements).
@@ -46,6 +51,10 @@ pub struct ContextArgs {
     /// Skip the conventions section (default: false)
     #[arg(long)]
     pub no_conventions: bool,
+
+    /// Query only the local project's memory, skipping linked project stores
+    #[arg(long)]
+    pub local_only: bool,
 }
 
 struct Section {
@@ -78,19 +87,60 @@ pub async fn context(args: ContextArgs, cfg: Config) -> Result<()> {
     let mem_path = args.db.clone().unwrap_or_else(|| {
         crate::config::resolve_db(None, &cfg.db_path).with_file_name("memory.db")
     });
+
+    // Discovery nudge: warn once when unimported server.db notes exist.
+    crate::cli::cmd::memory::reconcile::maybe_emit_nudge(&mem_path, &cfg);
+
     let be = match args.backend.as_str() {
         "git-notes" => Some("git-notes"),
         _ => None,
     };
-    let backend = open_memory_backend(&cfg, &mem_path, be)?;
+    let backend = open_memory_backend(&cfg, &mem_path, be).await?;
 
-    let sections = collect_sections(
+    let mut sections = collect_sections(
         &*backend,
         args.kind.as_deref(),
         args.limit,
         args.path.as_deref(),
     )
     .await?;
+
+    // Cross-project dep pass (ADR-003): for decision and requirement sections,
+    // append locked/cross-project entries from linked projects.
+    // `handoff` and `question` are always local (§3 ADR-003).
+    if !args.local_only {
+        let index_db_path = args
+            .index_db
+            .clone()
+            .unwrap_or_else(|| crate::config::resolve_db(None, &cfg.db_path));
+        let mut seen: std::collections::HashSet<(String, i64)> = Default::default();
+        // Seed seen from all local notes to avoid printing a dep note that
+        // somehow shares an ID with a local note.
+        for (_, notes) in &sections {
+            for n in notes {
+                seen.insert((String::new(), n.id));
+            }
+        }
+        let dep_notes = collect_dep_cross_cutting(&index_db_path, &mut seen).await;
+
+        // Merge dep notes into the appropriate section buckets.
+        for dep_note in dep_notes {
+            let kind = dep_note.kind.clone();
+            if !DEP_PASS_KINDS.contains(&kind.as_str()) {
+                continue;
+            }
+            // If a --kind filter is active, only include matching dep notes.
+            if let Some(ref kf) = args.kind
+                && &kind != kf
+            {
+                continue;
+            }
+            // Find the matching section bucket and append.
+            if let Some((_, notes)) = sections.iter_mut().find(|(k, _)| k == &kind) {
+                notes.push(dep_note);
+            }
+        }
+    }
 
     // Load conventions from the index DB (best-effort; skip if unavailable).
     let conventions: Vec<crate::conventions::ConventionRecord> =

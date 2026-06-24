@@ -60,7 +60,7 @@ spelunk memory add --kind requirement \
 spelunk exposes machine-readable plumbing commands for use in scripts:
 
 ```bash
-# Stream all indexed chunks for a file as NDJSON
+# Stream all indexed chunks for a file as JSONL
 spelunk plumbing cat-chunks src/auth.rs
 
 # Parse a file and emit AST chunks without writing to the DB
@@ -77,7 +77,7 @@ spelunk plumbing hash-file src/auth.rs
 spelunk plumbing graph-edges --symbol verify_token
 ```
 
-All plumbing commands emit NDJSON. Exit 0 = results, 1 = no results, 2 = error.
+All plumbing commands emit JSONL. Exit 0 = results, 1 = no results, 2 = error.
 
 ---
 

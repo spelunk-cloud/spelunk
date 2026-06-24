@@ -5,8 +5,11 @@ use serde::{Deserialize, Serialize};
 use super::super::ui::{is_tty, progress_style};
 use crate::{capability::Tier, config::Config, embeddings::vec_to_blob, storage::Database};
 
-/// Maximum chunks per request — enforced by the server (returns 413 if exceeded).
-const MAX_BATCH: usize = 256;
+/// Maximum chunks per request — server enforces 256 (returns 413 if exceeded).
+/// Keep well below that ceiling so each HTTP call completes within the client
+/// timeout: at ONNX_BATCH_SIZE=32 on the server, 64 chunks = 2 ONNX calls
+/// (~30-40 s on CPU), leaving plenty of headroom under the 120 s limit.
+const MAX_BATCH: usize = 64;
 
 #[derive(Serialize)]
 struct EmbedRequest {

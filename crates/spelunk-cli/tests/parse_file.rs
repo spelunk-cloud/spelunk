@@ -1,10 +1,10 @@
 //! Component tests for `spelunk plumbing parse-file`.
 //!
 //! `parse-file` does not require an indexed DB — it just parses a file
-//! on disk and emits NDJSON chunks.
+//! on disk and emits JSONL chunks.
 
 mod plumbing_helpers;
-use plumbing_helpers::parse_ndjson;
+use plumbing_helpers::parse_jsonl;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -33,7 +33,7 @@ fn dummy_config(tmp: &TempDir) -> std::path::PathBuf {
 // ── happy path ────────────────────────────────────────────────────────────────
 
 #[test]
-fn parse_file_emits_ndjson_for_rust_file() {
+fn parse_file_emits_jsonl_for_rust_file() {
     let tmp = TempDir::new().unwrap();
     let config = dummy_config(&tmp);
 
@@ -50,7 +50,7 @@ fn parse_file_emits_ndjson_for_rust_file() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     assert!(!rows.is_empty(), "expected at least one parsed chunk");
 
     // Every row must have the required fields.
@@ -89,7 +89,7 @@ fn parse_file_finds_function_and_struct_chunks() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
 
     // lib.rs has functions AND a struct; both should appear.
     let kinds: Vec<&str> = rows.iter().filter_map(|r| r["kind"].as_str()).collect();

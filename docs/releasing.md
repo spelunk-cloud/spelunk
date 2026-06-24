@@ -19,8 +19,12 @@ Two install paths live outside this workflow:
 - **`install.sh`** is hosted at `https://spelunk.cloud/install.sh`. It resolves
   the latest release tag via the GitHub API and downloads the matching tarball —
   it does not need updating per release.
-- **Homebrew tap** the formula's `url`/`sha256`/`version` are updated per
-  release by `.github/workflows/release.yml` .
+- **Homebrew tap** lives in the separate `spelunk-cloud/homebrew-spelunk`
+  repo. The `update-homebrew-formula` job in `.github/workflows/release.yml`
+  regenerates `Formula/spelunk.rb` with the new `url`/`sha256`/`version` and
+  pushes it to that repo's `main` branch directly, using the
+  `HOMEBREW_TAP_TOKEN` secret (a token with `contents: write` on
+  `homebrew-spelunk` — `GITHUB_TOKEN` only has access to this repo).
 
 ## Supported platforms
 

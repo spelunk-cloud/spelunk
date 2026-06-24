@@ -21,6 +21,8 @@ pub(super) fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
         invalid_at: row.get(11)?,
         distance: None,
         score: None,
+        source_project: None,
+        source_project_path: None,
     })
 }
 
@@ -40,6 +42,8 @@ pub(super) fn row_to_note_with_distance(row: &rusqlite::Row<'_>) -> rusqlite::Re
         invalid_at: row.get(11)?,
         distance: Some(row.get(12)?),
         score: None,
+        source_project: None,
+        source_project_path: None,
     })
 }
 
@@ -84,6 +88,69 @@ impl MemoryStore {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Insert a note with an explicit `created_at` timestamp (unix epoch seconds).
+    ///
+    /// Used by `memory reconcile` to preserve the original creation timestamp
+    /// from the source store. All other callers should use `add_note`, which
+    /// defers to the SQLite `DEFAULT (unixepoch())`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_note_with_created_at(
+        &self,
+        kind: &str,
+        title: &str,
+        body: &str,
+        tags: &[&str],
+        linked_files: &[&str],
+        source_ref: Option<&str>,
+        status: &str,
+        created_at: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO notes \
+             (kind, title, body, tags, linked_files, source_ref, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                kind,
+                title,
+                body,
+                tags.join(","),
+                linked_files.join(","),
+                source_ref,
+                status,
+                created_at,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Return all notes for a project ordered by created_at ASC (used by reconcile
+    /// to compute the memory.db content-hash set).
+    ///
+    /// Returns all notes regardless of status so that archived entries also
+    /// participate in dedup (we must not re-import a note that was already
+    /// imported and then archived in memory.db).
+    pub fn all_notes_for_dedup(&self) -> Result<Vec<Note>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, title, body, tags, linked_files, created_at, status, \
+             superseded_by, source_ref, valid_at, invalid_at \
+             FROM notes ORDER BY created_at ASC",
+        )?;
+        let notes = stmt
+            .query_map([], super::notes::row_to_note)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(notes)
+    }
+
+    /// Update an existing note's `superseded_by` link (used by reconcile to
+    /// resolve supersede chains after batch import).
+    pub fn set_superseded_by(&self, note_id: i64, successor_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE notes SET superseded_by = ?1 WHERE id = ?2",
+            rusqlite::params![successor_id, note_id],
+        )?;
+        Ok(())
     }
 
     pub fn insert_embedding(&self, note_id: i64, blob: &[u8]) -> Result<()> {

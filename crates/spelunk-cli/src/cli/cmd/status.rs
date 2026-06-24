@@ -69,7 +69,7 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
         let usage = db.usage_last_7_days().unwrap_or_default();
         let mem_path = resolve_db(None, &cfg.db_path).with_file_name("memory.db");
         let (memory_count, memory_backend_kind) =
-            match open_memory_backend(&cfg, &mem_path, None).ok() {
+            match open_memory_backend(&cfg, &mem_path, None).await.ok() {
                 Some(b) => {
                     let kind = b.backend_kind();
                     let count = b.count().await.unwrap_or(0);
@@ -242,7 +242,7 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
 
     // ── Memory backend ────────────────────────────────────────────────────────
     let mem_path_text = resolve_db(None, &cfg.db_path).with_file_name("memory.db");
-    if let Ok(b) = open_memory_backend(&cfg, &mem_path_text, None) {
+    if let Ok(b) = open_memory_backend(&cfg, &mem_path_text, None).await {
         println!("Memory backend: {}", b.backend_kind());
     }
 

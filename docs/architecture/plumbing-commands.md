@@ -8,7 +8,7 @@ human-readable wrappers built on top of them.
 
 ## Design Principles
 
-1. **NDJSON on stdout** — every plumbing command writes one JSON object per
+1. **JSONL on stdout** — every plumbing command writes one JSON object per
    line to stdout. Consumers `jq`-filter or stream-parse without buffering.
 2. **Exit codes are semantic**
    - `0` — success, ≥1 result returned
@@ -19,7 +19,7 @@ human-readable wrappers built on top of them.
 4. **Composable** — plumbing commands read from stdin or file-path arguments;
    they do not open editors, prompt for input, or write to the DB unless
    that is their explicit job.
-5. **`--format` is absent** — plumbing commands always emit NDJSON; the flag
+5. **`--format` is absent** — plumbing commands always emit JSONL; the flag
    is a porcelain concern.
 
 ---
@@ -221,5 +221,5 @@ spelunk plumbing read-memory --kind decision \
 1. Add the args struct in `src/cli/args.rs` under `PlumbingCommand`.
 2. Add the handler in `src/cli/cmd/plumbing/<name>.rs`.
 3. Wire it in `src/cli/cmd/plumbing/mod.rs` and `src/cli/mod.rs`.
-4. Output NDJSON, exit 0/1/2, never write to stdout except JSON objects.
+4. Output JSONL, exit 0/1/2, never write to stdout except JSON objects.
 5. Add an entry to this document.

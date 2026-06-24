@@ -14,28 +14,6 @@ spelunk memory add --kind decision --title "Chose sqlite-vec" --body "..."  # pe
 
 Semantic search works out of the box: `spelunk` autostarts a local `spelunk-server` that bundles a native embedder — no external inference server to run. Point everyone at a shared `spelunk-server` to share memory across a team.
 
-## Why spelunk?
-
-AI coding agents lose context between sessions and can't trace how code connects across files. spelunk solves both with zero infrastructure.
-
-- **Persistent memory** — store decisions, requirements, and context in git notes. Retrieve them next session, or share them via a server with your team.
-- **Code graph** — trace callers, callees, and imports across file boundaries without reading every file.
-- **Works without any server** — memory, code graph, and full-text/ast-grep search work with just the binary. No API keys, no configuration.
-- **Semantic search built in** — a local `spelunk-server` is autostarted on demand with a bundled native embedder (Nomic Embed Text v1.5); no external inference server required. You can still point spelunk at your own OpenAI-compatible endpoint (LM Studio, Ollama, vLLM) if you prefer.
-- **100% local** — your code never leaves your machine. The server is self-hosted (local by default).
-- **Agent-native** — JSON output (`AGENT=true`), git hooks, and a structured memory system built for the agent workflow loop.
-
-### When to use spelunk vs grep
-
-| You want to... | Use |
-|---|---|
-| Find an exact function name | `rg "fn validate_token"` |
-| Find code related to a concept | `spelunk search "request authentication"` |
-| See what calls a function | `spelunk graph validate_token` |
-| Remember why a decision was made | `spelunk memory search "why sqlite-vec"` |
-| Store a design decision for future sessions | `spelunk memory add --kind decision ...` |
-| Share context across a team | `spelunk-server` + `server_url` |
-
 ## Quick start
 
 **1. Install**
@@ -73,6 +51,28 @@ spelunk init                                       # index + autostart server in
 spelunk search "error handling in the HTTP layer"  # semantic search
 spelunk search "database migrations" --graph       # with callers/callees
 ```
+
+## Why spelunk?
+
+AI coding agents lose context between sessions and can't trace how code connects across files. spelunk solves both with zero infrastructure.
+
+- **Persistent memory** — store decisions, requirements, and context in git notes. Retrieve them next session, or share them via a server with your team.
+- **Code graph** — trace callers, callees, and imports across file boundaries without reading every file.
+- **Works without any server** — memory, code graph, and full-text/ast-grep search work with just the binary. No API keys, no configuration.
+- **Semantic search built in** — a local `spelunk-server` is autostarted on demand with a bundled native embedder (Nomic Embed Text v1.5); no external inference server required. You can still point spelunk at your own OpenAI-compatible endpoint (LM Studio, Ollama, vLLM) if you prefer.
+- **100% local** — your code never leaves your machine. The server is self-hosted (local by default).
+- **Agent-native** — JSON output (`AGENT=true`), git hooks, and a structured memory system built for the agent workflow loop.
+
+### When to use spelunk vs grep
+
+| You want to... | Use |
+|---|---|
+| Find an exact function name | `rg "fn validate_token"` |
+| Find code related to a concept | `spelunk search "request authentication"` |
+| See what calls a function | `spelunk graph validate_token` |
+| Remember why a decision was made | `spelunk memory search "why sqlite-vec"` |
+| Store a design decision for future sessions | `spelunk memory add --kind decision ...` |
+| Share context across a team | `spelunk-server` + `server_url` |
 
 ## Core features
 

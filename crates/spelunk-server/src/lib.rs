@@ -40,7 +40,7 @@ pub struct AppState {
     pub max_tokens_ceiling: usize,
     /// Per-principal rate limiter for `/llm/complete`.
     pub rate_limiter: Arc<RateLimiter>,
-    /// Persistent UUID v4 identifying this server instance across restarts.
+    /// Persistent UUID v7 identifying this server instance across restarts.
     /// CLI warns on instance_id change mid-session.
     pub instance_id: String,
     /// Effective UID of the process that started the server (Unix); `None` on Windows.

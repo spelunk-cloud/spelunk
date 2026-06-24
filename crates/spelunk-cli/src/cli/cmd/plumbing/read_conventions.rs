@@ -3,7 +3,7 @@ use anyhow::Result;
 use super::PlumbingReadConventionsArgs;
 use crate::storage::Database;
 
-/// Emit stored convention records as NDJSON.
+/// Emit stored convention records as JSONL.
 ///
 /// Exit codes:
 /// - 0: at least one row emitted

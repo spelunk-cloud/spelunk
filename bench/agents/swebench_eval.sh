@@ -94,20 +94,22 @@ python3 -m swebench.harness.run_evaluation \
 # Step 3: Merge harness results back into result JSON
 echo ""
 echo "--- Merging resolve data ---"
-HARNESS_DIR="swebench_eval_outputs/${RUN_ID}"
-if [[ -d "$HARNESS_DIR" ]]; then
-    # Glob for harness output file (filename varies by SWE-bench version)
-    HARNESS_FILE=$(find "$HARNESS_DIR" -maxdepth 2 -name '*.json' -exec grep -l '"resolved"' {} \; 2>/dev/null | head -1)
-    if [[ -z "$HARNESS_FILE" ]]; then
-        echo "ERROR: no harness output with 'resolved' field under ${HARNESS_DIR}" >&2
-    else
-        echo "  Found: ${HARNESS_FILE}"
-        python3 -c "
+# make_run_report() (swebench.harness.reporting) writes its summary report to
+# "<model_name>.<run_id>.json" in the current working directory — NOT under
+# swebench_eval_outputs/. Per-instance logs/test_output.txt live under
+# logs/run_evaluation/${RUN_ID}/<model>/<instance>/, but the aggregate
+# resolved/unresolved/error sets only exist in the top-level report file.
+HARNESS_FILE=$(find . -maxdepth 1 -name "*.${RUN_ID}.json" 2>/dev/null | head -1)
+if [[ -z "$HARNESS_FILE" ]]; then
+    echo "ERROR: no harness report file matching '*.${RUN_ID}.json' found in $(pwd)" >&2
+else
+    echo "  Found: ${HARNESS_FILE}"
+    python3 -c "
 import json
 raw = json.load(open('${RESULTS}'))
 results = raw['tasks'] if isinstance(raw, dict) and 'tasks' in raw else raw
 harness = json.load(open('${HARNESS_FILE}'))
-resolved_map = {r: True for r in harness.get('resolved', [])}
+resolved_map = {r: True for r in harness.get('resolved_ids', [])}
 
 skipped_pre = sum(1 for r in results if r.get('skipped'))
 errored = sum(1 for r in results if r.get('error'))
@@ -136,9 +138,8 @@ output = {
 json.dump(output, open('${RESULTS}', 'w'), indent=2)
 print(f'  Evaluated: {evaluated}  Resolved: {resolved_count}  Rate: {rate:.1%}')
 "
-    fi
 fi
 
 echo ""
 echo "=== Done ==="
-echo "Results in: ${HARNESS_DIR}/"
+echo "Per-instance logs in: logs/run_evaluation/${RUN_ID}/"

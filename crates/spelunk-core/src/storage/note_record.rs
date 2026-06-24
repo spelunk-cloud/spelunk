@@ -45,6 +45,8 @@ pub fn record_to_note(r: NoteRecord) -> Note {
         invalid_at: r.invalid_at,
         distance: None,
         score: None,
+        source_project: None,
+        source_project_path: None,
     }
 }
 

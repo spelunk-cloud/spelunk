@@ -9,7 +9,7 @@ pub(super) async fn memory_graph(
     cfg: &Config,
     backend_override: Option<&str>,
 ) -> Result<()> {
-    let backend = open_memory_backend(cfg, mem_path, backend_override)?;
+    let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     let root = backend
         .get(args.id)
         .await?

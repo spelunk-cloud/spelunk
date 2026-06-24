@@ -158,7 +158,8 @@ impl Database {
              JOIN spec_links sl ON sl.spec_id = s.id
              JOIN files sf      ON sf.path = s.path
              JOIN files lf      ON (lf.path = sl.linked_path
-                                    OR lf.path LIKE sl.linked_path || '%')
+                                    OR lf.path LIKE replace(replace(replace(sl.linked_path,
+                                        '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%' ESCAPE '\\')
              WHERE lf.indexed_at > sf.indexed_at
              ORDER BY s.path",
         )?;

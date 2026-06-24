@@ -1,7 +1,7 @@
 # spelunk Threat Model
 
 **Method:** Lightweight threat modeling (STRIDE-informed)  
-**Last reviewed:** June 2026 (PR #339: git-notes memory write-through)  
+**Last reviewed:** June 2026 (PR #390: ADR-004 unified memory storage)  
 **Reviewed by:** Architect  
 **Next review:** v1.0 release or after any new network-facing feature
 
@@ -16,8 +16,10 @@ spelunk has two distinct operational modes with different attack surfaces:
 2. Embeds chunks by calling an OpenAI-compatible HTTP endpoint (`api_base_url`, default `http://127.0.0.1:1234`)
 3. Runs KNN search over stored embeddings via sqlite-vec
 4. Optionally sends context + a user question to an LLM endpoint (`llm_model` / same base URL)
-5. Maintains a `memory.db` of structured notes with semantic search
+5. Maintains a `memory.db` of structured notes with semantic search. **`memory.db` is the single authoritative memory store at the CLI tier** (ADR-004). All `spelunk memory` operations (add, list, search, timeline, harvest) read from and write to `memory.db`.
 6. **When `store_in_git_notes = true` (the default):** each `spelunk memory add` also appends the note as a JSON line to `refs/notes/spelunk` on HEAD (PR #339). Git notes in this namespace travel with the repository on `git push` and are available to anyone who clones the repo — see [git-notes memory](#git-notes-memory-prref-notespelunk) below.
+
+**Auto-discovered loopback spelunk-server (v0.8.0+):** spelunk auto-starts a local `spelunk-server` daemon (bound to `127.0.0.1`) to provide a native embedder and LLM backend. This server is **inference-only**: it receives query text or chunk text for embedding, and completion prompts for LLM calls. It does **not** receive note text for storage and is **not** a memory backend. Only an explicit `server_url` in config (pointing at a team or cloud server) moves the memory store of record away from `memory.db`.
 
 ### Mode B — spelunk-server
 An axum HTTP API (`src/server/`) that exposes memory CRUD and semantic search over the network:
@@ -70,20 +72,31 @@ User filesystem
   │     └─► LLM prompt ─► api_base_url
   │           └─ context: code chunks + spec files + memory notes
   │
-  └─ spelunk memory add ─► memory.db (SQLite, local)
-                        └─► [git notes append] ─► refs/notes/spelunk on HEAD
-                                                        │
-                                                        └─► git push ─► remote (any clone)
-                                                             ┌──────────────────────────────────────┐
-                                                             │ TRUST BOUNDARY: local repo → remote  │
-                                                             │ Notes travel with the repo;           │
-                                                             │ no secret scan on this path (*)       │
-                                                             └──────────────────────────────────────┘
+  ├─ spelunk memory add ─► memory.db (SQLite, local)  ← single canonical store (ADR-004)
+  │                     └─► [git notes append] ─► refs/notes/spelunk on HEAD
+  │                                                       │
+  │                                                       └─► git push ─► remote (any clone)
+  │                                                            ┌──────────────────────────────────────┐
+  │                                                            │ TRUST BOUNDARY: local repo → remote  │
+  │                                                            │ Notes travel with the repo;           │
+  │                                                            │ no secret scan on this path (*)       │
+  │                                                            └──────────────────────────────────────┘
+  │
+  └─ spelunk memory search
+        ├─► embed query via HTTP ─► loopback spelunk-server (inference-only)
+        │    (query text only; note content stays in memory.db — NOT sent to server)
+        └─► KNN search ─► memory.db (local sqlite-vec)
 ```
 (*) `spelunk memory harvest` (harvest_claude.rs) does run `contains_secret` on
 harvested text before storing. Direct `spelunk memory add` does **not** — the
 note body comes from the user's own command line or `$EDITOR` and is written to
 git notes verbatim.
+
+**Memory data-flow rule (ADR-004):** Note text for storage is never sent to the
+loopback spelunk-server. For `memory search`, only the query string crosses the
+loopback trust boundary (to obtain a query embedding); the KNN search and all
+note reads/writes operate on the local `memory.db`. If a team `server_url` is
+explicitly configured, memory moves to that server instead — see Mode B.
 
 ### Mode B — spelunk-server
 
@@ -164,10 +177,11 @@ reachable beyond localhost (e.g. on a LAN or cloud VM), all memory is unauthenti
 | Threat | Mode | Likelihood | Impact | Mitigation |
 |--------|------|-----------|--------|-----------|
 | Indexed source file contains adversarial LLM instructions | A | Low | Medium | XML delimiter isolation in `ask.rs`; angle-bracket escaping of retrieved context (issue #137) |
+| Indexed source file steers the `explore` LLM into a `read_file` tool call for an arbitrary path (e.g. `/Users/me/.ssh/id_rsa`, `../../etc/passwd`), exfiltrating file contents via the answer / step log | A | Low | High | `read_file` path-boundary enforcement in `explore.rs` (`resolve_indexed_path`): reject absolute / drive / UNC / NUL inputs, lexically reject `..` escape, require index membership against the `files` allow-list (already ignore/secret-vetted by the indexer), and confirm the canonicalized target stays under the canonical project root (symlink backstop). Denial is a recoverable tool result echoing only the caller-supplied path — never a resolved path or file contents (issue #403) |
 | User query contains injection payload | A | Low | Low | Pre-flight check against known patterns (`ask.rs` lines 155–174) |
-| Memory note stored via server contains injection payload, later retrieved in `spelunk ask` context | A+B | Low | Medium | No sanitisation of server-stored note bodies before inclusion in LLM context. Same XML delimiter isolation applies, but angle-bracket escaping must cover memory context too (issue #137). |
+| Memory note stored via team server contains injection payload, later retrieved in `spelunk ask` context | B | Low | Medium | Applies only when an explicit team `server_url` is configured (Mode B). In Mode A, notes are stored in local `memory.db` — not via the loopback server — so this attack requires access to the user's filesystem. Same XML delimiter isolation applies when notes are included in LLM context; angle-bracket escaping must cover memory context (issue #137). |
 
-**Residual risk:** Pre-flight only blocks known string patterns. Novel injection payloads in indexed content or server-stored memory could influence the LLM response.
+**Residual risk:** Pre-flight only blocks known string patterns. Novel injection payloads in indexed content or memory notes could influence the LLM response.
 
 ---
 

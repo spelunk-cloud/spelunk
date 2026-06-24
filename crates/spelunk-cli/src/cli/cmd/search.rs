@@ -15,7 +15,7 @@ pub struct SearchArgs {
     #[arg(long, conflicts_with = "limit")]
     pub budget: Option<usize>,
 
-    /// Output format: text, json, or ndjson
+    /// Output format: text, json, or jsonl
     #[arg(long, default_value = "text")]
     pub format: String,
 
@@ -85,6 +85,14 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
     let (db_path, dep_projects) = resolve_project_and_deps(args.db.as_ref(), &cfg)?;
     crate::storage::record_usage_at(&db_path, "search");
 
+    // Honor the capability tier: when the server was auto-discovered via the
+    // loopback probe, `cfg.server_url` is unset; fill it in from the tier so
+    // the inference client can be built (mirrors explore.rs / memory/search.rs,
+    // see spelunk#316).
+    let project_root = db_path.parent().unwrap_or(&db_path);
+    let tier = capability::get_tier(&cfg).await;
+    let cfg = tier.effective_config(&cfg, project_root);
+
     // Apply --local-only: discard linked deps.
     let dep_projects = if args.local_only || args.as_of.is_some() {
         vec![]
@@ -118,37 +126,38 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
     //
     // When the user explicitly requests `--mode semantic` or `--mode hybrid`
     // but no server is reachable (Tier 0), automatically switch to FTS text
-    // search and print a notice to stderr.  stdout stays clean so NDJSON
-    // consumers are unaffected.
+    // search. Under ADR-004 inference-only routing (no explicit `server_url`),
+    // the fallback is silent — the user never configured a server, so there is
+    // nothing to warn about. The notice is only printed when `server_url` was
+    // explicitly set (the user expected a server and it is unreachable).
     //
     // The `auto` mode already degrades gracefully via the embed_query_vec error
     // path below — this guard handles the explicit-mode case only.
     // Snapshot searches are skipped: they require embeddings by definition.
-    if (mode == "semantic" || mode == "hybrid") && snapshot_id.is_none() {
-        let tier = capability::get_tier(&cfg).await;
-        if !tier.is_server() {
+    if (mode == "semantic" || mode == "hybrid") && snapshot_id.is_none() && !tier.is_server() {
+        if cfg.server_url.is_some() {
             eprintln!("[server unreachable — using text search]");
-            let sp = spinner("Searching (text)…");
-            let db = Database::open(&db_path)?;
-            let results = db
-                .search_text(&args.query, args.limit.min(100))
-                .unwrap_or_default();
-            sp.finish_and_clear();
-            if results.is_empty() {
-                println!("No results found.");
-                return Ok(());
-            }
-            match crate::utils::effective_format(&args.format) {
-                "json" => println!("{}", serde_json::to_string_pretty(&results)?),
-                "ndjson" => {
-                    for item in &results {
-                        println!("{}", serde_json::to_string(item)?);
-                    }
-                }
-                _ => print_results_text(&results),
-            }
+        }
+        let sp = spinner("Searching (text)…");
+        let db = Database::open(&db_path)?;
+        let results = db
+            .search_text(&args.query, args.limit.min(100))
+            .unwrap_or_default();
+        sp.finish_and_clear();
+        if results.is_empty() {
+            println!("No results found.");
             return Ok(());
         }
+        match crate::utils::effective_format(&args.format) {
+            "json" => println!("{}", serde_json::to_string_pretty(&results)?),
+            "jsonl" => {
+                for item in &results {
+                    println!("{}", serde_json::to_string(item)?);
+                }
+            }
+            _ => print_results_text(&results),
+        }
+        return Ok(());
     }
 
     let mut results = if mode == "text" && snapshot_id.is_none() {
@@ -322,7 +331,7 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
                 };
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
-            "ndjson" => {
+            "jsonl" => {
                 for item in &packed {
                     println!("{}", serde_json::to_string(item)?);
                 }
@@ -337,7 +346,7 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
 
     match crate::utils::effective_format(&args.format) {
         "json" => println!("{}", serde_json::to_string_pretty(&results)?),
-        "ndjson" => {
+        "jsonl" => {
             for item in &results {
                 println!("{}", serde_json::to_string(item)?);
             }
@@ -571,7 +580,7 @@ pub(crate) fn search_live(
 
     match crate::utils::effective_format(format) {
         "json" => println!("{}", serde_json::to_string_pretty(&results)?),
-        "ndjson" => {
+        "jsonl" => {
             for item in &results {
                 println!("{}", serde_json::to_string(item)?);
             }

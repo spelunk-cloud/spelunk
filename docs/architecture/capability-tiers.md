@@ -132,7 +132,7 @@ Key points:
 - **Address.** Discovery is fixed to `127.0.0.1:7777` — loopback only, never a
   routable interface. A team/remote server is reached through explicit
   `server_url` config, not discovery.
-- **`instance_id`.** Each running server reports a unique UUID v4 in its
+- **`instance_id`.** Each running server reports a unique UUID v7 in its
   `/v1/health` body. The CLI logs it at debug level and uses it to detect
   a server that was restarted underneath a session. Implemented in both server
   and CLI (shipped with PRs #329/#333).

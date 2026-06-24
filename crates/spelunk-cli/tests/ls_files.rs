@@ -1,7 +1,7 @@
 //! Component tests for `spelunk plumbing ls-files`.
 
 mod plumbing_helpers;
-use plumbing_helpers::{index_fixture_project, parse_ndjson, spelunk_cmd};
+use plumbing_helpers::{index_fixture_project, parse_jsonl, spelunk_cmd};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -10,7 +10,7 @@ use tempfile::TempDir;
 // ── happy path ────────────────────────────────────────────────────────────────
 
 #[test]
-fn ls_files_emits_ndjson_for_indexed_project() {
+fn ls_files_emits_jsonl_for_indexed_project() {
     let (_tmp, db_path, config_path) = index_fixture_project();
 
     let output = spelunk_cmd(&db_path, &config_path)
@@ -21,7 +21,7 @@ fn ls_files_emits_ndjson_for_indexed_project() {
         .stdout
         .clone();
 
-    let rows = parse_ndjson(&output);
+    let rows = parse_jsonl(&output);
     assert!(!rows.is_empty(), "expected at least one file entry");
 
     for row in &rows {
@@ -65,7 +65,7 @@ fn ls_files_stale_flag_returns_subset_or_empty() {
         .arg("ls-files")
         .output()
         .unwrap();
-    let all_rows = parse_ndjson(&all_output.stdout);
+    let all_rows = parse_jsonl(&all_output.stdout);
     let all_count = all_rows.len();
 
     // With --stale: only stale files returned (may be 0..all_count).
@@ -74,7 +74,7 @@ fn ls_files_stale_flag_returns_subset_or_empty() {
         .arg("--stale")
         .output()
         .unwrap();
-    let stale_rows = parse_ndjson(&stale_output.stdout);
+    let stale_rows = parse_jsonl(&stale_output.stdout);
 
     // Stale subset must not exceed total count.
     assert!(

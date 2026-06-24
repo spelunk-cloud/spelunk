@@ -14,6 +14,9 @@ pub(super) async fn memory_search(
     let index_db_path = crate::config::resolve_db(None, &cfg.db_path);
     crate::storage::record_usage_at(&index_db_path, "memory search");
 
+    // Discovery nudge: warn once when unimported server.db notes exist.
+    super::reconcile::maybe_emit_nudge(mem_path, cfg);
+
     // Honor the auto-discovered server tier: loopback auto-discovery sets the
     // capability tier without populating `cfg.server_url`, so build an
     // effective config that fills in `server_url`/`project_id` from the tier
@@ -25,7 +28,7 @@ pub(super) async fn memory_search(
     let cfg = &eff_cfg;
 
     let mode = args.mode.as_str();
-    let backend = open_memory_backend(cfg, mem_path, backend_override)?;
+    let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     let as_of = parse_as_of(args.as_of.as_deref())?;
 
     let notes = if mode == "text" {
@@ -60,12 +63,7 @@ pub(super) async fn memory_search(
         }
     };
 
-    if notes.is_empty() {
-        println!("No memory entries found.");
-        return Ok(());
-    }
-
-    let notes = if args.expand_graph {
+    let mut notes = if args.expand_graph {
         let mut seen: std::collections::HashSet<i64> = notes.iter().map(|n| n.id).collect();
         let mut expanded = notes;
         let mut neighbours = vec![];
@@ -92,6 +90,26 @@ pub(super) async fn memory_search(
     } else {
         notes
     };
+
+    // Cross-project dep pass (ADR-003): append locked/cross-project decisions
+    // and requirements from linked projects unless --local-only is set.
+    // Dep stores are queried via text search (they have no embedder available
+    // in the CLI path), filtered post-query to the `locked`/`cross-project`
+    // tag set. Results are appended after local results per ADR-003 §6.
+    if !args.local_only {
+        let mut seen: std::collections::HashSet<(String, i64)> = Default::default();
+        for n in &notes {
+            seen.insert((String::new(), n.id));
+        }
+        let dep_notes =
+            super::cross_project::collect_dep_cross_cutting(&index_db_path, &mut seen).await;
+        notes.extend(dep_notes);
+    }
+
+    if notes.is_empty() {
+        println!("No memory entries found.");
+        return Ok(());
+    }
 
     match crate::utils::effective_format(&args.format) {
         "json" => println!("{}", serde_json::to_string_pretty(&notes)?),

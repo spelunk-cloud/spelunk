@@ -4,9 +4,11 @@
 
 **The key mental model**: spelunk retrieves context; you reason over it. Use `spelunk graph` and `spelunk search` to find the right code, read the results, then synthesise the answer yourself. spelunk is a persistent memory store and code navigation tool, not an oracle.
 
-**What's built-in:** memory (git-notes + local SQLite), code graph, full-text and ast-grep search, and extracted conventions work with just the CLI binary — no server needed.
+**What's built-in:** memory (local SQLite `memory.db`, optionally mirrored to git-notes), code graph, full-text and ast-grep search, and extracted conventions work with just the CLI binary — no server needed. A project's memory always lives in its local `memory.db`; that is the canonical store of record for every memory command.
 
-**What's server-backed:** semantic/hybrid search (`spelunk search --mode auto|semantic|hybrid`), `spelunk explore`, and `spelunk memory harvest` go through `spelunk-server`. From v0.8.0 the server is autostarted locally on demand and bundles a native embedder (Nomic Embed Text v1.5, via fastembed-rs) — there is no external embedding server to run by default. If you force offline mode (`SPELUNK_NO_SERVER=1`), these commands fall back to text/ast-grep search or error clearly.
+**What's server-backed:** semantic/hybrid search (`spelunk search --mode auto|semantic|hybrid`), `spelunk explore`, and `spelunk memory harvest` use `spelunk-server` for **inference** (embeddings + LLM). From v0.8.0 the server is autostarted locally on demand and bundles a native embedder (Nomic Embed Text v1.5, via fastembed-rs) — there is no external embedding server to run by default. The auto-discovered loopback server is **inference-only**: it never stores memory. For `memory search` the CLI sends only the query to the loopback embedder and runs the vector search locally against `memory.db` — note text never leaves the local store. If you force offline mode (`SPELUNK_NO_SERVER=1`), these commands fall back to text/ast-grep search or error clearly, and all memory commands operate on `memory.db`.
+
+**Where does memory live?** Always `memory.db` for the active project — **unless** you have *explicitly* configured a team `server_url`, which relocates the store of record to that shared server (the team-memory tier). An auto-discovered loopback server does **not** change where memory lives.
 
 ## The core loop
 
@@ -40,7 +42,7 @@ You can also use `--format json` on individual commands.
 If your config does not have a `server_url`, `spelunk` auto-discovers a local
 `spelunk-server` running on loopback by reading
 `~/.local/state/spelunk/server.port`.  You can start, stop, and inspect that
-daemon with the `spelunk server` subcommand.
+daemon with the `spelunk server` subcommand. This auto-discovered daemon is an **inference backend only** — it serves embeddings and LLM calls. It is **not** a memory store: your project's memory stays in `memory.db` regardless of whether this server is running. (Memory moves to a server only when you *explicitly* set `server_url` to a team instance in your config.)
 
 ```bash
 # Start spelunk-server on port 7777 (idempotent — no-op if already running)
@@ -252,6 +254,26 @@ spelunk memory watch
 
 Conflict detection: If you write an entry semantically similar to an existing one (cosine ≥ 0.92), the server returns HTTP 409 (advisory). The entry is stored with a `contradicts` edge linking to the conflicting entry. Check `spelunk memory show <id>` to review related entries before proceeding.
 
+## Reconciling memory from a server database
+
+If you have access to a `spelunk-server` SQLite database (e.g. a team server snapshot or a local server DB at `~/.local/state/spelunk/server.db`), you can import its memory entries into your project's local database without running the server:
+
+```bash
+# Preview what would be imported (no writes)
+spelunk memory reconcile --source-db ~/.local/state/spelunk/server.db --dry-run
+
+# Import memory from the server DB for the current project
+spelunk memory reconcile --source-db ~/.local/state/spelunk/server.db
+
+# Import across all projects in the server DB
+spelunk memory reconcile --source-db ~/.local/state/spelunk/server.db --all-projects
+
+# Machine-readable output (one JSON object per imported entry)
+spelunk memory reconcile --source-db ~/.local/state/spelunk/server.db --format json
+```
+
+Reconcile is additive and idempotent — entries already present in the local DB are skipped (matched by content hash). Useful for seeding a fresh checkout with team decisions, or for offline work after a period connected to a shared server.
+
 ## Cross-project search
 
 If your project depends on shared libraries you've indexed separately:
@@ -275,7 +297,7 @@ spelunk hooks install --ci
 
 ## Plumbing Commands
 
-Plumbing commands emit NDJSON to stdout and follow a strict exit-code convention, making them safe to use in scripts and pipelines. See [Plumbing and Porcelain](plumbing-and-porcelain.md) for a full explanation of the design philosophy.
+Plumbing commands emit JSONL to stdout and follow a strict exit-code convention, making them safe to use in scripts and pipelines. See [Plumbing and Porcelain](plumbing-and-porcelain.md) for a full explanation of the design philosophy.
 
 Exit codes across all plumbing commands:
 - **0** — success, results emitted
@@ -290,7 +312,7 @@ Commands marked **(requires server)** need an embedding model running on the con
 spelunk plumbing cat-chunks <file>
 ```
 
-Emit all indexed chunks for a given file as NDJSON.
+Emit all indexed chunks for a given file as JSONL.
 
 | Flag | Description |
 |------|-------------|
@@ -318,7 +340,7 @@ spelunk plumbing cat-chunks src/indexer/chunker.rs \
 spelunk plumbing ls-files [--prefix <prefix>] [--stale] [--root <dir>]
 ```
 
-List every indexed file as NDJSON. With `--stale`, only files whose on-disk blake3 hash differs from the stored hash are emitted.
+List every indexed file as JSONL. With `--stale`, only files whose on-disk blake3 hash differs from the stored hash are emitted.
 
 | Flag | Description |
 |------|-------------|
@@ -346,7 +368,7 @@ spelunk plumbing ls-files --stale --root .
 spelunk plumbing parse-file <file>
 ```
 
-Parse a file with tree-sitter and emit chunks as NDJSON without writing anything to the index. Useful for previewing how spelunk will chunk a file.
+Parse a file with tree-sitter and emit chunks as JSONL without writing anything to the index. Useful for previewing how spelunk will chunk a file.
 
 | Flag | Description |
 |------|-------------|
@@ -429,7 +451,7 @@ Example output:
 spelunk plumbing embed [--query]
 ```
 
-Read lines from stdin and emit one NDJSON embedding vector per line. Each output object contains the model name, vector dimensionality, and the float vector.
+Read lines from stdin and emit one JSONL embedding vector per line. Each output object contains the model name, vector dimensionality, and the float vector.
 
 | Flag | Description |
 |------|-------------|
@@ -487,7 +509,7 @@ spelunk plumbing graph-edges --symbol validate_token
 spelunk plumbing read-memory [--kind <kind>] [--id <n>] [--limit N]
 ```
 
-Emit memory entries as NDJSON. Use `--kind` to filter by entry type or `--id` to fetch a single entry.
+Emit memory entries as JSONL. Use `--kind` to filter by entry type or `--id` to fetch a single entry.
 
 | Flag | Description |
 |------|-------------|
