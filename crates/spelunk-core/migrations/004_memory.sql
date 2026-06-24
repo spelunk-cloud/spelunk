@@ -14,5 +14,5 @@ CREATE TABLE IF NOT EXISTS notes (
 -- Semantic embeddings for notes (one row per note).
 CREATE VIRTUAL TABLE IF NOT EXISTS note_embeddings USING vec0(
     note_id    INTEGER PRIMARY KEY,
-    embedding  FLOAT[768]
+    embedding  FLOAT[896]
 );

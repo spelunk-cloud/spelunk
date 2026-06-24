@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{
-    embedding, linear_b, linear_no_bias, rms_norm, rotary_emb::rope, Activation, Embedding,
-    Linear, Module, RmsNorm, VarBuilder,
+    Activation, Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_b,
+    linear_no_bias, rms_norm, rotary_emb::rope,
 };
 use candle_transformers::models::qwen3::Config as Qwen3Config;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
@@ -28,7 +28,6 @@ const EMBED_BATCH_SIZE: usize = 8;
 /// avoid multi-GB allocations on long code chunks.
 /// At 512 tokens: 8 × 16 × 512² × 4 bytes ≈ 134 MB — well within budget.
 const BATCH_MAX_SEQ: usize = 512;
-
 
 pub struct NativeEmbedder {
     inner: Arc<Mutex<EmbedderInner>>,
@@ -75,15 +74,12 @@ struct EmbedLayer {
 
 impl Qwen3EmbedWeights {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let embed_tokens =
-            embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
 
         // Pre-compute RoPE sin/cos tables once (matches Qwen3RotaryEmbedding in candle).
         let half_hd = cfg.head_dim / 2;
         let inv_freq: Vec<f32> = (0..half_hd)
-            .map(|i| {
-                1.0f32 / (cfg.rope_theta as f32).powf(2.0 * i as f32 / cfg.head_dim as f32)
-            })
+            .map(|i| 1.0f32 / (cfg.rope_theta as f32).powf(2.0 * i as f32 / cfg.head_dim as f32))
             .collect();
         let inv_freq_t =
             Tensor::from_vec(inv_freq, (1, half_hd), vb.device())?.to_dtype(DType::F32)?;
@@ -110,17 +106,17 @@ impl Qwen3EmbedWeights {
             let vb_a = vb_i.pp("self_attn");
             let vb_m = vb_i.pp("mlp");
             layers.push(EmbedLayer {
-                attn_norm: rms_norm(h,         eps, vb_i.pp("input_layernorm"))?,
-                q:         linear_b(h, nh * hd, bias, vb_a.pp("q_proj"))?,
-                k:         linear_b(h, nkv * hd, bias, vb_a.pp("k_proj"))?,
-                v:         linear_b(h, nkv * hd, bias, vb_a.pp("v_proj"))?,
-                o:         linear_b(nh * hd, h,  bias, vb_a.pp("o_proj"))?,
-                q_norm:    rms_norm(hd,        eps, vb_a.pp("q_norm"))?,
-                k_norm:    rms_norm(hd,        eps, vb_a.pp("k_norm"))?,
-                gate:      linear_no_bias(h, inter, vb_m.pp("gate_proj"))?,
-                up:        linear_no_bias(h, inter, vb_m.pp("up_proj"))?,
-                down:      linear_no_bias(inter, h, vb_m.pp("down_proj"))?,
-                post_norm: rms_norm(h,         eps, vb_i.pp("post_attention_layernorm"))?,
+                attn_norm: rms_norm(h, eps, vb_i.pp("input_layernorm"))?,
+                q: linear_b(h, nh * hd, bias, vb_a.pp("q_proj"))?,
+                k: linear_b(h, nkv * hd, bias, vb_a.pp("k_proj"))?,
+                v: linear_b(h, nkv * hd, bias, vb_a.pp("v_proj"))?,
+                o: linear_b(nh * hd, h, bias, vb_a.pp("o_proj"))?,
+                q_norm: rms_norm(hd, eps, vb_a.pp("q_norm"))?,
+                k_norm: rms_norm(hd, eps, vb_a.pp("k_norm"))?,
+                gate: linear_no_bias(h, inter, vb_m.pp("gate_proj"))?,
+                up: linear_no_bias(h, inter, vb_m.pp("up_proj"))?,
+                down: linear_no_bias(inter, h, vb_m.pp("down_proj"))?,
+                post_norm: rms_norm(h, eps, vb_i.pp("post_attention_layernorm"))?,
             });
         }
 
@@ -238,9 +234,15 @@ impl Qwen3EmbedWeights {
         let v = layer.v.forward(x)?; // [b, seq, nkv*hd]
 
         // Reshape and transpose to [b, n_heads, seq, head_dim]
-        let q = q.reshape((b, seq, self.n_head, self.head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((b, seq, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
-        let v = v.reshape((b, seq, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+        let q = q
+            .reshape((b, seq, self.n_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, seq, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, seq, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?;
 
         // QK RMSNorm (Qwen3 adds a per-head norm before RoPE)
         let q = layer.q_norm.forward(&q)?;
@@ -267,10 +269,10 @@ impl Qwen3EmbedWeights {
         let out = probs.matmul(&v)?; // [b, n_head, seq, hd]
 
         // Merge heads: [b, seq, n_head*hd]
-        let out = out
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, seq, self.n_head * self.head_dim))?;
+        let out =
+            out.transpose(1, 2)?
+                .contiguous()?
+                .reshape((b, seq, self.n_head * self.head_dim))?;
         Ok(layer.o.forward(&out)?)
     }
 
@@ -473,8 +475,7 @@ impl spelunk_core::embeddings::EmbeddingBackend for NativeEmbedder {
 
             // 2. Sort by token length so sequences in the same sub-batch have
             //    similar lengths, minimising padding waste.
-            let mut indexed: Vec<(usize, Vec<u32>)> =
-                id_vecs.into_iter().enumerate().collect();
+            let mut indexed: Vec<(usize, Vec<u32>)> = id_vecs.into_iter().enumerate().collect();
             indexed.sort_unstable_by_key(|(_, ids)| ids.len());
 
             // 3. Process in sub-batches; reassemble into original order.

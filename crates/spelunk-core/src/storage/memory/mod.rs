@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::Path;
 
@@ -147,6 +147,55 @@ impl MemoryStore {
         // derived from `MAX(remote_id)` over `notes`, so there is no separate
         // watermark to persist. The unique `idx_notes_remote_id` above is what
         // makes that cursor lookup and the `remote_id` dedupe cheap.
+
+        // Upgrade note_embeddings from 768-dim (Nomic) to 896-dim (F2LLM-v2-330M).
+        // Guarded by a marker table so re-opening an already-upgraded store is a no-op.
+        // Fresh stores get FLOAT[896] directly from 004_memory.sql above.
+        let already_v896: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master \
+                 WHERE type='table' AND name='schema_v896_note_embeddings'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .context("checking v896 note_embeddings marker")?
+            .is_some();
+        if !already_v896 {
+            let needs_upgrade: bool = self
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE type='table' AND name='note_embeddings'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .context("querying note_embeddings schema")?
+                .map(|sql| sql.contains("FLOAT[768]"))
+                .unwrap_or(false);
+            if needs_upgrade {
+                self.conn
+                    .execute_batch(
+                        "DROP TABLE IF EXISTS note_embeddings; \
+                         CREATE VIRTUAL TABLE note_embeddings USING vec0(\
+                             note_id INTEGER PRIMARY KEY, embedding FLOAT[896]\
+                         );",
+                    )
+                    .context("upgrading note_embeddings to 896-dim")?;
+                tracing::info!(
+                    "memory note_embeddings dim upgraded 768→896; \
+                     re-run `spelunk memory harvest` to rebuild embeddings"
+                );
+            }
+            self.conn
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS schema_v896_note_embeddings \
+                     (sentinel INTEGER PRIMARY KEY);",
+                )
+                .context("creating v896 note_embeddings marker")?;
+        }
         Ok(())
     }
 }
