@@ -50,13 +50,6 @@ struct Args {
     #[arg(long, env = "SPELUNK_EMBEDDING_URL")]
     embedding_url: Option<String>,
 
-    /// Number of ONNX intra-op threads used by the native embedder.
-    /// Lower values reduce CPU saturation during indexing; higher values increase
-    /// throughput. Defaults to 4, which leaves the system responsive on a laptop.
-    /// Only applies when the native embedder is active (no --embedding-url).
-    #[arg(long, env = "SPELUNK_EMBED_THREADS", default_value_t = 4)]
-    embed_threads: usize,
-
     /// Embedding model name to pass to the embedding server (e.g.
     /// `text-embedding-embeddinggemma-300m-qat`). Overrides `SPELUNK_EMBEDDING_MODEL`.
     #[arg(long, env = "SPELUNK_EMBEDDING_MODEL", default_value = "")]
@@ -144,7 +137,7 @@ async fn main() -> Result<()> {
         // No --embedding-url: try the bundled native embedder (embed-native feature).
         #[cfg(feature = "embed-native")]
         {
-            match embedder_native::NativeEmbedder::load(args.embed_threads) {
+            match embedder_native::NativeEmbedder::load() {
                 Ok(native) => {
                     tracing::info!(
                         "native embedding model loaded (dim={})",
