@@ -10,6 +10,7 @@
 //!   POST /v1/auth/device/token        — poll for the token (RFC 8628)
 //!   POST /v1/auth/device/select-org   — finish a multi-org device login
 //!   POST /v1/auth/token               — rotate / silently switch org
+//!   GET  /v1/me                       — current identity + org memberships
 
 use std::time::Duration;
 
@@ -47,11 +48,32 @@ pub struct DeviceCodeResponse {
 }
 
 /// A WorkOS organisation the operator can select from.
+///
+/// `id` is the **local org UUID** (not the WorkOS `org_...` id); it is the value
+/// to pass as `organization_id` / `org_id` to the auth endpoints.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Organization {
     pub id: String,
     pub name: String,
     pub slug: String,
+}
+
+/// One `orgs[]` entry from `GET /v1/me`.
+///
+/// `id` is the **local org UUID**. Extra fields (e.g. `role`) are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeOrg {
+    pub id: String,
+    #[allow(dead_code)]
+    pub name: String,
+    pub slug: String,
+}
+
+/// `GET /v1/me` response (only the membership list is consumed by the CLI).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeResponse {
+    #[serde(default)]
+    pub orgs: Vec<MeOrg>,
 }
 
 /// Successful token body shared by `/device/token`, `/device/select-org`, and
@@ -267,6 +289,34 @@ pub async fn refresh_token(
         .context("POST /v1/auth/token failed")?;
 
     token_or_error(resp, "refreshing token").await
+}
+
+/// `GET /v1/me` — fetch the caller's identity and org memberships.
+///
+/// Authenticated with the stored access token as a bearer. Used to resolve an
+/// org slug to its local org UUID before a silent switch.
+pub async fn fetch_me(
+    client: &reqwest::Client,
+    cloud_url: &str,
+    access_token: &str,
+) -> Result<MeResponse> {
+    let resp = client
+        .get(format!("{cloud_url}/v1/me"))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("GET /v1/me failed")?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return resp
+            .json::<MeResponse>()
+            .await
+            .context("parsing /v1/me response");
+    }
+
+    let body = resp.text().await.unwrap_or_default();
+    anyhow::bail!("GET /v1/me failed ({status}): {body}");
 }
 
 /// Parse a `TokenSuccess` from a 2xx response, mapping known error bodies
