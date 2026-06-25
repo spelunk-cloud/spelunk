@@ -364,6 +364,30 @@ mod tests {
         assert_eq!(tokens.access_token, "at-b");
     }
 
+    /// A `403 org_not_member` from select-org maps to the clear membership error
+    /// (not a raw status dump), so a multi-org login against a stale org choice
+    /// fails legibly.
+    #[tokio::test]
+    async fn select_org_403_maps_to_membership_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/device/select-org"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "org_not_member"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = auth_api::select_org(&client, &server.uri(), "pt-xyz", "org_b")
+            .await
+            .expect_err("select-org should fail for a non-member org");
+        assert!(
+            err.to_string().contains("not a member"),
+            "expected a clear membership error, got: {err}"
+        );
+    }
+
     /// The persisted `[auth]` table round-trips through Config::load and the
     /// access token becomes the effective server_key bearer.
     #[test]

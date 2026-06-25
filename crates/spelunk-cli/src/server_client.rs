@@ -700,6 +700,118 @@ mod tests {
         assert!(err.to_string().contains("/search") || err.to_string().contains("401"));
     }
 
+    /// Loop-safety guard: when the retry *after* a successful refresh also 401s,
+    /// the request is NOT refreshed/retried a second time. The retry surfaces the
+    /// 401 (one inference call, then exactly one refresh, then exactly one retry,
+    /// total two inference hits and one refresh) rather than spinning forever.
+    #[tokio::test]
+    async fn refresh_retry_caps_at_one_and_does_not_loop() {
+        let inference = MockServer::start().await;
+        let cloud = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // EVERY /search call returns 401 — both the original and the retry.
+        // `.expect(2)` is the loop guard: a third hit (i.e. a second retry)
+        // would make wiremock fail the test on drop.
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/search"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&inference)
+            .await;
+
+        // The refresh endpoint must be called EXACTLY once. A second refresh
+        // (the infinite-loop failure mode) would exceed this and fail the test.
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-new",
+                "refresh_token": "rt-new",
+                "expires_at": 5_000_000_000_i64,
+                "org_id": "org_1",
+            })))
+            .expect(1)
+            .mount(&cloud)
+            .await;
+
+        let token = expiring_tokens(5_000_000_000); // not locally expired
+        let client = ServerInferenceClient::for_test(
+            &inference.uri(),
+            "proj",
+            Some("at-old".to_string()),
+            Some((token, cloud.uri(), config_path)),
+        );
+
+        // The persistent 401 surfaces as an error, NOT a hang.
+        let err = client
+            .search_query("q", "semantic", 1)
+            .await
+            .expect_err("a persistent 401 after one refresh must surface an error");
+        assert!(
+            err.to_string().contains("/search") || err.to_string().contains("401"),
+            "error should reflect the failed /search, got: {err}"
+        );
+        // Mock `.expect(..)` assertions verify on drop: search hit twice, refresh once.
+    }
+
+    /// `from_config` carries refresh state ONLY when the bearer was resolved from
+    /// the `[auth]` access token — so a `spelunk login` session can refresh.
+    #[test]
+    #[serial_test::serial]
+    fn from_config_attaches_refresh_state_for_auth_token_bearer() {
+        unsafe {
+            std::env::remove_var("SPELUNK_SERVER_KEY");
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let tokens = AuthTokens {
+            access_token: "at-login".into(),
+            refresh_token: "rt-login".into(),
+            expires_at: 4_000_000_000,
+            org_id: "org_1".into(),
+        };
+        spelunk_core::config::save_auth_tokens_to(&tokens, &path).unwrap();
+
+        let mut cfg = crate::config::Config::load(Some(&path)).unwrap();
+        // from_config needs an inference URL to build a client at all.
+        cfg.inference_url = Some("http://127.0.0.1:7777".into());
+        let client = ServerInferenceClient::from_config(&cfg).expect("client builds");
+
+        let guard = client.auth.lock().unwrap();
+        assert!(
+            guard.refresh.is_some(),
+            "an [auth]-derived bearer must carry refresh state so it can rotate"
+        );
+        assert_eq!(guard.bearer.as_deref(), Some("at-login"));
+    }
+
+    /// A bare legacy `server_key` (no `[auth]` table) must NOT carry refresh
+    /// state — there is nothing to refresh, so a 401 surfaces immediately and we
+    /// never call `/v1/auth/token` with a non-existent refresh token. Guards the
+    /// "legacy bearer does not attempt refresh" contract at the config boundary.
+    #[test]
+    #[serial_test::serial]
+    fn from_config_no_refresh_state_for_legacy_server_key() {
+        unsafe {
+            std::env::remove_var("SPELUNK_SERVER_KEY");
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "server_key = \"sk-legacy\"\n").unwrap();
+
+        let mut cfg = crate::config::Config::load(Some(&path)).unwrap();
+        cfg.inference_url = Some("http://127.0.0.1:7777".into());
+        let client = ServerInferenceClient::from_config(&cfg).expect("client builds");
+
+        let guard = client.auth.lock().unwrap();
+        assert!(
+            guard.refresh.is_none(),
+            "a bare legacy server_key must not be treated as refreshable"
+        );
+        assert_eq!(guard.bearer.as_deref(), Some("sk-legacy"));
+    }
+
     /// `derive_local_fallback` produces `local/<blake3-hex>` slugs — the `/`
     /// must become `%2F` so the whole slug occupies one URL path segment
     /// (IMP-1 / spelunk decision #106).

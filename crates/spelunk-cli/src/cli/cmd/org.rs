@@ -359,5 +359,41 @@ mod tests {
                 "error should name the slug: {err}"
             );
         }
+
+        /// A slug that resolves to a UUID but is rejected by the token endpoint
+        /// with `403 org_not_member` surfaces the clear membership error — the
+        /// server is the authority on membership even after a local slug match.
+        #[tokio::test]
+        async fn token_403_org_not_member_maps_to_membership_error() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/v1/me"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "orgs": [
+                        { "id": BETA_UUID, "name": "Beta", "slug": "beta", "role": "admin" }
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/v1/auth/token"))
+                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": "org_not_member"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = reqwest::Client::new();
+            let err = switch_org(&client, &server.uri(), &auth(), "beta")
+                .await
+                .expect_err("a 403 org_not_member must error");
+            assert!(
+                err.to_string().contains("not a member"),
+                "expected a clear membership error, got: {err}"
+            );
+        }
     }
 }
