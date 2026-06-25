@@ -355,6 +355,66 @@ spelunk server stop
 
 ---
 
+## spelunk login
+
+Authenticate with spelunk.cloud using a browser-based device login. `spelunk
+login` prints a verification URL and a short user code; open the URL, enter the
+code, and approve the sign-in in your browser. On success, short-lived tokens
+are stored in your config and refreshed automatically in the background, so you
+do not need to log in again until the refresh token expires.
+
+```
+spelunk login [--org <slug>] [--cloud-url <url>]
+```
+
+| Flag | Notes |
+|------|-------|
+| `--org <slug>` | For accounts with more than one organization, select which one to log into without the interactive prompt. If you are already logged in, this re-scopes the current session to that org without a new device login. |
+| `--cloud-url <url>` | Override the cloud API URL (default `https://api.spelunk.cloud`; also settable via `SPELUNK_CLOUD_URL`). |
+
+```bash
+spelunk login
+spelunk login --org acme
+```
+
+Tokens are written to the `[auth]` table of `~/.config/spelunk/config.toml`
+(file mode `0600`). Existing setups that use a static `server_key` (or the
+`SPELUNK_SERVER_KEY` environment variable) keep working unchanged until you next
+run `spelunk login`; `SPELUNK_SERVER_KEY` continues to take precedence, which is
+handy for CI.
+
+---
+
+## spelunk org
+
+Manage the active organization for an authenticated session.
+
+```
+spelunk org switch <slug|uuid>
+```
+
+`spelunk org switch` re-scopes your session to another organization you belong
+to, reusing the stored credentials — no new device login is required. Accepts an
+org slug or its UUID.
+
+```bash
+spelunk org switch acme
+```
+
+---
+
+## spelunk logout
+
+Remove stored spelunk.cloud credentials from
+`~/.config/spelunk/config.toml`. Clears both the `[auth]` tokens written by
+`spelunk login` and any static `server_key`.
+
+```
+spelunk logout
+```
+
+---
+
 ## spelunk memory
 
 Store and query project context, decisions, and requirements. See
@@ -434,5 +494,7 @@ spelunk plumbing read-memory           # memory entries as JSONL
 | `AGENT=true` | Force JSON output for commands that support it |
 | `SPELUNK_NO_SERVER=1` | Never autostart or use a server (fully offline / no-server mode) |
 | `SPELUNK_SERVER_URL` | Point the CLI at a specific server URL |
+| `SPELUNK_CLOUD_URL` | Override the spelunk.cloud API URL used by `login` / `org` (default `https://api.spelunk.cloud`) |
+| `SPELUNK_SERVER_KEY` | Static credential for a team/self-hosted server; takes precedence over stored `login` tokens (useful in CI) |
 | `RUST_LOG=debug` | Enable verbose logging |
 | `EDITOR` / `VISUAL` | Editor opened by `spelunk memory add` when `--body` is omitted |

@@ -33,14 +33,21 @@ startup. Subsequent starts use the cached weights with no network access.
 
 ### Added
 
-- **`spelunk login` / `spelunk logout`** — authenticate the CLI against
-  spelunk.cloud using the OAuth 2.0 Device Authorization Grant (RFC 8628).
-  `spelunk login` initiates the flow, prints a verification URL and user code to
-  enter in the browser, polls for approval (with back-off on
-  `authorization_pending` / `slow_down`), and on success stores the issued
-  token as `server_key` in `~/.config/spelunk/config.toml`. `spelunk logout`
-  removes the stored credential. `--cloud-url` (or `SPELUNK_CLOUD_URL`)
-  overrides the default `https://api.spelunk.cloud` endpoint. (ADR-037 P3,
+- **`spelunk login` / `spelunk org switch` / `spelunk logout`** — browser-based
+  device login for spelunk.cloud with short-lived, auto-refreshing tokens.
+  `spelunk login` prints a verification URL and user code to enter in the
+  browser, polls for approval (with back-off on `authorization_pending` /
+  `slow_down`), and on success stores tokens in the `[auth]` table of
+  `~/.config/spelunk/config.toml` (mode `0600`). The tokens are refreshed
+  transparently in the background, so you stay logged in without re-running
+  `login`. For multi-org accounts, `--org <slug>` selects the organization
+  non-interactively; when you are already logged in, `--org` (or the new
+  `spelunk org switch <slug|uuid>`) re-scopes the session to another org you
+  belong to without a new device login. `spelunk logout` clears the stored
+  credentials. `--cloud-url` (or `SPELUNK_CLOUD_URL`) overrides the default
+  `https://api.spelunk.cloud` endpoint. Existing setups using a static
+  `server_key` / `SPELUNK_SERVER_KEY` keep working until the next `spelunk
+  login`, and `SPELUNK_SERVER_KEY` still takes precedence for CI. (ADR-045,
   #430)
 
 - **Two-way memory sync with spelunk.cloud (`spelunk sync` / `spelunk memory
@@ -61,14 +68,14 @@ startup. Subsequent starts use the cached weights with no network access.
 
 ### Changed
 
-- **`spelunk login` token is now actually used for auth.** The device-flow
-  token is written to the canonical `server_key` config field that every auth
-  path already reads, so a freshly logged-in CLI authenticates against the
-  cloud without further config. Previously the token was written to a separate
-  `api_key` field that no auth consumer read, leaving login effectively inert;
-  that field has been removed. `SPELUNK_SERVER_KEY` remains the environment
-  override for CI and headless use (no new env var was introduced). (#438,
-  spelunk#437)
+- **Cloud auth now uses short-lived, auto-refreshing tokens instead of a
+  non-expiring key.** `spelunk login` stores access/refresh tokens under the
+  `[auth]` table of the config; requests send the access token as a bearer
+  credential and the CLI refreshes it transparently on expiry, retrying the
+  original request once. Bearer precedence is `SPELUNK_SERVER_KEY` (env) > stored
+  `[auth]` access token > legacy bare `server_key`, so existing `server_key`
+  users keep working with no flag-day and `SPELUNK_SERVER_KEY` still overrides
+  for CI and headless use. (ADR-045, #438)
 
 - **Cloud project slug auto-resolves to its server UUID.** When a team
   `server_url` routes projects by an internal UUID, a human `project_id` slug is
