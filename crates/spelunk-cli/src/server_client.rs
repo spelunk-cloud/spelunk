@@ -7,6 +7,7 @@
 //! All prompt orchestration remains CLI-side; the server is a raw-inference peer.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -14,7 +15,9 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::cli::cmd::auth_api;
 use crate::config::Config;
+use spelunk_core::config::AuthTokens;
 
 /// Characters that must be percent-encoded inside a single URL **path segment**.
 ///
@@ -106,7 +109,29 @@ pub struct ServerInferenceClient {
     client: reqwest::Client,
     base_url: String,
     project_id: String,
-    api_key: Option<String>,
+    /// Current bearer token + refresh state. `RwLock`-free `Mutex` is fine:
+    /// contention is nil (refresh happens at most once per request) and the
+    /// critical section is a cheap clone / swap.
+    auth: Mutex<BearerState>,
+}
+
+/// Mutable bearer state shared across requests so a refreshed token is reused.
+struct BearerState {
+    /// The token sent as `Authorization: Bearer`. `None` in Tier-0 / unauthed.
+    bearer: Option<String>,
+    /// WorkOS refresh state, present only when `spelunk login` wrote `[auth]`
+    /// tokens. Enables the refresh-on-expiry / refresh-on-401 path; absent for
+    /// a bare `server_key` (which cannot be refreshed — the user must re-login).
+    refresh: Option<RefreshState>,
+}
+
+/// State needed to rotate an expired/rejected WorkOS access token.
+struct RefreshState {
+    tokens: AuthTokens,
+    cloud_url: String,
+    /// Where rotated tokens are persisted. `None` ⇒ the global config path
+    /// (`~/.config/spelunk/config.toml`); tests inject a temp path.
+    config_path: Option<std::path::PathBuf>,
 }
 
 impl ServerInferenceClient {
@@ -126,20 +151,155 @@ impl ServerInferenceClient {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("building HTTP client for server inference");
+
+        // Carry WorkOS refresh state only when the bearer comes from `[auth]`
+        // (i.e. `server_key` was resolved from the access token). A bare
+        // `server_key` / env token is not refreshable here.
+        let refresh = cfg
+            .auth
+            .as_ref()
+            .filter(|a| Some(a.access_token.as_str()) == cfg.server_key.as_deref())
+            .map(|tokens| RefreshState {
+                tokens: tokens.clone(),
+                cloud_url: auth_api::DEFAULT_CLOUD_URL.to_string(),
+                config_path: None,
+            });
+
         Some(Self {
             client,
             base_url,
             project_id,
-            api_key: cfg.server_key.clone(),
+            auth: Mutex::new(BearerState {
+                bearer: cfg.server_key.clone(),
+                refresh,
+            }),
         })
     }
 
+    /// Test-only constructor wiring an explicit base URL, bearer, and refresh
+    /// state (with a temp config path so persistence does not touch the real
+    /// `~/.config/spelunk/config.toml`).
+    #[cfg(test)]
+    fn for_test(
+        base_url: &str,
+        project_id: &str,
+        bearer: Option<String>,
+        refresh: Option<(AuthTokens, String, std::path::PathBuf)>,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            project_id: project_id.to_string(),
+            auth: Mutex::new(BearerState {
+                bearer,
+                refresh: refresh.map(|(tokens, cloud_url, config_path)| RefreshState {
+                    tokens,
+                    cloud_url,
+                    config_path: Some(config_path),
+                }),
+            }),
+        }
+    }
+
+    /// Current bearer token, if any.
+    fn current_bearer(&self) -> Option<String> {
+        self.auth
+            .lock()
+            .expect("auth mutex poisoned")
+            .bearer
+            .clone()
+    }
+
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(key) = &self.api_key {
+        if let Some(key) = self.current_bearer() {
             req.header("Authorization", format!("Bearer {key}"))
         } else {
             req
         }
+    }
+
+    /// Whether a stored WorkOS access token is at/past expiry (refresh state
+    /// present and expired).
+    fn access_token_expired(&self) -> bool {
+        let guard = self.auth.lock().expect("auth mutex poisoned");
+        guard
+            .refresh
+            .as_ref()
+            .is_some_and(|r| r.tokens.is_expired())
+    }
+
+    /// Rotate the WorkOS access token via `POST /v1/auth/token`, persist the
+    /// rotated tokens, and update the in-memory bearer.
+    ///
+    /// Returns `Ok(true)` when a refresh was performed, `Ok(false)` when there
+    /// is no refresh state (a bare `server_key` — nothing to refresh). Errors
+    /// carry a clear "re-run `spelunk login`" message.
+    async fn refresh_access_token(&self) -> Result<bool> {
+        let (refresh_token, cloud_url, config_path) = {
+            let guard = self.auth.lock().expect("auth mutex poisoned");
+            match &guard.refresh {
+                Some(r) => (
+                    r.tokens.refresh_token.clone(),
+                    r.cloud_url.clone(),
+                    r.config_path.clone(),
+                ),
+                None => return Ok(false),
+            }
+        };
+
+        let rotated = auth_api::refresh_token(&self.client, &cloud_url, &refresh_token, None)
+            .await
+            .map_err(|e| {
+                e.context("session expired and token refresh failed — re-run `spelunk login`")
+            })?;
+        let new_tokens = rotated.into_auth_tokens();
+
+        // Persist rotated tokens so the next process starts authenticated.
+        match &config_path {
+            Some(p) => spelunk_core::config::save_auth_tokens_to(&new_tokens, p),
+            None => spelunk_core::config::save_auth_tokens(&new_tokens),
+        }
+        .context("persisting refreshed auth tokens")?;
+
+        let mut guard = self.auth.lock().expect("auth mutex poisoned");
+        guard.bearer = Some(new_tokens.access_token.clone());
+        guard.refresh = Some(RefreshState {
+            tokens: new_tokens,
+            cloud_url,
+            config_path,
+        });
+        Ok(true)
+    }
+
+    /// Send a request with WorkOS token management:
+    ///   1. If the stored access token is locally expired, refresh first.
+    ///   2. Send the request (built fresh by `build` so it can be retried).
+    ///   3. On a `401`, refresh once and retry the request a single time.
+    ///
+    /// `build` is given the base (unauthed) `RequestBuilder` for the URL and
+    /// should attach the body; the bearer header is added here so each attempt
+    /// uses the current token. One refresh attempt only; on refresh failure the
+    /// original error / a clear re-login message is surfaced.
+    async fn send_authed(
+        &self,
+        make_req: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        // Proactive refresh: avoid a guaranteed-401 round-trip when we already
+        // know the token is past expiry.
+        if self.access_token_expired() {
+            self.refresh_access_token().await?;
+        }
+
+        let resp = self.authed(make_req()).send().await?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+
+        // Reactive refresh on 401, then retry exactly once.
+        if self.refresh_access_token().await? {
+            return Ok(self.authed(make_req()).send().await?);
+        }
+        Ok(resp)
     }
 
     fn llm_url(&self) -> String {
@@ -191,10 +351,9 @@ impl ServerInferenceClient {
             json_schema,
         };
 
+        let url = self.llm_url();
         let resp = self
-            .authed(self.client.post(self.llm_url()))
-            .json(&body)
-            .send()
+            .send_authed(|| self.client.post(&url).json(&body))
             .await
             .context("POST /llm/complete")?
             .error_for_status()
@@ -261,10 +420,9 @@ impl ServerInferenceClient {
         };
 
         // Response is raw little-endian f32 bytes (one vector, `dim` floats).
+        let url = self.embed_url();
         let bytes = self
-            .authed(self.client.post(self.embed_url()))
-            .json(&body)
-            .send()
+            .send_authed(|| self.client.post(&url).json(&body))
             .await
             .context("POST /index/embed (query vector)")?
             .error_for_status()
@@ -310,10 +468,10 @@ impl ServerInferenceClient {
             mode: String,
         }
 
+        let url = self.search_url();
+        let req_body = Req { query, limit, mode };
         let resp: Resp = self
-            .authed(self.client.post(self.search_url()))
-            .json(&Req { query, limit, mode })
-            .send()
+            .send_authed(|| self.client.post(&url).json(&req_body))
             .await
             .context("POST /search (query vector)")?
             .error_for_status()
@@ -397,6 +555,150 @@ pub fn harvest_requires_server(server_url: Option<&str>) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spelunk_core::config::AuthTokens;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn expiring_tokens(expires_at: i64) -> AuthTokens {
+        AuthTokens {
+            access_token: "at-old".to_string(),
+            refresh_token: "rt-old".to_string(),
+            expires_at,
+            org_id: "org_1".to_string(),
+        }
+    }
+
+    /// A 401 from the inference server triggers exactly one refresh + retry; the
+    /// rotated access token is used on the retry and persisted to disk.
+    #[tokio::test]
+    async fn refresh_on_401_retries_once_and_persists() {
+        let inference = MockServer::start().await;
+        let cloud = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // First /search call (with stale bearer) → 401.
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/search"))
+            .and(header("authorization", "Bearer at-old"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .mount(&inference)
+            .await;
+
+        // The refresh exchange rotates the tokens.
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token_type": "workos",
+                "access_token": "at-new",
+                "refresh_token": "rt-new",
+                "expires_at": 5_000_000_000_i64,
+                "org_id": "org_1",
+            })))
+            .expect(1)
+            .mount(&cloud)
+            .await;
+
+        // Retry (with the rotated bearer) → 200.
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/search"))
+            .and(header("authorization", "Bearer at-new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "query_vector": [0.1_f32, 0.2, 0.3],
+                "mode": "semantic",
+            })))
+            .expect(1)
+            .mount(&inference)
+            .await;
+
+        let token = expiring_tokens(5_000_000_000); // not locally expired
+        let client = ServerInferenceClient::for_test(
+            &inference.uri(),
+            "proj",
+            Some("at-old".to_string()),
+            Some((token, cloud.uri(), config_path.clone())),
+        );
+
+        let vec = client
+            .search_query("hello", "semantic", 5)
+            .await
+            .expect("search should succeed after one refresh+retry");
+        assert_eq!(vec, Some(vec![0.1_f32, 0.2, 0.3]));
+
+        // Rotated tokens were persisted to the injected config path.
+        let cfg = spelunk_core::config::Config::load(Some(&config_path)).unwrap();
+        assert_eq!(cfg.server_key.as_deref(), Some("at-new"));
+        assert_eq!(cfg.auth.unwrap().refresh_token, "rt-new");
+    }
+
+    /// A locally-expired access token is refreshed proactively before the first
+    /// send, so the stale token never reaches the server.
+    #[tokio::test]
+    async fn proactive_refresh_when_locally_expired() {
+        let inference = MockServer::start().await;
+        let cloud = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-fresh",
+                "refresh_token": "rt-fresh",
+                "expires_at": 5_000_000_000_i64,
+                "org_id": "org_1",
+            })))
+            .expect(1)
+            .mount(&cloud)
+            .await;
+
+        // Only the fresh bearer is ever accepted; the stale one must not appear.
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/search"))
+            .and(header("authorization", "Bearer at-fresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "query_vector": [1.0_f32],
+                "mode": "semantic",
+            })))
+            .expect(1)
+            .mount(&inference)
+            .await;
+
+        // expires_at = 0 ⇒ definitely past expiry.
+        let token = expiring_tokens(0);
+        let client = ServerInferenceClient::for_test(
+            &inference.uri(),
+            "proj",
+            Some("at-old".to_string()),
+            Some((token, cloud.uri(), config_path)),
+        );
+
+        let vec = client.search_query("q", "semantic", 1).await.unwrap();
+        assert_eq!(vec, Some(vec![1.0_f32]));
+    }
+
+    /// With no refresh state (bare `server_key`), a 401 is surfaced as-is — no
+    /// refresh attempt, no retry.
+    #[tokio::test]
+    async fn no_refresh_state_surfaces_401() {
+        let inference = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/search"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&inference)
+            .await;
+
+        let client = ServerInferenceClient::for_test(
+            &inference.uri(),
+            "proj",
+            Some("sk-legacy".to_string()),
+            None,
+        );
+        let err = client.search_query("q", "semantic", 1).await.unwrap_err();
+        assert!(err.to_string().contains("/search") || err.to_string().contains("401"));
+    }
 
     /// `derive_local_fallback` produces `local/<blake3-hex>` slugs — the `/`
     /// must become `%2F` so the whole slug occupies one URL path segment

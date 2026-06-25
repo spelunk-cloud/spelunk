@@ -1,32 +1,32 @@
-//! `spelunk login` — OAuth 2.0 Device Authorization Grant (RFC 8628).
+//! `spelunk login` — WorkOS device-authorization grant, cloud-api-proxied (ADR-045).
 //!
 //! Flow
 //! ----
-//! 1. POST /v1/auth/device → `{ device_code, user_code, verification_uri,
-//!    verification_uri_complete?, expires_in, interval }`
+//! 1. POST /v1/auth/device → device_code (opaque), user_code, verification_uri.
 //! 2. Print the verification URL and user code for the operator.
-//! 3. Poll POST /v1/auth/device/token every `interval` seconds until:
-//!    - 200 OK  →  parse { api_key }  →  save as `server_key`  →  print "Login successful."
-//!    - 400 authorization_pending  →  keep polling (show progress dot)
-//!    - 400 slow_down              →  increase interval by 5 s (RFC 8628 §3.5)
-//!    - 400 expired_token          →  exit 1 with timeout message
-//!    - 400 access_denied          →  exit 1
-//!    - 400 invalid_grant          →  exit 1 with error body
-//!    - 429                        →  double interval, retry
-//!    - network/parse error        →  retry up to 3 times then exit 1
+//! 3. Poll POST /v1/auth/device/token every `interval` seconds (RFC 8628):
+//!    - single-org success            → persist tokens, done
+//!    - organization_selection_required → pick via `--org` or prompt, then
+//!      POST /v1/auth/device/select-org → persist tokens
+//!    - authorization_pending          → keep polling
+//!    - slow_down                      → increase interval by 5 s
+//!    - expired_token / access_denied  → exit 1
+//!    - MFA / step-up challenge        → print "complete in browser", keep polling
+//!
+//! When the operator is already logged in with a valid refresh token and passes
+//! `--org <slug>`, login short-circuits to a silent org-switch (no device
+//! re-entry) via `org switch`.
 
 use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use serde::Deserialize;
 
-use spelunk_core::config;
+use spelunk_core::config::{self, AuthTokens};
 
-// ── Default cloud API base URL ────────────────────────────────────────────────
-
-const DEFAULT_CLOUD_URL: &str = "https://api.spelunk.cloud";
+use super::auth_api::{self, DEFAULT_CLOUD_URL, Organization, PollOutcome, TokenSuccess};
+use super::org::{persist_tokens, resolve_org_for_switch, switch_org};
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -35,30 +35,12 @@ pub struct LoginArgs {
     /// Override the spelunk cloud API URL (default: https://api.spelunk.cloud)
     #[arg(long, env = "SPELUNK_CLOUD_URL")]
     pub cloud_url: Option<String>,
-}
 
-// ── Wire types ────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct DeviceCodeResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    verification_uri_complete: Option<String>,
-    expires_in: u64,
-    interval: u64,
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    api_key: String,
-}
-
-#[derive(Deserialize)]
-struct ErrorResponse {
-    error: String,
-    #[serde(default)]
-    error_description: Option<String>,
+    /// Organization to log into (slug). For multi-org accounts this selects the
+    /// org non-interactively; when already logged in it silently re-scopes the
+    /// session without a new device login.
+    #[arg(long)]
+    pub org: Option<String>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -68,15 +50,24 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         .cloud_url
         .as_deref()
         .unwrap_or(DEFAULT_CLOUD_URL)
-        .trim_end_matches('/');
+        .trim_end_matches('/')
+        .to_string();
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("building HTTP client")?;
+    let client = auth_api::build_client()?;
+
+    // Already logged in with a valid refresh token + `--org`: silent re-scope.
+    if let Some(org_slug) = &args.org {
+        let cfg = config::Config::load(None).context("loading config")?;
+        if let Some(auth) = cfg.auth.as_ref() {
+            let tokens = switch_org(&client, &cloud_url, auth, org_slug).await?;
+            persist_tokens(&tokens)?;
+            println!("Switched to organization '{org_slug}'.");
+            return Ok(());
+        }
+    }
 
     // ── Step 1: initiate device authorization ─────────────────────────────────
-    let device = initiate_device(&client, cloud_url).await?;
+    let device = auth_api::initiate_device(&client, &cloud_url).await?;
 
     // ── Step 2: prompt the user ───────────────────────────────────────────────
     println!();
@@ -87,7 +78,6 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     println!("Enter the code: {}", device.user_code);
     println!();
 
-    // If the server provides a one-click URL, print it as a convenience.
     if let Some(ref complete_url) = device.verification_uri_complete
         && complete_url != &device.verification_uri
     {
@@ -103,43 +93,60 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     // ── Step 3: polling loop ──────────────────────────────────────────────────
     let mut interval_secs = device.interval.max(5);
     let mut consecutive_errors: u32 = 0;
+    let mut challenge_announced = false;
 
     loop {
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
 
-        let result = poll_token(&client, cloud_url, &device.device_code).await;
-
-        match result {
+        match auth_api::poll_token(&client, &cloud_url, &device.device_code).await {
             PollOutcome::Success(token) => {
-                // Write to config before printing the success message so that a
-                // write error surfaces before the user thinks they are logged in.
-                config::save_server_key(&token)
-                    .context("saving server_key to ~/.config/spelunk/config.toml")?;
-                println!("\nLogin successful.");
+                finish_login(token.into_auth_tokens())?;
+                return Ok(());
+            }
+            PollOutcome::SelectOrg {
+                pending_token,
+                organizations,
+            } => {
+                let token = complete_org_selection(
+                    &client,
+                    &cloud_url,
+                    &pending_token,
+                    &organizations,
+                    args.org.as_deref(),
+                )
+                .await?;
+                finish_login(token.into_auth_tokens())?;
                 return Ok(());
             }
             PollOutcome::Pending => {
-                // Print a progress dot without a newline so the user sees activity.
                 print!(".");
                 let _ = std::io::stdout().flush();
                 consecutive_errors = 0;
             }
             PollOutcome::SlowDown => {
-                // RFC 8628 §3.5: increase interval by 5 s on slow_down.
                 interval_secs += 5;
                 consecutive_errors = 0;
             }
             PollOutcome::RateLimit => {
-                // 429: double the interval as a back-off.
                 interval_secs *= 2;
+                consecutive_errors = 0;
+            }
+            PollOutcome::Challenge(url) => {
+                if !challenge_announced {
+                    match url {
+                        Some(u) => eprintln!(
+                            "\nAdditional verification required — complete it in your browser:\n  {u}"
+                        ),
+                        None => eprintln!(
+                            "\nAdditional verification required — complete it in your browser."
+                        ),
+                    }
+                    challenge_announced = true;
+                }
                 consecutive_errors = 0;
             }
             PollOutcome::Expired => {
                 eprintln!("\nLogin timed out. Run `spelunk login` again.");
-                eprintln!(
-                    "Hint: your account may not be part of an organization yet — \
-                     contact your admin."
-                );
                 std::process::exit(1);
             }
             PollOutcome::Denied => {
@@ -161,119 +168,48 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     }
 }
 
-// ── Step 1: device authorization initiation ───────────────────────────────────
+/// Persist tokens and print the success message.
+fn finish_login(tokens: AuthTokens) -> Result<()> {
+    // Write before printing so a write error surfaces before the user believes
+    // they are logged in.
+    persist_tokens(&tokens)?;
+    println!("\nLogin successful.");
+    Ok(())
+}
 
-/// `POST /v1/auth/device` to start the device-authorization grant.
-///
-/// The request **must** carry a JSON body so reqwest sets `Content-Length` +
-/// `Content-Type`: a bodyless POST is rejected with `411 Length Required` by
-/// Google Front End (Cloud Run's fronting proxy) before it ever reaches
-/// cloud-api. The server treats the body — and `client_hint` within it — as
-/// optional, but uses the hint to label the approval page and name the issued
-/// key, so we send the machine hostname when we can resolve it.
-async fn initiate_device(client: &reqwest::Client, cloud_url: &str) -> Result<DeviceCodeResponse> {
-    let resp = client
-        .post(format!("{cloud_url}/v1/auth/device"))
-        .json(&device_init_body())
-        .send()
-        .await
-        .context("POST /v1/auth/device failed")?;
+/// Resolve a multi-org device login: honour `--org <slug>` when given, otherwise
+/// prompt the operator to pick from `organizations`, then call select-org.
+async fn complete_org_selection(
+    client: &reqwest::Client,
+    cloud_url: &str,
+    pending_token: &str,
+    organizations: &[Organization],
+    org_flag: Option<&str>,
+) -> Result<TokenSuccess> {
+    let org = resolve_org_for_switch(organizations, org_flag, prompt_org_choice)?;
+    auth_api::select_org(client, cloud_url, pending_token, &org.id).await
+}
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Device authorization request failed ({status}): {body}");
+/// Interactively prompt the operator to choose an organisation by number.
+fn prompt_org_choice(organizations: &[Organization]) -> Result<Organization> {
+    println!("\nYou belong to multiple organizations. Choose one:");
+    for (i, org) in organizations.iter().enumerate() {
+        println!("  {}) {} ({})", i + 1, org.name, org.slug);
     }
+    loop {
+        print!("Enter a number (1-{}): ", organizations.len());
+        std::io::stdout().flush().ok();
 
-    resp.json()
-        .await
-        .context("parsing device authorization response")
-}
-
-/// Build the JSON body for `POST /v1/auth/device` (see [`initiate_device`]).
-///
-/// When the machine hostname resolves it is passed as `client_hint`; otherwise
-/// an empty object is sent, which the server accepts. Either way a non-empty
-/// body is produced so the fronting proxy does not reject the request with
-/// `411`.
-fn device_init_body() -> serde_json::Value {
-    match gethostname::gethostname().into_string() {
-        Ok(host) if !host.trim().is_empty() => serde_json::json!({ "client_hint": host }),
-        _ => serde_json::json!({}),
-    }
-}
-
-// ── Poll outcome ──────────────────────────────────────────────────────────────
-
-enum PollOutcome {
-    /// Token issued — contains the api_key.
-    Success(String),
-    /// User has not yet approved.
-    Pending,
-    /// Server requests slower polling (RFC 8628 §3.5).
-    SlowDown,
-    /// HTTP 429 — back off.
-    RateLimit,
-    /// Device code expired.
-    Expired,
-    /// User explicitly denied.
-    Denied,
-    /// invalid_grant (e.g. code already used or revoked).
-    InvalidGrant(String),
-    /// Transient network / parse error.
-    Error(anyhow::Error),
-}
-
-async fn poll_token(client: &reqwest::Client, cloud_url: &str, device_code: &str) -> PollOutcome {
-    let body = serde_json::json!({ "device_code": device_code });
-
-    let resp = match client
-        .post(format!("{cloud_url}/v1/auth/device/token"))
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return PollOutcome::Error(anyhow::anyhow!(e).context("network error")),
-    };
-
-    let status = resp.status();
-
-    if status.is_success() {
-        match resp.json::<TokenResponse>().await {
-            Ok(t) => return PollOutcome::Success(t.api_key),
-            Err(e) => {
-                return PollOutcome::Error(anyhow::anyhow!(e).context("parsing token response"));
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading organisation choice")?;
+        match line.trim().parse::<usize>() {
+            Ok(n) if n >= 1 && n <= organizations.len() => {
+                return Ok(organizations[n - 1].clone());
             }
+            _ => eprintln!("Invalid choice; try again."),
         }
-    }
-
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return PollOutcome::RateLimit;
-    }
-
-    // Parse the error body.
-    let err: ErrorResponse = match resp.json().await {
-        Ok(e) => e,
-        Err(e) => {
-            return PollOutcome::Error(anyhow::anyhow!(e).context("parsing error response"));
-        }
-    };
-
-    match err.error.as_str() {
-        "authorization_pending" => PollOutcome::Pending,
-        "slow_down" => PollOutcome::SlowDown,
-        "expired_token" => PollOutcome::Expired,
-        "access_denied" => PollOutcome::Denied,
-        "invalid_grant" => {
-            let msg = err
-                .error_description
-                .unwrap_or_else(|| "invalid_grant".to_string());
-            PollOutcome::InvalidGrant(msg)
-        }
-        other => PollOutcome::Error(anyhow::anyhow!(
-            "unexpected error from token endpoint: {other}"
-        )),
     }
 }
 
@@ -281,13 +217,13 @@ async fn poll_token(client: &reqwest::Client, cloud_url: &str, device_code: &str
 
 #[cfg(test)]
 mod tests {
+    use spelunk_core::config::{self, AuthTokens};
     use tempfile::TempDir;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
-    use spelunk_core::config;
+    use crate::cli::cmd::auth_api;
 
-    /// Matches a request whose body is non-empty (i.e. carries Content-Length).
     struct NonEmptyBody;
     impl Match for NonEmptyBody {
         fn matches(&self, request: &Request) -> bool {
@@ -295,23 +231,8 @@ mod tests {
         }
     }
 
-    /// The device-init body is always a JSON object, so the request carries a
-    /// Content-Length — guarding against the `411 Length Required` regression
-    /// (GH #434) where a bodyless POST was rejected by Google Front End.
-    #[test]
-    fn device_init_body_is_non_empty_object() {
-        let body = super::device_init_body();
-        assert!(body.is_object(), "body must be a JSON object");
-        let serialized = serde_json::to_string(&body).unwrap();
-        assert!(
-            serialized.len() >= 2,
-            "body must serialise to a non-empty payload, got {serialized:?}"
-        );
-    }
-
-    /// `initiate_device` sends a non-empty JSON body with a Content-Type so the
-    /// fronting proxy accepts the request. If the request were bodyless (the
-    /// #434 bug) the mock would not match and this call would fail.
+    /// `initiate_device` sends a non-empty JSON body so the fronting proxy does
+    /// not reject the request with 411 (GH #434).
     #[tokio::test]
     async fn initiate_device_sends_body() {
         let server = MockServer::start().await;
@@ -333,86 +254,136 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let device = super::initiate_device(&client, &server.uri())
+        let device = auth_api::initiate_device(&client, &server.uri())
             .await
             .expect("device init should succeed when a body is sent");
-
         assert_eq!(device.device_code, "dc-123");
         assert_eq!(device.user_code, "ABCD-EFGH");
     }
 
-    /// save_server_key_to creates the file and writes the key.
-    #[test]
-    fn save_server_key_creates_file() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        config::save_server_key_to("sk-sp-test", &path).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("server_key"), "should contain server_key");
-        assert!(
-            contents.contains("sk-sp-test"),
-            "should contain the key value"
-        );
+    /// A single-org poll success is parsed into the persisted token shape.
+    #[tokio::test]
+    async fn poll_token_single_org_success_persists_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/device/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token_type": "workos",
+                "access_token": "at-1",
+                "refresh_token": "rt-1",
+                "expires_at": 4_000_000_000_i64,
+                "org_id": "org_solo",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        match auth_api::poll_token(&client, &server.uri(), "dc-1").await {
+            auth_api::PollOutcome::Success(t) => {
+                let auth = t.into_auth_tokens();
+                assert_eq!(auth.access_token, "at-1");
+                assert_eq!(auth.refresh_token, "rt-1");
+                assert_eq!(auth.expires_at, 4_000_000_000_i64);
+                assert_eq!(auth.org_id, "org_solo");
+            }
+            _ => panic!("expected single-org success"),
+        }
     }
 
-    /// save_server_key_to preserves existing keys.
-    #[test]
-    fn save_server_key_preserves_other_keys() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "server_url = \"http://localhost:7777\"\n").unwrap();
-        config::save_server_key_to("sk-sp-test", &path).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            contents.contains("server_url"),
-            "should still contain server_url"
-        );
-        assert!(
-            contents.contains("sk-sp-test"),
-            "should contain the new key"
-        );
+    /// `authorization_pending` maps to Pending so the loop keeps polling.
+    #[tokio::test]
+    async fn poll_token_pending_maps_to_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/device/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "authorization_pending"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        assert!(matches!(
+            auth_api::poll_token(&client, &server.uri(), "dc-1").await,
+            auth_api::PollOutcome::Pending
+        ));
     }
 
-    /// save_server_key_to replaces an existing server_key entry.
-    #[test]
-    fn save_server_key_replaces_existing() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "server_key = \"sk-sp-old\"\n").unwrap();
-        config::save_server_key_to("sk-sp-new", &path).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(!contents.contains("sk-sp-old"), "old key should be gone");
-        assert!(contents.contains("sk-sp-new"), "new key should be present");
+    /// A multi-org poll carries the pending_token + organizations list.
+    #[tokio::test]
+    async fn poll_token_multi_org_returns_select_org() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/device/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "organization_selection_required",
+                "pending_token": "pt-xyz",
+                "organizations": [
+                    { "id": "org_a", "name": "Acme", "slug": "acme" },
+                    { "id": "org_b", "name": "Beta", "slug": "beta" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        match auth_api::poll_token(&client, &server.uri(), "dc-1").await {
+            auth_api::PollOutcome::SelectOrg {
+                pending_token,
+                organizations,
+            } => {
+                assert_eq!(pending_token, "pt-xyz");
+                assert_eq!(organizations.len(), 2);
+                assert_eq!(organizations[1].slug, "beta");
+            }
+            _ => panic!("expected SelectOrg"),
+        }
     }
 
-    /// remove_server_key_from removes the server_key line.
-    #[test]
-    fn remove_server_key_removes_line() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "server_url = \"http://localhost:7777\"\nserver_key = \"sk-sp-test\"\n",
-        )
-        .unwrap();
-        config::remove_server_key_from(&path).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !contents.contains("server_key"),
-            "server_key should be removed"
-        );
-        assert!(
-            contents.contains("server_url"),
-            "server_url should still be present"
-        );
+    /// select-org exchanges the pending token + org id for real tokens.
+    #[tokio::test]
+    async fn select_org_returns_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/device/select-org"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token_type": "workos",
+                "access_token": "at-b",
+                "refresh_token": "rt-b",
+                "expires_at": 4_000_000_001_i64,
+                "org_id": "org_b",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let tokens = auth_api::select_org(&client, &server.uri(), "pt-xyz", "org_b")
+            .await
+            .expect("select-org should succeed");
+        assert_eq!(tokens.org_id, "org_b");
+        assert_eq!(tokens.access_token, "at-b");
     }
 
-    /// remove_server_key_from is a no-op when the file does not exist.
+    /// The persisted `[auth]` table round-trips through Config::load and the
+    /// access token becomes the effective server_key bearer.
     #[test]
-    fn remove_server_key_no_op_when_file_missing() {
+    #[serial_test::serial]
+    fn persisted_auth_tokens_resolve_to_server_key() {
+        unsafe {
+            std::env::remove_var("SPELUNK_SERVER_KEY");
+        }
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        // Must not error even when file is absent.
-        config::remove_server_key_from(&path).unwrap();
+        let tokens = AuthTokens {
+            access_token: "at-persist".into(),
+            refresh_token: "rt-persist".into(),
+            expires_at: 4_000_000_000,
+            org_id: "org_x".into(),
+        };
+        config::save_auth_tokens_to(&tokens, &path).unwrap();
+
+        let cfg = config::Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.server_key.as_deref(), Some("at-persist"));
+        assert_eq!(cfg.auth.as_ref().unwrap().refresh_token, "rt-persist");
     }
 }

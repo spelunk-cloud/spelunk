@@ -337,6 +337,52 @@ pub struct Config {
     /// primary SQLite write is unaffected.
     #[serde(default = "Config::default_store_in_git_notes")]
     pub store_in_git_notes: bool,
+
+    /// WorkOS device-flow tokens persisted by `spelunk login`, stored under the
+    /// `[auth]` table in the global config.
+    ///
+    /// When present and the access token is unexpired, it is the source of the
+    /// `Authorization: Bearer` token every cloud request sends — [`Config::load`]
+    /// copies the access token into [`Config::server_key`] so existing call
+    /// sites keep working unchanged. The `refresh_token` is used to rotate an
+    /// expired access token and to silently switch organisations. Read the
+    /// effective bearer through [`Config::server_key`]; reach for the refresh
+    /// token via this field only in the token-refresh path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthTokens>,
+}
+
+/// WorkOS tokens persisted under the `[auth]` table of the global config.
+///
+/// Written by `spelunk login` / `spelunk org switch`; rotated by the token
+/// refresh path. The file is written `0600` (see [`save_auth_tokens_to`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthTokens {
+    /// Short-lived WorkOS access token, sent as `Authorization: Bearer`.
+    pub access_token: String,
+    /// Long-lived rotating refresh token. Exchanged at `/v1/auth/token` to
+    /// rotate the access token or switch organisation.
+    pub refresh_token: String,
+    /// Absolute expiry of `access_token`, as a Unix timestamp (seconds).
+    pub expires_at: i64,
+    /// WorkOS organisation the tokens are scoped to.
+    pub org_id: String,
+}
+
+impl AuthTokens {
+    /// Whether the access token is at or past its expiry, with a small skew
+    /// margin so a token that is about to expire is refreshed pre-emptively
+    /// rather than failing mid-request.
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(chrono::Utc::now().timestamp())
+    }
+
+    /// Expiry check against an explicit `now` (Unix seconds) — testable form of
+    /// [`AuthTokens::is_expired`]. Treats the token as expired 30 s early.
+    pub fn is_expired_at(&self, now: i64) -> bool {
+        const SKEW_SECS: i64 = 30;
+        now >= self.expires_at - SKEW_SECS
+    }
 }
 
 impl Config {
@@ -387,6 +433,7 @@ impl Default for Config {
             specs_dir: Self::default_specs_dir(),
             llm_context_length: Self::default_llm_context_length(),
             store_in_git_notes: Self::default_store_in_git_notes(),
+            auth: None,
         }
     }
 }
@@ -434,6 +481,12 @@ impl Config {
             }
         }
 
+        // Legacy bare `server_key` after the global + project-level merges but
+        // before env / `[auth]` resolution. Used as the lowest-precedence
+        // fallback so pre-WorkOS users (and team `.spelunk/config.toml` keys)
+        // keep working until they re-run `spelunk login`.
+        let legacy_server_key = cfg.server_key.clone();
+
         // ── 3. Environment variable overrides ────────────────────────────────
         if let Ok(v) = std::env::var("SPELUNK_SERVER_URL") {
             cfg.server_url = Some(v);
@@ -443,8 +496,9 @@ impl Config {
             );
             cfg.server_url = Some(v);
         }
-        if let Ok(v) = std::env::var("SPELUNK_SERVER_KEY") {
-            cfg.server_key = Some(v);
+        let env_server_key = std::env::var("SPELUNK_SERVER_KEY").ok();
+        if let Some(v) = &env_server_key {
+            cfg.server_key = Some(v.clone());
         }
         if let Ok(v) = std::env::var("SPELUNK_PROJECT_ID") {
             cfg.project_id = Some(v);
@@ -461,6 +515,23 @@ impl Config {
                 )
             })?;
             cfg.mode = Some(parsed);
+        }
+
+        // ── 4. Resolve the effective Bearer token (ADR-045) ──────────────────
+        // Precedence for `Authorization: Bearer`:
+        //   1. `SPELUNK_SERVER_KEY` env var (CI / explicit override) — wins.
+        //   2. `[auth].access_token` from `spelunk login` (WorkOS device flow).
+        //   3. Legacy bare `server_key` (pre-WorkOS users keep working until
+        //      they re-run `spelunk login`).
+        // The `[auth]` tokens are kept in `cfg.auth` so the refresh-on-expiry /
+        // org-switch paths can reach the refresh token; every other call site
+        // only ever reads the resolved `cfg.server_key`.
+        if env_server_key.is_none() {
+            if let Some(auth) = &cfg.auth {
+                cfg.server_key = Some(auth.access_token.clone());
+            } else {
+                cfg.server_key = legacy_server_key;
+            }
         }
 
         Ok(cfg)
@@ -599,6 +670,91 @@ pub fn remove_server_key_from(config_path: &Path) -> Result<()> {
 
     std::fs::write(config_path, updated)
         .with_context(|| format!("writing {}", config_path.display()))?;
+    Ok(())
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// `[auth]` table persistence (WorkOS device-flow tokens, ADR-045)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Persist WorkOS tokens to the `[auth]` table of `~/.config/spelunk/config.toml`.
+///
+/// Replaces any existing `[auth]` table; all other top-level keys and tables
+/// are preserved. The file is written with `0600` permissions so the refresh
+/// token is not world-readable.
+pub fn save_auth_tokens(tokens: &AuthTokens) -> Result<()> {
+    save_auth_tokens_to(tokens, &spelunk_config_dir().join("config.toml"))
+}
+
+/// Same as [`save_auth_tokens`] but writes to an explicit path (useful in tests).
+pub fn save_auth_tokens_to(tokens: &AuthTokens, config_path: &Path) -> Result<()> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+
+    let mut doc = read_config_table(config_path)?;
+    let auth_value = toml::Value::try_from(tokens).context("serialising auth tokens")?;
+    doc.insert("auth".to_string(), auth_value);
+
+    let serialised = toml::to_string_pretty(&doc).context("serialising config.toml")?;
+    write_config_secure(config_path, &serialised)
+}
+
+/// Remove the `[auth]` table from `~/.config/spelunk/config.toml`.
+///
+/// What `spelunk logout` clears (alongside the legacy `server_key`). No-op if
+/// the file or the table is absent. Other keys are preserved.
+pub fn remove_auth_tokens() -> Result<()> {
+    remove_auth_tokens_from(&spelunk_config_dir().join("config.toml"))
+}
+
+/// Same as [`remove_auth_tokens`] but operates on an explicit path (tests).
+pub fn remove_auth_tokens_from(config_path: &Path) -> Result<()> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let mut doc = read_config_table(config_path)?;
+    if doc.remove("auth").is_none() {
+        return Ok(());
+    }
+    let serialised = toml::to_string_pretty(&doc).context("serialising config.toml")?;
+    write_config_secure(config_path, &serialised)
+}
+
+/// Parse the config file into a `toml::Table`, returning an empty table when the
+/// file does not exist.
+fn read_config_table(config_path: &Path) -> Result<toml::Table> {
+    if !config_path.exists() {
+        return Ok(toml::Table::new());
+    }
+    let raw = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    raw.parse::<toml::Table>()
+        .with_context(|| format!("parsing {}", config_path.display()))
+}
+
+/// Write `contents` to `config_path` and tighten permissions to `0600` on Unix
+/// so secrets in the file are owner-only.
+fn write_config_secure(config_path: &Path, contents: &str) -> Result<()> {
+    std::fs::write(config_path, contents)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    set_owner_only_permissions(config_path)?;
+    Ok(())
+}
+
+/// Set `0600` permissions on Unix; a no-op on other platforms.
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, perms)
+        .with_context(|| format!("setting 0600 permissions on {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1289,6 +1445,144 @@ project_id = "team/proj"
         if let Some(d) = original_cwd {
             std::env::set_current_dir(d).unwrap();
         }
+    }
+
+    // ── [auth] WorkOS tokens (ADR-045) ───────────────────────────────────────
+
+    fn sample_tokens() -> AuthTokens {
+        AuthTokens {
+            access_token: "at-sample".to_string(),
+            refresh_token: "rt-sample".to_string(),
+            expires_at: 4_000_000_000,
+            org_id: "org_sample".to_string(),
+        }
+    }
+
+    /// Persisted `[auth]` tokens round-trip and the access token becomes the
+    /// effective `server_key` bearer.
+    #[test]
+    #[serial_test::serial]
+    fn auth_tokens_resolve_to_server_key_bearer() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        save_auth_tokens_to(&sample_tokens(), &path).unwrap();
+
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.server_key.as_deref(), Some("at-sample"));
+        let auth = cfg.auth.expect("auth table should load");
+        assert_eq!(auth.refresh_token, "rt-sample");
+        assert_eq!(auth.org_id, "org_sample");
+    }
+
+    /// `SPELUNK_SERVER_KEY` (CI) overrides the `[auth]` access token.
+    #[test]
+    #[serial_test::serial]
+    fn env_server_key_wins_over_auth_tokens() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        save_auth_tokens_to(&sample_tokens(), &path).unwrap();
+
+        unsafe { std::env::set_var("SPELUNK_SERVER_KEY", "ci-token") };
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.server_key.as_deref(), Some("ci-token"));
+        // The refresh token is still available for the refresh path.
+        assert_eq!(cfg.auth.unwrap().refresh_token, "rt-sample");
+        unsafe { std::env::remove_var("SPELUNK_SERVER_KEY") };
+    }
+
+    /// A legacy bare `server_key` keeps working when no `[auth]` table exists.
+    #[test]
+    #[serial_test::serial]
+    fn legacy_server_key_used_when_no_auth_table() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "server_key = \"sk-legacy\"\n").unwrap();
+
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.server_key.as_deref(), Some("sk-legacy"));
+        assert!(cfg.auth.is_none());
+    }
+
+    /// `[auth]` access token takes precedence over a legacy bare `server_key`
+    /// present in the same file.
+    #[test]
+    #[serial_test::serial]
+    fn auth_token_precedence_over_legacy_server_key() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "server_key = \"sk-legacy\"\n").unwrap();
+        save_auth_tokens_to(&sample_tokens(), &path).unwrap();
+
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.server_key.as_deref(), Some("at-sample"));
+    }
+
+    /// Writing auth tokens preserves other top-level keys (e.g. `server_url`).
+    #[test]
+    #[serial_test::serial]
+    fn save_auth_tokens_preserves_other_keys() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "server_url = \"http://team.example:7777\"\n").unwrap();
+        save_auth_tokens_to(&sample_tokens(), &path).unwrap();
+
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.server_url.as_deref(), Some("http://team.example:7777"));
+        assert_eq!(cfg.auth.unwrap().access_token, "at-sample");
+    }
+
+    /// `remove_auth_tokens_from` clears the `[auth]` table but leaves the legacy
+    /// `server_key` (logout clears that separately).
+    #[test]
+    #[serial_test::serial]
+    fn remove_auth_tokens_clears_only_auth_table() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "server_key = \"sk-legacy\"\n").unwrap();
+        save_auth_tokens_to(&sample_tokens(), &path).unwrap();
+
+        remove_auth_tokens_from(&path).unwrap();
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert!(cfg.auth.is_none());
+        // Legacy key still present and now resolves as the bearer fallback.
+        assert_eq!(cfg.server_key.as_deref(), Some("sk-legacy"));
+    }
+
+    /// `remove_auth_tokens_from` is a no-op when the file is missing.
+    #[test]
+    fn remove_auth_tokens_no_op_when_file_missing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        remove_auth_tokens_from(&path).unwrap();
+    }
+
+    /// On Unix, the config file is written `0600` after persisting tokens.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn save_auth_tokens_sets_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        save_auth_tokens_to(&sample_tokens(), &path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "config must be owner-only after save");
+    }
+
+    /// Expiry uses a 30 s skew margin.
+    #[test]
+    fn auth_tokens_expiry_with_skew() {
+        let t = sample_tokens(); // expires_at = 4_000_000_000
+        assert!(!t.is_expired_at(4_000_000_000 - 31));
+        assert!(t.is_expired_at(4_000_000_000 - 30));
+        assert!(t.is_expired_at(4_000_000_000 + 100));
     }
 
     #[test]
