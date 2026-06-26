@@ -35,20 +35,20 @@ startup. Subsequent starts use the cached weights with no network access.
 
 - **`spelunk login` / `spelunk org switch` / `spelunk logout`** — browser-based
   device login for spelunk.cloud with short-lived, auto-refreshing tokens.
-  `spelunk login` prints a verification URL and user code to enter in the
-  browser, polls for approval (with back-off on `authorization_pending` /
-  `slow_down`), and on success stores tokens in the `[auth]` table of
-  `~/.config/spelunk/config.toml` (mode `0600`). The tokens are refreshed
-  transparently in the background, so you stay logged in without re-running
-  `login`. For multi-org accounts, `--org <slug>` selects the organization
-  non-interactively; when you are already logged in, `--org` (or the new
-  `spelunk org switch <slug|uuid>`) re-scopes the session to another org you
-  belong to without a new device login. `spelunk logout` clears the stored
-  credentials. `--cloud-url` (or `SPELUNK_CLOUD_URL`) overrides the default
-  `https://api.spelunk.cloud` endpoint. Existing setups using a static
-  `server_key` / `SPELUNK_SERVER_KEY` keep working until the next `spelunk
-  login`, and `SPELUNK_SERVER_KEY` still takes precedence for CI. (ADR-045,
-  #430)
+  `spelunk login` prints a verification URL and a short user code; open the URL
+  in a browser, enter the code, and approve the sign-in. Multi-org accounts
+  select their organization on the browser-hosted approval page. On success,
+  tokens are stored in the `[auth]` table of
+  `~/.config/spelunk/config.toml` (mode `0600`). Polls for approval with
+  back-off on `authorization_pending` / `slow_down`. The tokens are refreshed
+  transparently on expiry, so you stay logged in without re-running `login`.
+  `spelunk login --org <slug>` logs in and then re-scopes to the named org.
+  `spelunk org switch <slug|uuid>` re-scopes an existing session without a new
+  device login. `spelunk logout` clears the stored credentials. `--cloud-url`
+  (or `SPELUNK_CLOUD_URL`) overrides the default `https://api.spelunk.cloud`
+  endpoint. Existing setups using a static `server_key` / `SPELUNK_SERVER_KEY`
+  keep working until the next `spelunk login`, and `SPELUNK_SERVER_KEY` still
+  takes precedence for CI.
 
 - **Two-way memory sync with spelunk.cloud (`spelunk sync` / `spelunk memory
   sync`).** When a team server is configured, `spelunk sync` (top-level alias
@@ -75,7 +75,7 @@ startup. Subsequent starts use the cached weights with no network access.
   original request once. Bearer precedence is `SPELUNK_SERVER_KEY` (env) > stored
   `[auth]` access token > legacy bare `server_key`, so existing `server_key`
   users keep working with no flag-day and `SPELUNK_SERVER_KEY` still overrides
-  for CI and headless use. (ADR-045, #438)
+  for CI and headless use.
 
 - **Cloud project slug auto-resolves to its server UUID.** When a team
   `server_url` routes projects by an internal UUID, a human `project_id` slug is
@@ -85,17 +85,6 @@ startup. Subsequent starts use the cached weights with no network access.
   automatically if the slug changes, and `SPELUNK_NO_SLUG_CACHE=1` forces a fresh
   lookup. This makes the human-readable `project_id` work transparently against
   cloud-api routing. (ADR-005, #428)
-
-### Fixed
-
-- **`spelunk login` no longer fails with `411 Length Required` on Cloud Run /
-  GFE-fronted hosts.** The device-init request (`POST /v1/auth/device`) was a
-  bodyless POST, so no `Content-Length` header was set and Google Front End
-  (Cloud Run's fronting proxy) rejected it before it reached cloud-api,
-  breaking login on its very first request against prod. The request now sends
-  a JSON body, so `Content-Length` and `Content-Type` are set; the body also
-  carries the machine hostname as `client_hint` (falling back to an empty
-  object when the hostname cannot be resolved). (#436, GH #434)
 
 ### Dependencies
 

@@ -369,7 +369,7 @@ spelunk login [--org <slug>] [--cloud-url <url>]
 
 | Flag | Notes |
 |------|-------|
-| `--org <slug>` | For accounts with more than one organization, select which one to log into without the interactive prompt. If you are already logged in, this re-scopes the current session to that org without a new device login. |
+| `--org <slug>` | After the device login yields a token, silently re-scope the session to this org (login-then-switch). If you are already logged in with a stored refresh token, re-scopes without a new device login. Multi-org accounts choose their org on the browser-hosted approval page during the device flow itself. |
 | `--cloud-url <url>` | Override the cloud API URL (default `https://api.spelunk.cloud`; also settable via `SPELUNK_CLOUD_URL`). |
 
 ```bash
