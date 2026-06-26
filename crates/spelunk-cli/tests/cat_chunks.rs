@@ -65,6 +65,29 @@ fn cat_chunks_output_includes_function_name() {
     );
 }
 
+// Indexed paths are stored with forward slashes; a backslash-style query path
+// (as a Windows user might type) must still match. Runs on all OSes — the
+// normalization converts `\` to `/` regardless of host.
+#[test]
+fn cat_chunks_matches_backslash_query_path() {
+    let (_tmp, db_path, config_path) = index_fixture_project();
+
+    let output = spelunk_cmd(&db_path, &config_path)
+        .arg("cat-chunks")
+        .arg("src\\lib.rs")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows = parse_jsonl(&output);
+    assert!(
+        !rows.is_empty(),
+        "expected chunks for a backslash-style query path 'src\\\\lib.rs'"
+    );
+}
+
 // ── no results (exit 1) ───────────────────────────────────────────────────────
 
 #[test]

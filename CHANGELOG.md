@@ -100,6 +100,15 @@ startup. Subsequent starts use the cached weights with no network access.
   `check`/lint and `openapi-snapshot` jobs remain Ubuntu-only as they use
   POSIX tooling.
 
+### Fixed
+
+- **Indexed file paths are now stored OS-independently (forward slashes).**
+  Indexing on Windows previously stored backslash separators (`src\lib.rs`)
+  while every lookup uses forward slashes, so `spelunk chunks` / `cat-chunks`
+  (and the `\` SQL-escape in `LIKE` lookups) found nothing for an indexed file
+  on Windows. Root-relative paths are normalized to `/` on both indexing and
+  lookup, making the on-disk index portable across operating systems. (#444)
+
 ## [0.8.3] — 2026-06-17
 
 ### Changed

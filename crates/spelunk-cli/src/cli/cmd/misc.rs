@@ -31,7 +31,9 @@ pub fn languages() -> Result<()> {
 
 pub fn chunks(args: ChunksArgs, cfg: Config) -> Result<()> {
     let (_db_path, db) = open_project_db(args.db.as_deref(), &cfg.db_path)?;
-    let results = db.chunks_for_file(&args.path)?;
+    // Stored paths use forward slashes; normalize the query arg so a Windows
+    // caller passing `src\lib.rs` matches the indexed `src/lib.rs`.
+    let results = db.chunks_for_file(&spelunk_core::utils::normalize_index_path(&args.path))?;
 
     if results.is_empty() {
         println!("No chunks found for '{}'.", args.path);

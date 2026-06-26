@@ -71,8 +71,11 @@ pub(super) fn run_parse_phase(
     for entry in &files {
         let path = entry.path();
         // Store paths relative to the project root so the index is portable.
+        // Normalize separators to `/` so the on-disk index is identical across
+        // OSes and matches forward-slash CLI/query paths (Windows `to_string_lossy`
+        // would otherwise emit `src\lib.rs`).
         let rel = path.strip_prefix(root).unwrap_or(path);
-        let path_str = rel.to_string_lossy();
+        let path_str = spelunk_core::utils::normalize_index_path(&rel.to_string_lossy());
         parse_bar.set_message(short_path(&path_str));
 
         // ── Binary document formats (DOCX, XLSX, PDF, …) ─────────────────────
@@ -379,10 +382,10 @@ fn cleanup_stale(files: &[ignore::DirEntry], root: &std::path::Path, db: &Databa
         .iter()
         .map(|e| {
             let p = e.path();
-            p.strip_prefix(root)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .to_string()
+            // Match the normalized form stored during indexing (forward slashes).
+            spelunk_core::utils::normalize_index_path(
+                &p.strip_prefix(root).unwrap_or(p).to_string_lossy(),
+            )
         })
         .collect();
     // Pass "" so file_paths_under returns all files in this DB (paths are relative).
