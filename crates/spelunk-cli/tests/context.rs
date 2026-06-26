@@ -486,13 +486,17 @@ fn context_json_notes_have_required_fields() {
 
 #[test]
 fn context_exits_nonzero_when_config_invalid() {
-    // A config with a db_path inside a non-existent directory that cannot be
-    // created (deeply nested under a non-existent root) will cause MemoryStore
-    // to fail its create_dir_all, producing a non-zero exit.
+    // A config whose db_path sits *under an existing regular file* cannot have
+    // its parent directory created (create_dir_all fails because a path component
+    // is a file), so MemoryStore errors and the command exits non-zero. Using a
+    // real file keeps this cross-platform — the previous `/dev/null` trick is
+    // Unix-only (on Windows that path is just a creatable directory chain, so the
+    // command would succeed and this assertion would fail).
     let tmp = TempDir::new().expect("create temp dir");
     let config_path = tmp.path().join("config.toml");
-    // Use /dev/null/impossible/path — /dev/null is a file, so mkdir fails.
-    let db_path = std::path::Path::new("/dev/null/impossible/path/spelunk.db");
+    let blocker = tmp.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").expect("write blocker file");
+    let db_path = blocker.join("impossible").join("spelunk.db");
 
     std::fs::write(
         &config_path,
