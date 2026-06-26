@@ -537,4 +537,338 @@ mod tests {
         assert!(!is_prod_cloud_url("https://staging.spelunk.cloud"));
         assert!(!is_prod_cloud_url("http://127.0.0.1:8080"));
     }
+
+    // ── Wire-level tests for initiate_device ─────────────────────────────────────
+
+    /// `initiate_device` sends a form-encoded `client_id` and parses the
+    /// WorkOS device-code response shape correctly.
+    #[tokio::test]
+    async fn initiate_device_sends_client_id_and_parses_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        struct AssertClientId;
+        impl Respond for AssertClientId {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body = String::from_utf8_lossy(&request.body);
+                assert!(
+                    body.contains("client_id=client_test"),
+                    "initiate_device must send client_id in form body, got: {body}"
+                );
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_code": "dc-abc",
+                    "user_code": "USER-CODE",
+                    "verification_uri": "https://workos.example.com/activate",
+                    "verification_uri_complete": "https://workos.example.com/activate?code=USER-CODE",
+                    "expires_in": 900,
+                    "interval": 5
+                }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/user_management/authorize/device"))
+            .respond_with(AssertClientId)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let resp = initiate_device(&client, &server.uri(), "client_test")
+            .await
+            .expect("initiate_device should succeed");
+
+        assert_eq!(resp.device_code, "dc-abc");
+        assert_eq!(resp.user_code, "USER-CODE");
+        assert_eq!(resp.expires_in, 900);
+        assert_eq!(resp.interval, 5);
+        assert_eq!(
+            resp.verification_uri_complete.as_deref(),
+            Some("https://workos.example.com/activate?code=USER-CODE")
+        );
+    }
+
+    /// A non-2xx from `initiate_device` is surfaced as a clear error (not a
+    /// panic or an opaque parse failure).
+    #[tokio::test]
+    async fn initiate_device_error_response_surfaces_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/user_management/authorize/device"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad client"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let err = initiate_device(&client, &server.uri(), "bad_client_id")
+            .await
+            .expect_err("a 400 from WorkOS must surface as an error");
+        assert!(
+            err.to_string().contains("400"),
+            "error should mention the HTTP status, got: {err}"
+        );
+    }
+
+    // ── Wire-level tests for poll_token ────────────────────────────────────────
+
+    /// A WorkOS MFA/step-up response (`mfa_required`) must map to
+    /// `PollOutcome::Challenge` — it is non-fatal so the polling loop can
+    /// continue and the operator completes the challenge in the browser.
+    #[tokio::test]
+    async fn poll_token_mfa_required_is_non_fatal_challenge() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/user_management/authenticate"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "mfa_required"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let outcome = poll_token(&client, &server.uri(), "client_test", "dc-xyz").await;
+        assert!(
+            matches!(outcome, PollOutcome::Challenge(_)),
+            "mfa_required must yield PollOutcome::Challenge (non-fatal)"
+        );
+    }
+
+    /// All four WorkOS step-up/MFA error codes must map to `PollOutcome::Challenge`
+    /// so the operator can complete the challenge in the browser rather than having
+    /// the CLI exit with an error.
+    #[tokio::test]
+    async fn poll_token_all_mfa_codes_are_non_fatal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for code in &["mfa_challenge", "mfa_enrollment", "challenge_required"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/user_management/authenticate"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": code
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = build_client().unwrap();
+            let outcome = poll_token(&client, &server.uri(), "client_test", "dc-xyz").await;
+            assert!(
+                matches!(outcome, PollOutcome::Challenge(_)),
+                "error code '{code}' must yield PollOutcome::Challenge (non-fatal)"
+            );
+        }
+    }
+
+    /// `authorization_pending` must yield `PollOutcome::Pending` so the loop
+    /// keeps polling without surfacing an error.
+    #[tokio::test]
+    async fn poll_token_authorization_pending_is_pending() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/user_management/authenticate"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "authorization_pending"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let outcome = poll_token(&client, &server.uri(), "client_test", "dc-xyz").await;
+        assert!(
+            matches!(outcome, PollOutcome::Pending),
+            "authorization_pending must yield PollOutcome::Pending"
+        );
+    }
+
+    /// A successful device-code exchange returns `PollOutcome::Success` with the
+    /// correct tokens, decoding `exp` and `org_id` from the JWT payload.
+    #[tokio::test]
+    async fn poll_token_success_decodes_jwt_claims() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let jwt = fake_jwt(&serde_json::json!({ "exp": 4_000_000_000_i64, "org_id": "org_abc" }));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/user_management/authenticate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": jwt,
+                "refresh_token": "rt-device",
+                "organization_id": "org_abc",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let outcome = poll_token(&client, &server.uri(), "client_test", "dc-xyz").await;
+        let PollOutcome::Success(tok) = outcome else {
+            panic!("expected Success, got non-Success outcome");
+        };
+        assert_eq!(tok.refresh_token, "rt-device");
+        assert_eq!(tok.org_id, "org_abc");
+        assert_eq!(tok.expires_at, 4_000_000_000_i64);
+    }
+
+    // ── --org login-then-switch integration ───────────────────────────────────
+    //
+    // The `--org` flow in `login.rs` is:
+    //   1. Device-code login yields initial tokens (org chosen browser-side).
+    //   2. `switch_org` is called with those initial tokens + the `--org` slug.
+    //   3. `switch_org` calls GET /v1/me (slug → local UUID) then WorkOS refresh
+    //      with `organization_id` (the local UUID).
+    //
+    // The full `login()` function sleeps (device polling) and calls
+    // `process::exit`, so we test the critical switch leg directly through the
+    // public `switch_org` helper that `login` calls, verifying the end-to-end
+    // wire contract of the login-then-switch path.
+
+    /// After a device login yields an initial token for org A, passing `--org
+    /// <beta-slug>` re-scopes via `switch_org`: GET /v1/me resolves the slug to
+    /// a local UUID and POST /authenticate (refresh grant + organization_id)
+    /// returns tokens scoped to the target org.
+    #[tokio::test]
+    async fn login_then_switch_org_resolves_slug_and_refreshes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::cli::cmd::org::switch_org;
+
+        const BETA_UUID: &str = "22222222-2222-2222-2222-222222222222";
+
+        let server = MockServer::start().await;
+
+        // GET /v1/me — returns two orgs; beta is the one the user wants to switch to.
+        Mock::given(method("GET"))
+            .and(path("/v1/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orgs": [
+                    { "id": "11111111-1111-1111-1111-111111111111",
+                      "name": "Acme", "slug": "acme", "role": "admin" },
+                    { "id": BETA_UUID, "name": "Beta Corp", "slug": "beta", "role": "member" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // POST /authenticate (refresh grant) — must carry the resolved local UUID.
+        let beta_jwt = fake_jwt(&serde_json::json!({
+            "exp": 5_000_000_000_i64,
+            "org_id": BETA_UUID
+        }));
+        Mock::given(method("POST"))
+            .and(path("/user_management/authenticate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": beta_jwt,
+                "refresh_token": "rt-beta",
+                "organization_id": BETA_UUID,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Simulate the initial tokens that a device login would have yielded
+        // (scoped to acme, the org picked browser-side).
+        let initial_tokens = spelunk_core::config::AuthTokens {
+            access_token: "at-initial-acme".into(),
+            refresh_token: "rt-initial-acme".into(),
+            expires_at: 5_000_000_000,
+            org_id: "11111111-1111-1111-1111-111111111111".into(),
+        };
+
+        let client = build_client().unwrap();
+        let switched = switch_org(
+            &client,
+            &server.uri(), // workos_url
+            &server.uri(), // cloud_url (for /v1/me)
+            "client_test",
+            &initial_tokens,
+            "beta",
+        )
+        .await
+        .expect("login-then-switch should succeed");
+
+        assert_eq!(switched.org_id, BETA_UUID);
+        assert_eq!(switched.refresh_token, "rt-beta");
+        assert_eq!(switched.expires_at, 5_000_000_000_i64);
+    }
+
+    /// When `--org` targets an org the user is NOT a member of, WorkOS returns
+    /// `organization_not_found`, which must surface as a clear membership error
+    /// — NOT a panic or an opaque HTTP error. This guards the login-then-switch
+    /// path specifically (the slug resolves via /v1/me but WorkOS rejects the
+    /// refresh grant).
+    #[tokio::test]
+    async fn login_then_switch_org_not_member_surfaces_clear_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::cli::cmd::org::switch_org;
+
+        const BETA_UUID: &str = "22222222-2222-2222-2222-222222222222";
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orgs": [
+                    { "id": BETA_UUID, "name": "Beta Corp", "slug": "beta", "role": "member" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        // WorkOS rejects the refresh because the user is not actually a member
+        // (e.g. membership in the local DB is stale).
+        Mock::given(method("POST"))
+            .and(path("/user_management/authenticate"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "organization_not_found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let initial_tokens = spelunk_core::config::AuthTokens {
+            access_token: "at-initial".into(),
+            refresh_token: "rt-initial".into(),
+            expires_at: 5_000_000_000,
+            org_id: "11111111-1111-1111-1111-111111111111".into(),
+        };
+
+        let client = build_client().unwrap();
+        let err = switch_org(
+            &client,
+            &server.uri(),
+            &server.uri(),
+            "client_test",
+            &initial_tokens,
+            "beta",
+        )
+        .await
+        .expect_err("non-member org should error");
+
+        assert!(
+            err.to_string().contains("not a member"),
+            "expected a clear membership error, got: {err}"
+        );
+    }
 }
