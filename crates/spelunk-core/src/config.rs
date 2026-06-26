@@ -360,8 +360,9 @@ pub struct Config {
 pub struct AuthTokens {
     /// Short-lived WorkOS access token, sent as `Authorization: Bearer`.
     pub access_token: String,
-    /// Long-lived rotating refresh token. Exchanged at `/v1/auth/token` to
-    /// rotate the access token or switch organisation.
+    /// Long-lived rotating refresh token. Exchanged directly at WorkOS
+    /// `/user_management/authenticate` (refresh grant, ADR-047) to rotate the
+    /// access token or switch organisation.
     pub refresh_token: String,
     /// Absolute expiry of `access_token`, as a Unix timestamp (seconds).
     pub expires_at: i64,

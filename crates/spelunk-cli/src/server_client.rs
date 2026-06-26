@@ -126,9 +126,15 @@ struct BearerState {
 }
 
 /// State needed to rotate an expired/rejected WorkOS access token.
+///
+/// Refresh now goes DIRECTLY to WorkOS (ADR-047), so the WorkOS base URL and the
+/// embedded public `client_id` are carried here alongside the rotating tokens.
 struct RefreshState {
     tokens: AuthTokens,
-    cloud_url: String,
+    /// WorkOS User Management base URL (`https://api.workos.com` by default).
+    workos_url: String,
+    /// Embedded WorkOS public `client_id` for the active environment.
+    client_id: String,
     /// Where rotated tokens are persisted. `None` ⇒ the global config path
     /// (`~/.config/spelunk/config.toml`); tests inject a temp path.
     config_path: Option<std::path::PathBuf>,
@@ -154,14 +160,17 @@ impl ServerInferenceClient {
 
         // Carry WorkOS refresh state only when the bearer comes from `[auth]`
         // (i.e. `server_key` was resolved from the access token). A bare
-        // `server_key` / env token is not refreshable here.
+        // `server_key` / env token is not refreshable here. Refresh targets
+        // WorkOS directly (ADR-047): the WorkOS base URL and the embedded public
+        // client_id (derived from the default cloud host) are captured here.
         let refresh = cfg
             .auth
             .as_ref()
             .filter(|a| Some(a.access_token.as_str()) == cfg.server_key.as_deref())
             .map(|tokens| RefreshState {
                 tokens: tokens.clone(),
-                cloud_url: auth_api::DEFAULT_CLOUD_URL.to_string(),
+                workos_url: auth_api::workos_url(),
+                client_id: auth_api::workos_client_id(auth_api::DEFAULT_CLOUD_URL),
                 config_path: None,
             });
 
@@ -192,9 +201,12 @@ impl ServerInferenceClient {
             project_id: project_id.to_string(),
             auth: Mutex::new(BearerState {
                 bearer,
-                refresh: refresh.map(|(tokens, cloud_url, config_path)| RefreshState {
+                // `workos_url` is the second tuple element (tests point it at a
+                // mock WorkOS server); the client_id is a fixed test value.
+                refresh: refresh.map(|(tokens, workos_url, config_path)| RefreshState {
                     tokens,
-                    cloud_url,
+                    workos_url,
+                    client_id: "client_test".to_string(),
                     config_path: Some(config_path),
                 }),
             }),
@@ -228,30 +240,33 @@ impl ServerInferenceClient {
             .is_some_and(|r| r.tokens.is_expired())
     }
 
-    /// Rotate the WorkOS access token via `POST /v1/auth/token`, persist the
-    /// rotated tokens, and update the in-memory bearer.
+    /// Rotate the WorkOS access token DIRECTLY via WorkOS `/authenticate`
+    /// (refresh grant, ADR-047), persist the rotated tokens, and update the
+    /// in-memory bearer.
     ///
     /// Returns `Ok(true)` when a refresh was performed, `Ok(false)` when there
     /// is no refresh state (a bare `server_key` — nothing to refresh). Errors
     /// carry a clear "re-run `spelunk login`" message.
     async fn refresh_access_token(&self) -> Result<bool> {
-        let (refresh_token, cloud_url, config_path) = {
+        let (refresh_token, workos_url, client_id, config_path) = {
             let guard = self.auth.lock().expect("auth mutex poisoned");
             match &guard.refresh {
                 Some(r) => (
                     r.tokens.refresh_token.clone(),
-                    r.cloud_url.clone(),
+                    r.workos_url.clone(),
+                    r.client_id.clone(),
                     r.config_path.clone(),
                 ),
                 None => return Ok(false),
             }
         };
 
-        let rotated = auth_api::refresh_token(&self.client, &cloud_url, &refresh_token, None)
-            .await
-            .map_err(|e| {
-                e.context("session expired and token refresh failed — re-run `spelunk login`")
-            })?;
+        let rotated =
+            auth_api::refresh_token(&self.client, &workos_url, &client_id, &refresh_token, None)
+                .await
+                .map_err(|e| {
+                    e.context("session expired and token refresh failed — re-run `spelunk login`")
+                })?;
         let new_tokens = rotated.into_auth_tokens();
 
         // Persist rotated tokens so the next process starts authenticated.
@@ -265,7 +280,8 @@ impl ServerInferenceClient {
         guard.bearer = Some(new_tokens.access_token.clone());
         guard.refresh = Some(RefreshState {
             tokens: new_tokens,
-            cloud_url,
+            workos_url,
+            client_id,
             config_path,
         });
         Ok(true)
@@ -568,6 +584,36 @@ mod tests {
         }
     }
 
+    /// Build an unsigned JWT carrying `exp` and `org_id` so the refresh path's
+    /// claim decode resolves the rotated session's expiry and org. The token
+    /// string itself doubles as the bearer the retry must send.
+    fn jwt(label: &str, org_id: &str, exp: i64) -> String {
+        fn b64url(bytes: &[u8]) -> String {
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b = [
+                    chunk[0],
+                    *chunk.get(1).unwrap_or(&0),
+                    *chunk.get(2).unwrap_or(&0),
+                ];
+                let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+                out.push(A[((n >> 18) & 0x3f) as usize] as char);
+                out.push(A[((n >> 12) & 0x3f) as usize] as char);
+                if chunk.len() > 1 {
+                    out.push(A[((n >> 6) & 0x3f) as usize] as char);
+                }
+                if chunk.len() > 2 {
+                    out.push(A[(n & 0x3f) as usize] as char);
+                }
+            }
+            out
+        }
+        // `label` keeps distinct test JWTs textually distinguishable.
+        let payload = serde_json::json!({ "exp": exp, "org_id": org_id, "lbl": label }).to_string();
+        format!("{}.{}.sig", b64url(b"{}"), b64url(payload.as_bytes()))
+    }
+
     /// A 401 from the inference server triggers exactly one refresh + retry; the
     /// rotated access token is used on the retry and persisted to disk.
     #[tokio::test]
@@ -576,6 +622,8 @@ mod tests {
         let cloud = MockServer::start().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
+
+        let at_new = jwt("new", "org_1", 5_000_000_000);
 
         // First /search call (with stale bearer) → 401.
         Mock::given(method("POST"))
@@ -586,24 +634,22 @@ mod tests {
             .mount(&inference)
             .await;
 
-        // The refresh exchange rotates the tokens.
+        // The WorkOS refresh exchange rotates the tokens (ADR-047).
         Mock::given(method("POST"))
-            .and(path("/v1/auth/token"))
+            .and(path("/user_management/authenticate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "token_type": "workos",
-                "access_token": "at-new",
+                "access_token": at_new,
                 "refresh_token": "rt-new",
-                "expires_at": 5_000_000_000_i64,
-                "org_id": "org_1",
+                "organization_id": "org_1",
             })))
             .expect(1)
             .mount(&cloud)
             .await;
 
-        // Retry (with the rotated bearer) → 200.
+        // Retry (with the rotated bearer = the new JWT) → 200.
         Mock::given(method("POST"))
             .and(path("/v1/projects/proj/search"))
-            .and(header("authorization", "Bearer at-new"))
+            .and(header("authorization", format!("Bearer {at_new}").as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "query_vector": [0.1_f32, 0.2, 0.3],
                 "mode": "semantic",
@@ -628,7 +674,7 @@ mod tests {
 
         // Rotated tokens were persisted to the injected config path.
         let cfg = spelunk_core::config::Config::load(Some(&config_path)).unwrap();
-        assert_eq!(cfg.server_key.as_deref(), Some("at-new"));
+        assert_eq!(cfg.server_key.as_deref(), Some(at_new.as_str()));
         assert_eq!(cfg.auth.unwrap().refresh_token, "rt-new");
     }
 
@@ -641,13 +687,14 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 
+        let at_fresh = jwt("fresh", "org_1", 5_000_000_000);
+
         Mock::given(method("POST"))
-            .and(path("/v1/auth/token"))
+            .and(path("/user_management/authenticate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "at-fresh",
+                "access_token": at_fresh,
                 "refresh_token": "rt-fresh",
-                "expires_at": 5_000_000_000_i64,
-                "org_id": "org_1",
+                "organization_id": "org_1",
             })))
             .expect(1)
             .mount(&cloud)
@@ -656,7 +703,10 @@ mod tests {
         // Only the fresh bearer is ever accepted; the stale one must not appear.
         Mock::given(method("POST"))
             .and(path("/v1/projects/proj/search"))
-            .and(header("authorization", "Bearer at-fresh"))
+            .and(header(
+                "authorization",
+                format!("Bearer {at_fresh}").as_str(),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "query_vector": [1.0_f32],
                 "mode": "semantic",
@@ -724,12 +774,11 @@ mod tests {
         // The refresh endpoint must be called EXACTLY once. A second refresh
         // (the infinite-loop failure mode) would exceed this and fail the test.
         Mock::given(method("POST"))
-            .and(path("/v1/auth/token"))
+            .and(path("/user_management/authenticate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "at-new",
+                "access_token": jwt("new", "org_1", 5_000_000_000),
                 "refresh_token": "rt-new",
-                "expires_at": 5_000_000_000_i64,
-                "org_id": "org_1",
+                "organization_id": "org_1",
             })))
             .expect(1)
             .mount(&cloud)

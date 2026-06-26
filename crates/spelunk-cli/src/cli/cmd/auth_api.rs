@@ -1,16 +1,21 @@
-//! HTTP client for the cloud-api WorkOS-proxied auth endpoints (ADR-045).
+//! HTTP client for WorkOS-direct device-flow auth (ADR-047).
 //!
-//! cloud-api holds the WorkOS secret; the CLI only ever talks to cloud-api.
-//! This module owns the request/response shapes for the device-authorization
-//! grant and the token/refresh/org-switch exchanges, plus the polling loop used
-//! by `spelunk login`. Persisting the resulting tokens is the caller's job.
+//! Supersedes the cloud-api `/v1/auth/*` proxy (ADR-045). A live multi-org
+//! device login proved every token leg the CLI needs is a WorkOS PUBLIC-CLIENT
+//! exchange — `client_id` only, no secret — so the CLI talks to WorkOS directly
+//! and no longer routes auth through cloud-api.
 //!
-//! Endpoints:
-//!   POST /v1/auth/device              — start the device flow
-//!   POST /v1/auth/device/token        — poll for the token (RFC 8628)
-//!   POST /v1/auth/device/select-org   — finish a multi-org device login
-//!   POST /v1/auth/token               — rotate / silently switch org
-//!   GET  /v1/me                       — current identity + org memberships
+//! WorkOS endpoints (all under `https://api.workos.com/user_management`):
+//!   POST /authorize/device   — start the device-authorization grant
+//!   POST /authenticate       — exchange a device code, refresh, or switch org
+//!
+//! Org selection happens browser-side on WorkOS's hosted approval page, so the
+//! CLI never sees `organization_selection_required` and there is no
+//! pending-token / select-org step.
+//!
+//! cloud-api is still used for ONE thing — `GET /v1/me` resolves an org slug to
+//! its local org UUID before a switch (see [`fetch_me`]). That call carries the
+//! WorkOS access token as a bearer; cloud-api validates it.
 
 use std::time::Duration;
 
@@ -19,8 +24,22 @@ use serde::Deserialize;
 
 use spelunk_core::config::AuthTokens;
 
-/// Default cloud API base URL.
+/// Default cloud API base URL (used only for `GET /v1/me`).
 pub const DEFAULT_CLOUD_URL: &str = "https://api.spelunk.cloud";
+
+/// Default WorkOS User Management API base URL.
+pub const DEFAULT_WORKOS_URL: &str = "https://api.workos.com";
+
+/// Embedded PUBLIC-CLIENT `client_id` for the **production** WorkOS environment.
+pub const WORKOS_CLIENT_ID_PROD: &str = "client_01KTY5G10DF7854DNX5EWC9R6Y";
+
+/// Embedded PUBLIC-CLIENT `client_id` for the **dev / staging** WorkOS environment.
+pub const WORKOS_CLIENT_ID_DEV: &str = "client_01KTY5JEJSZQD6R3QBXZS19WVF";
+
+/// RFC 8628 device-code grant type.
+const GRANT_DEVICE_CODE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// OAuth refresh-token grant type (also used for silent org-switch).
+const GRANT_REFRESH_TOKEN: &str = "refresh_token";
 
 /// HTTP request timeout for non-polling auth calls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,9 +52,56 @@ pub fn build_client() -> Result<reqwest::Client> {
         .context("building HTTP client")
 }
 
+/// Resolve the WorkOS base URL.
+///
+/// `SPELUNK_WORKOS_URL` overrides the default (used by tests to point at a mock
+/// server). Trailing slashes are trimmed.
+pub fn workos_url() -> String {
+    std::env::var("SPELUNK_WORKOS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_WORKOS_URL.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Resolve the embedded WorkOS `client_id` for the active environment.
+///
+/// Selection mirrors the cloud-url default-vs-override pattern already used for
+/// the rest of the CLI's environment config:
+///   1. `SPELUNK_WORKOS_CLIENT_ID` — explicit override (tests / bespoke envs).
+///   2. Otherwise derived from `cloud_url`: the production cloud host
+///      (`api.spelunk.cloud`) selects the prod client_id; anything else (a dev
+///      override, localhost, a staging host) selects the dev client_id.
+pub fn workos_client_id(cloud_url: &str) -> String {
+    if let Ok(v) = std::env::var("SPELUNK_WORKOS_CLIENT_ID")
+        && !v.trim().is_empty()
+    {
+        return v;
+    }
+    if is_prod_cloud_url(cloud_url) {
+        WORKOS_CLIENT_ID_PROD.to_string()
+    } else {
+        WORKOS_CLIENT_ID_DEV.to_string()
+    }
+}
+
+/// Whether `cloud_url` targets the production spelunk.cloud API host.
+///
+/// Only the canonical production host counts as prod; every other host (dev
+/// overrides, staging, localhost) falls through to the dev environment.
+fn is_prod_cloud_url(cloud_url: &str) -> bool {
+    let host = cloud_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host = host.split(['/', ':']).next().unwrap_or(host);
+    host.eq_ignore_ascii_case("api.spelunk.cloud")
+}
+
 // ── Wire types ────────────────────────────────────────────────────────────────
 
-/// `POST /v1/auth/device` response.
+/// `POST /authorize/device` response (WorkOS shape).
 #[derive(Debug, Deserialize)]
 pub struct DeviceCodeResponse {
     /// Opaque handle — never parsed by the CLI.
@@ -45,17 +111,6 @@ pub struct DeviceCodeResponse {
     pub verification_uri_complete: Option<String>,
     pub expires_in: u64,
     pub interval: u64,
-}
-
-/// A WorkOS organisation the operator can select from.
-///
-/// `id` is the **local org UUID** (not the WorkOS `org_...` id); it is the value
-/// to pass as `organization_id` / `org_id` to the auth endpoints.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Organization {
-    pub id: String,
-    pub name: String,
-    pub slug: String,
 }
 
 /// One `orgs[]` entry from `GET /v1/me`.
@@ -76,12 +131,27 @@ pub struct MeResponse {
     pub orgs: Vec<MeOrg>,
 }
 
-/// Successful token body shared by `/device/token`, `/device/select-org`, and
-/// `/auth/token`.
+/// Raw WorkOS `/authenticate` success body.
+///
+/// WorkOS returns the rotated `access_token` (a JWT) and `refresh_token`. The
+/// expiry and organisation are carried in the access-token JWT claims (`exp`,
+/// `org_id`); `organization_id` is also echoed at the top level on org-scoped
+/// authentications, which we prefer when present.
 #[derive(Debug, Clone, Deserialize)]
+struct WorkosAuthResponse {
+    access_token: String,
+    refresh_token: String,
+    /// Echoed for org-scoped sessions; falls back to the JWT `org_id` claim.
+    #[serde(default)]
+    organization_id: Option<String>,
+}
+
+/// A successful token exchange, normalised into the persisted [`AuthTokens`].
+///
+/// Built from a [`WorkosAuthResponse`] by decoding the access-token JWT for its
+/// `exp` (→ `expires_at`) and `org_id` claims.
+#[derive(Debug, Clone)]
 pub struct TokenSuccess {
-    #[allow(dead_code)]
-    pub token_type: Option<String>,
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: i64,
@@ -89,7 +159,7 @@ pub struct TokenSuccess {
 }
 
 impl TokenSuccess {
-    /// Convert a wire success body into the persisted [`AuthTokens`] shape.
+    /// Convert a normalised success body into the persisted [`AuthTokens`] shape.
     pub fn into_auth_tokens(self) -> AuthTokens {
         AuthTokens {
             access_token: self.access_token,
@@ -100,38 +170,98 @@ impl TokenSuccess {
     }
 }
 
-/// RFC 8628 error body returned by a pending / failed poll.
+impl WorkosAuthResponse {
+    /// Normalise the WorkOS body into a [`TokenSuccess`], deriving `expires_at`
+    /// and `org_id` from the access-token JWT claims.
+    fn into_success(self) -> TokenSuccess {
+        let claims = decode_jwt_claims(&self.access_token).unwrap_or_default();
+        let expires_at = claims.exp.unwrap_or(0);
+        let org_id = self.organization_id.or(claims.org_id).unwrap_or_default();
+        TokenSuccess {
+            access_token: self.access_token,
+            refresh_token: self.refresh_token,
+            expires_at,
+            org_id,
+        }
+    }
+}
+
+/// The subset of JWT claims the CLI reads from a WorkOS access token.
+#[derive(Debug, Default, Deserialize)]
+struct JwtClaims {
+    /// Absolute expiry (Unix seconds).
+    exp: Option<i64>,
+    /// WorkOS organisation id the token is scoped to.
+    org_id: Option<String>,
+}
+
+/// Decode the claims (second segment) of a JWT without verifying the signature.
+///
+/// The CLI does not validate the token — WorkOS issued it over TLS and the
+/// server re-validates on every request. We only need the `exp` and `org_id`
+/// claims to populate local state, so a base64url-decode of the payload is
+/// sufficient. Returns `None` if the token is malformed.
+fn decode_jwt_claims(token: &str) -> Option<JwtClaims> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let bytes = base64url_decode(payload_b64)?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Decode unpadded base64url (RFC 4648 §5) into bytes. Returns `None` on any
+/// invalid character. A small standalone decoder so the CLI needs no base64 dep.
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+
+    let input = input.trim_end_matches('=');
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in input.as_bytes() {
+        let v = val(c)?;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// WorkOS `/authenticate` 4xx error body (RFC 8628 + WorkOS error codes).
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
     error: String,
     #[serde(default)]
     error_description: Option<String>,
-    /// MFA / step-up challenge URL (surfaced non-fatally when present).
-    #[serde(default)]
-    challenge_url: Option<String>,
-    // Multi-org selection fields (present when error == organization_selection_required).
-    #[serde(default)]
-    pending_token: Option<String>,
-    #[serde(default)]
-    organizations: Vec<Organization>,
 }
 
 // ── Device flow ───────────────────────────────────────────────────────────────
 
-/// `POST /v1/auth/device` to start the device-authorization grant.
+/// `POST /user_management/authorize/device` to start the device grant.
 ///
-/// A non-empty JSON body is always sent so the fronting proxy does not reject
-/// the request with `411 Length Required` (see GH #434).
+/// Sends only `client_id` (public-client init); WorkOS returns the device code,
+/// user code, verification URLs, expiry, and poll interval.
 pub async fn initiate_device(
     client: &reqwest::Client,
-    cloud_url: &str,
+    workos_url: &str,
+    client_id: &str,
 ) -> Result<DeviceCodeResponse> {
     let resp = client
-        .post(format!("{cloud_url}/v1/auth/device"))
-        .json(&device_init_body())
+        .post(format!("{workos_url}/user_management/authorize/device"))
+        .form(&[("client_id", client_id)])
         .send()
         .await
-        .context("POST /v1/auth/device failed")?;
+        .context("POST /user_management/authorize/device failed")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -144,26 +274,10 @@ pub async fn initiate_device(
         .context("parsing device authorization response")
 }
 
-/// Build the JSON body for `POST /v1/auth/device`.
-///
-/// The machine hostname is sent as `client_hint` when it resolves; otherwise an
-/// empty object is sent (still a non-empty payload so the proxy accepts it).
-pub fn device_init_body() -> serde_json::Value {
-    match gethostname::gethostname().into_string() {
-        Ok(host) if !host.trim().is_empty() => serde_json::json!({ "client_hint": host }),
-        _ => serde_json::json!({}),
-    }
-}
-
-/// Outcome of a single poll of `/v1/auth/device/token`.
+/// Outcome of a single poll of `/authenticate` (device-code grant).
 pub enum PollOutcome {
-    /// Single-org success — tokens are ready to persist.
+    /// Success — tokens are ready to persist.
     Success(TokenSuccess),
-    /// Multi-org: the operator must pick an organisation to continue.
-    SelectOrg {
-        pending_token: String,
-        organizations: Vec<Organization>,
-    },
     /// User has not yet approved.
     Pending,
     /// Server requests slower polling (RFC 8628 §3.5).
@@ -182,17 +296,20 @@ pub enum PollOutcome {
     Error(anyhow::Error),
 }
 
-/// `POST /v1/auth/device/token` once with the opaque `device_code`.
+/// Poll `POST /user_management/authenticate` once with the device-code grant.
 pub async fn poll_token(
     client: &reqwest::Client,
-    cloud_url: &str,
+    workos_url: &str,
+    client_id: &str,
     device_code: &str,
 ) -> PollOutcome {
-    let body = serde_json::json!({ "device_code": device_code });
-
     let resp = match client
-        .post(format!("{cloud_url}/v1/auth/device/token"))
-        .json(&body)
+        .post(format!("{workos_url}/user_management/authenticate"))
+        .form(&[
+            ("client_id", client_id),
+            ("grant_type", GRANT_DEVICE_CODE),
+            ("device_code", device_code),
+        ])
         .send()
         .await
     {
@@ -203,8 +320,8 @@ pub async fn poll_token(
     let status = resp.status();
 
     if status.is_success() {
-        return match resp.json::<TokenSuccess>().await {
-            Ok(t) => PollOutcome::Success(t),
+        return match resp.json::<WorkosAuthResponse>().await {
+            Ok(t) => PollOutcome::Success(t.into_success()),
             Err(e) => PollOutcome::Error(anyhow::anyhow!(e).context("parsing token response")),
         };
     }
@@ -223,17 +340,9 @@ pub async fn poll_token(
         "slow_down" => PollOutcome::SlowDown,
         "expired_token" => PollOutcome::Expired,
         "access_denied" => PollOutcome::Denied,
-        "organization_selection_required" => match err.pending_token {
-            Some(pending_token) => PollOutcome::SelectOrg {
-                pending_token,
-                organizations: err.organizations,
-            },
-            None => PollOutcome::Error(anyhow::anyhow!(
-                "organization_selection_required without a pending_token"
-            )),
-        },
-        "mfa_required" | "mfa_challenge" | "challenge_required" => {
-            PollOutcome::Challenge(err.challenge_url)
+        "mfa_required" | "mfa_challenge" | "mfa_enrollment" | "challenge_required" => {
+            // WorkOS step-up is completed browser-side; surface it non-fatally.
+            PollOutcome::Challenge(None)
         }
         "invalid_grant" => {
             let msg = err
@@ -242,59 +351,45 @@ pub async fn poll_token(
             PollOutcome::InvalidGrant(msg)
         }
         other => PollOutcome::Error(anyhow::anyhow!(
-            "unexpected error from token endpoint: {other}"
+            "unexpected error from authenticate endpoint: {other}"
         )),
     }
 }
 
-/// `POST /v1/auth/device/select-org` to finish a multi-org device login.
-///
-/// Returns the issued tokens, or a clear error on `403 org_not_member`.
-pub async fn select_org(
-    client: &reqwest::Client,
-    cloud_url: &str,
-    pending_token: &str,
-    org_id: &str,
-) -> Result<TokenSuccess> {
-    let body = serde_json::json!({ "pending_token": pending_token, "org_id": org_id });
-    let resp = client
-        .post(format!("{cloud_url}/v1/auth/device/select-org"))
-        .json(&body)
-        .send()
-        .await
-        .context("POST /v1/auth/device/select-org failed")?;
-
-    token_or_error(resp, "selecting organisation").await
-}
-
-/// `POST /v1/auth/token` to rotate tokens.
+/// `POST /user_management/authenticate` with the refresh-token grant.
 ///
 /// With `organization_id` set this is a silent org-switch; without it, a plain
-/// refresh. A `403 org_not_member` is surfaced as a clear error.
+/// refresh. A non-member / unknown organisation surfaces as a clear error.
 pub async fn refresh_token(
     client: &reqwest::Client,
-    cloud_url: &str,
+    workos_url: &str,
+    client_id: &str,
     refresh_token: &str,
     organization_id: Option<&str>,
 ) -> Result<TokenSuccess> {
-    let mut body = serde_json::json!({ "refresh_token": refresh_token });
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id),
+        ("grant_type", GRANT_REFRESH_TOKEN),
+        ("refresh_token", refresh_token),
+    ];
     if let Some(org) = organization_id {
-        body["organization_id"] = serde_json::Value::String(org.to_string());
+        form.push(("organization_id", org));
     }
+
     let resp = client
-        .post(format!("{cloud_url}/v1/auth/token"))
-        .json(&body)
+        .post(format!("{workos_url}/user_management/authenticate"))
+        .form(&form)
         .send()
         .await
-        .context("POST /v1/auth/token failed")?;
+        .context("POST /user_management/authenticate (refresh) failed")?;
 
     token_or_error(resp, "refreshing token").await
 }
 
-/// `GET /v1/me` — fetch the caller's identity and org memberships.
+/// `GET /v1/me` (cloud-api) — fetch the caller's identity and org memberships.
 ///
-/// Authenticated with the stored access token as a bearer. Used to resolve an
-/// org slug to its local org UUID before a silent switch.
+/// Authenticated with the stored WorkOS access token as a bearer. Used to
+/// resolve an org slug to its local org UUID before a silent switch.
 pub async fn fetch_me(
     client: &reqwest::Client,
     cloud_url: &str,
@@ -319,20 +414,21 @@ pub async fn fetch_me(
     anyhow::bail!("GET /v1/me failed ({status}): {body}");
 }
 
-/// Parse a `TokenSuccess` from a 2xx response, mapping known error bodies
-/// (notably `org_not_member`) to readable errors.
+/// Parse a `TokenSuccess` from a 2xx WorkOS response, mapping known error bodies
+/// (notably a non-member organisation) to readable errors.
 async fn token_or_error(resp: reqwest::Response, ctx: &str) -> Result<TokenSuccess> {
     let status = resp.status();
     if status.is_success() {
         return resp
-            .json::<TokenSuccess>()
+            .json::<WorkosAuthResponse>()
             .await
+            .map(WorkosAuthResponse::into_success)
             .with_context(|| format!("parsing token response while {ctx}"));
     }
 
     let body = resp.text().await.unwrap_or_default();
     if let Ok(err) = serde_json::from_str::<ErrorResponse>(&body) {
-        if err.error == "org_not_member" {
+        if err.error == "organization_not_found" || err.error == "org_not_member" {
             anyhow::bail!("You are not a member of the requested organization.");
         }
         anyhow::bail!("{ctx} failed ({status}): {}", err.error);
@@ -344,26 +440,101 @@ async fn token_or_error(resp: reqwest::Response, ctx: &str) -> Result<TokenSucce
 mod tests {
     use super::*;
 
-    #[test]
-    fn device_init_body_is_non_empty_object() {
-        let body = device_init_body();
-        assert!(body.is_object());
-        assert!(serde_json::to_string(&body).unwrap().len() >= 2);
+    /// Build a minimal unsigned JWT with the given claims payload (header and
+    /// signature are placeholders — the CLI never verifies them).
+    fn fake_jwt(claims: &serde_json::Value) -> String {
+        fn b64url(bytes: &[u8]) -> String {
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b = [
+                    chunk[0],
+                    *chunk.get(1).unwrap_or(&0),
+                    *chunk.get(2).unwrap_or(&0),
+                ];
+                let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+                out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+                out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+                if chunk.len() > 1 {
+                    out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+                }
+                if chunk.len() > 2 {
+                    out.push(ALPHABET[(n & 0x3f) as usize] as char);
+                }
+            }
+            out
+        }
+        let header = b64url(br#"{"alg":"none"}"#);
+        let payload = b64url(serde_json::to_string(claims).unwrap().as_bytes());
+        format!("{header}.{payload}.sig")
     }
 
     #[test]
-    fn token_success_into_auth_tokens_maps_fields() {
-        let t = TokenSuccess {
-            token_type: Some("workos".into()),
-            access_token: "at".into(),
+    fn base64url_decode_round_trips_jwt_payload() {
+        let jwt = fake_jwt(&serde_json::json!({ "exp": 123, "org_id": "org_abc" }));
+        let claims = decode_jwt_claims(&jwt).expect("claims decode");
+        assert_eq!(claims.exp, Some(123));
+        assert_eq!(claims.org_id.as_deref(), Some("org_abc"));
+    }
+
+    #[test]
+    fn decode_jwt_claims_malformed_returns_none() {
+        assert!(decode_jwt_claims("not-a-jwt").is_none());
+        assert!(decode_jwt_claims("a.!!!.c").is_none());
+    }
+
+    #[test]
+    fn into_success_prefers_top_level_org_then_falls_back_to_claim() {
+        // Top-level organization_id wins.
+        let resp = WorkosAuthResponse {
+            access_token: fake_jwt(&serde_json::json!({ "exp": 999, "org_id": "org_claim" })),
             refresh_token: "rt".into(),
-            expires_at: 1234,
-            org_id: "org_1".into(),
+            organization_id: Some("org_top".into()),
         };
-        let auth = t.into_auth_tokens();
-        assert_eq!(auth.access_token, "at");
-        assert_eq!(auth.refresh_token, "rt");
-        assert_eq!(auth.expires_at, 1234);
-        assert_eq!(auth.org_id, "org_1");
+        let s = resp.into_success();
+        assert_eq!(s.org_id, "org_top");
+        assert_eq!(s.expires_at, 999);
+
+        // Falls back to the JWT claim when absent.
+        let resp = WorkosAuthResponse {
+            access_token: fake_jwt(&serde_json::json!({ "exp": 1000, "org_id": "org_claim" })),
+            refresh_token: "rt".into(),
+            organization_id: None,
+        };
+        let s = resp.into_success();
+        assert_eq!(s.org_id, "org_claim");
+        assert_eq!(s.expires_at, 1000);
+    }
+
+    #[test]
+    fn workos_client_id_prod_for_canonical_host() {
+        // No override env set in this case path.
+        let prev = std::env::var("SPELUNK_WORKOS_CLIENT_ID").ok();
+        unsafe { std::env::remove_var("SPELUNK_WORKOS_CLIENT_ID") };
+        assert_eq!(
+            workos_client_id("https://api.spelunk.cloud"),
+            WORKOS_CLIENT_ID_PROD
+        );
+        assert_eq!(
+            workos_client_id("https://dev.spelunk.cloud"),
+            WORKOS_CLIENT_ID_DEV
+        );
+        assert_eq!(
+            workos_client_id("http://localhost:8080"),
+            WORKOS_CLIENT_ID_DEV
+        );
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("SPELUNK_WORKOS_CLIENT_ID", v) };
+        }
+    }
+
+    #[test]
+    fn is_prod_cloud_url_only_matches_canonical_host() {
+        assert!(is_prod_cloud_url("https://api.spelunk.cloud"));
+        assert!(is_prod_cloud_url("https://api.spelunk.cloud/"));
+        assert!(is_prod_cloud_url("https://API.SPELUNK.CLOUD"));
+        assert!(!is_prod_cloud_url("https://staging.spelunk.cloud"));
+        assert!(!is_prod_cloud_url("http://127.0.0.1:8080"));
     }
 }

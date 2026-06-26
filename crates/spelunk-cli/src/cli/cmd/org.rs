@@ -1,9 +1,11 @@
 //! `spelunk org switch <org>` — silently re-scope the session to another
-//! organisation without a new device login (ADR-045).
+//! organisation without a new device login (ADR-047).
 //!
-//! Uses the stored refresh token against `POST /v1/auth/token` with
-//! `organization_id`, then persists the rotated tokens. Shared org-resolution
-//! and token-persistence helpers also back `spelunk login --org`.
+//! Resolves the org slug to its local UUID via cloud-api `GET /v1/me`, then
+//! uses the stored refresh token directly against WorkOS `/authenticate`
+//! (refresh grant) with `organization_id`, and persists the rotated tokens.
+//! Shared org-resolution and token-persistence helpers also back
+//! `spelunk login --org`.
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -11,7 +13,7 @@ use uuid::Uuid;
 
 use spelunk_core::config::{self, AuthTokens};
 
-use super::auth_api::{self, DEFAULT_CLOUD_URL, MeOrg, Organization};
+use super::auth_api::{self, DEFAULT_CLOUD_URL, MeOrg};
 
 #[derive(Args, Debug)]
 pub struct OrgArgs {
@@ -44,19 +46,23 @@ pub async fn org(args: OrgArgs) -> Result<()> {
         .trim_end_matches('/')
         .to_string();
 
+    let workos_url = auth_api::workos_url();
+    let client_id = auth_api::workos_client_id(&cloud_url);
     match args.command {
-        OrgCommand::Switch(switch_args) => org_switch(&cloud_url, &switch_args.org).await,
+        OrgCommand::Switch(switch_args) => {
+            org_switch(&workos_url, &cloud_url, &client_id, &switch_args.org).await
+        }
     }
 }
 
-async fn org_switch(cloud_url: &str, org: &str) -> Result<()> {
+async fn org_switch(workos_url: &str, cloud_url: &str, client_id: &str, org: &str) -> Result<()> {
     let cfg = config::Config::load(None).context("loading config")?;
     let auth = cfg.auth.as_ref().ok_or_else(|| {
         anyhow::anyhow!("Not logged in. Run `spelunk login` before switching organizations.")
     })?;
 
     let client = auth_api::build_client()?;
-    let tokens = switch_org(&client, cloud_url, auth, org).await?;
+    let tokens = switch_org(&client, workos_url, cloud_url, client_id, auth, org).await?;
     persist_tokens(&tokens)?;
     println!("Switched to organization '{org}'.");
     Ok(())
@@ -65,18 +71,27 @@ async fn org_switch(cloud_url: &str, org: &str) -> Result<()> {
 /// Silently switch the session to `org` using the stored refresh token.
 ///
 /// `org` may be a local org UUID or a slug. A slug is resolved to its local org
-/// UUID via `GET /v1/me`; the UUID is then sent as `organization_id` to
-/// `POST /v1/auth/token`, which rotates the tokens scoped to that organisation
-/// (or returns `org_not_member`).
+/// UUID via cloud-api `GET /v1/me`; the UUID is then sent as `organization_id`
+/// to WorkOS `/authenticate` (refresh grant), which rotates the tokens scoped
+/// to that organisation (or returns an `organization_not_found` membership
+/// error).
 pub async fn switch_org(
     client: &reqwest::Client,
+    workos_url: &str,
     cloud_url: &str,
+    client_id: &str,
     auth: &AuthTokens,
     org: &str,
 ) -> Result<AuthTokens> {
     let org_uuid = resolve_org_uuid(client, cloud_url, auth, org).await?;
-    let success =
-        auth_api::refresh_token(client, cloud_url, &auth.refresh_token, Some(&org_uuid)).await?;
+    let success = auth_api::refresh_token(
+        client,
+        workos_url,
+        client_id,
+        &auth.refresh_token,
+        Some(&org_uuid),
+    )
+    .await?;
     Ok(success.into_auth_tokens())
 }
 
@@ -113,35 +128,6 @@ pub fn persist_tokens(tokens: &AuthTokens) -> Result<()> {
     config::save_auth_tokens(tokens).context("saving auth tokens to ~/.config/spelunk/config.toml")
 }
 
-/// Resolve which organisation to act on during a multi-org device login.
-///
-/// When `org_flag` (a slug) is given, it must match an entry in `organizations`
-/// (by slug, or by id as a fallback); otherwise `prompt` is invoked so the
-/// operator can choose interactively.
-pub fn resolve_org_for_switch(
-    organizations: &[Organization],
-    org_flag: Option<&str>,
-    prompt: impl FnOnce(&[Organization]) -> Result<Organization>,
-) -> Result<Organization> {
-    match org_flag {
-        Some(slug) => organizations
-            .iter()
-            .find(|o| o.slug == slug || o.id == slug)
-            .cloned()
-            .ok_or_else(|| {
-                let available = organizations
-                    .iter()
-                    .map(|o| o.slug.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                anyhow::anyhow!(
-                    "Organization '{slug}' is not one of your memberships. Available: {available}"
-                )
-            }),
-        None => prompt(organizations),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,63 +162,21 @@ mod tests {
         assert!(msg.contains("gamma"), "error should name the slug: {msg}");
     }
 
-    fn orgs() -> Vec<Organization> {
-        vec![
-            Organization {
-                id: "org_a".into(),
-                name: "Acme".into(),
-                slug: "acme".into(),
-            },
-            Organization {
-                id: "org_b".into(),
-                name: "Beta".into(),
-                slug: "beta".into(),
-            },
-        ]
-    }
-
-    fn unreachable_prompt(_: &[Organization]) -> Result<Organization> {
-        panic!("prompt must not be called when --org matches");
-    }
-
-    /// `--org <slug>` selects the matching org without prompting.
-    #[test]
-    fn resolve_matches_org_flag_by_slug() {
-        let org = resolve_org_for_switch(&orgs(), Some("beta"), unreachable_prompt).unwrap();
-        assert_eq!(org.id, "org_b");
-    }
-
-    /// `--org` also accepts an org's local UUID directly (id fallback).
-    #[test]
-    fn resolve_matches_org_flag_by_id() {
-        let org = resolve_org_for_switch(&orgs(), Some("org_a"), unreachable_prompt).unwrap();
-        assert_eq!(org.slug, "acme");
-    }
-
-    /// A `--org` that is not a membership is a clear error, not a prompt.
-    #[test]
-    fn resolve_unknown_org_flag_errors() {
-        let err = resolve_org_for_switch(&orgs(), Some("gamma"), unreachable_prompt).unwrap_err();
-        assert!(err.to_string().contains("gamma"));
-    }
-
-    /// With no `--org`, the prompt is used.
-    #[test]
-    fn resolve_without_flag_prompts() {
-        let chosen = resolve_org_for_switch(&orgs(), None, |o| Ok(o[0].clone())).unwrap();
-        assert_eq!(chosen.id, "org_a");
-    }
-
-    // ── switch_org wire-level tests ───────────────────────────────────────────
+    // ── switch_org wire-level tests (WorkOS-direct, ADR-047) ──────────────────
+    //
+    // `switch_org` makes two calls: cloud-api `GET /v1/me` (slug → UUID) and
+    // WorkOS `POST /user_management/authenticate` (refresh grant). Both are
+    // mounted on one mock server here, used as both `cloud_url` and `workos_url`.
     mod switch_org_wire {
         use serde_json::Value;
-        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
         use crate::cli::cmd::org::switch_org;
         use spelunk_core::config::AuthTokens;
 
         const BETA_UUID: &str = "22222222-2222-2222-2222-222222222222";
+        const CLIENT_ID: &str = "client_test";
 
         fn auth() -> AuthTokens {
             AuthTokens {
@@ -243,33 +187,64 @@ mod tests {
             }
         }
 
-        fn token_success(org_id: &str) -> Value {
+        /// Build an unsigned JWT whose payload carries `exp` and `org_id`, so the
+        /// CLI's claim decode resolves the rotated session's org and expiry.
+        fn jwt(org_id: &str, exp: i64) -> String {
+            fn b64url(bytes: &[u8]) -> String {
+                const A: &[u8] =
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+                let mut out = String::new();
+                for chunk in bytes.chunks(3) {
+                    let b = [
+                        chunk[0],
+                        *chunk.get(1).unwrap_or(&0),
+                        *chunk.get(2).unwrap_or(&0),
+                    ];
+                    let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+                    out.push(A[((n >> 18) & 0x3f) as usize] as char);
+                    out.push(A[((n >> 12) & 0x3f) as usize] as char);
+                    if chunk.len() > 1 {
+                        out.push(A[((n >> 6) & 0x3f) as usize] as char);
+                    }
+                    if chunk.len() > 2 {
+                        out.push(A[(n & 0x3f) as usize] as char);
+                    }
+                }
+                out
+            }
+            let payload = serde_json::json!({ "exp": exp, "org_id": org_id }).to_string();
+            format!("{}.{}.sig", b64url(b"{}"), b64url(payload.as_bytes()))
+        }
+
+        /// WorkOS `/authenticate` success body (access_token is a JWT).
+        fn workos_success(org_id: &str) -> Value {
             serde_json::json!({
-                "token_type": "workos",
-                "access_token": "at-new",
+                "access_token": jwt(org_id, 4_000_000_100),
                 "refresh_token": "rt-new",
-                "expires_at": 4_000_000_100_i64,
-                "org_id": org_id,
+                "organization_id": org_id,
             })
         }
 
-        /// Asserts the `/v1/auth/token` body carries the expected
-        /// `organization_id` (the resolved local UUID).
-        struct AssertOrgId(&'static str);
-        impl Respond for AssertOrgId {
+        /// Asserts the WorkOS form body carries the expected `organization_id`
+        /// (the resolved local UUID) and the refresh grant fields.
+        struct AssertForm(&'static str);
+        impl Respond for AssertForm {
             fn respond(&self, request: &Request) -> ResponseTemplate {
-                let body: Value = serde_json::from_slice(&request.body).unwrap();
-                assert_eq!(
-                    body["organization_id"].as_str(),
-                    Some(self.0),
-                    "organization_id must be the local org UUID"
+                let body = String::from_utf8_lossy(&request.body);
+                assert!(
+                    body.contains(&format!("organization_id={}", self.0)),
+                    "organization_id must be the local org UUID, got body: {body}"
                 );
-                ResponseTemplate::new(200).set_body_json(token_success(self.0))
+                assert!(
+                    body.contains("grant_type=refresh_token"),
+                    "must use the refresh-token grant, got body: {body}"
+                );
+                ResponseTemplate::new(200).set_body_json(workos_success(self.0))
             }
         }
 
         /// `switch_org(<slug>)` calls GET /v1/me, resolves the slug to its local
-        /// UUID, and POSTs that UUID as `organization_id`.
+        /// UUID, and POSTs that UUID as `organization_id` to WorkOS.
         #[tokio::test]
         async fn slug_resolves_via_me_then_switches() {
             let server = MockServer::start().await;
@@ -288,17 +263,24 @@ mod tests {
                 .await;
 
             Mock::given(method("POST"))
-                .and(path("/v1/auth/token"))
-                .respond_with(AssertOrgId(BETA_UUID))
+                .and(path("/user_management/authenticate"))
+                .respond_with(AssertForm(BETA_UUID))
                 .expect(1)
                 .mount(&server)
                 .await;
 
             let client = reqwest::Client::new();
-            let tokens = switch_org(&client, &server.uri(), &auth(), "beta")
-                .await
-                .expect("slug switch should succeed");
-            assert_eq!(tokens.access_token, "at-new");
+            let tokens = switch_org(
+                &client,
+                &server.uri(),
+                &server.uri(),
+                CLIENT_ID,
+                &auth(),
+                "beta",
+            )
+            .await
+            .expect("slug switch should succeed");
+            assert_eq!(tokens.refresh_token, "rt-new");
             assert_eq!(tokens.org_id, BETA_UUID);
         }
 
@@ -308,22 +290,25 @@ mod tests {
         async fn uuid_passed_directly_skips_me() {
             let server = MockServer::start().await;
 
-            // No /v1/me mock mounted: if it is hit, the request 404s and the
-            // body assertion below would never run with the right value.
+            // No /v1/me mock mounted: if it is hit, the request 404s.
             Mock::given(method("POST"))
-                .and(path("/v1/auth/token"))
-                .and(body_partial_json(
-                    serde_json::json!({ "organization_id": BETA_UUID }),
-                ))
-                .respond_with(ResponseTemplate::new(200).set_body_json(token_success(BETA_UUID)))
+                .and(path("/user_management/authenticate"))
+                .respond_with(AssertForm(BETA_UUID))
                 .expect(1)
                 .mount(&server)
                 .await;
 
             let client = reqwest::Client::new();
-            let tokens = switch_org(&client, &server.uri(), &auth(), BETA_UUID)
-                .await
-                .expect("uuid switch should succeed");
+            let tokens = switch_org(
+                &client,
+                &server.uri(),
+                &server.uri(),
+                CLIENT_ID,
+                &auth(),
+                BETA_UUID,
+            )
+            .await
+            .expect("uuid switch should succeed");
             assert_eq!(tokens.org_id, BETA_UUID);
         }
 
@@ -344,27 +329,34 @@ mod tests {
                 .await;
 
             Mock::given(method("POST"))
-                .and(path("/v1/auth/token"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(token_success(BETA_UUID)))
+                .and(path("/user_management/authenticate"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(workos_success(BETA_UUID)))
                 .expect(0)
                 .mount(&server)
                 .await;
 
             let client = reqwest::Client::new();
-            let err = switch_org(&client, &server.uri(), &auth(), "gamma")
-                .await
-                .expect_err("unknown slug should error");
+            let err = switch_org(
+                &client,
+                &server.uri(),
+                &server.uri(),
+                CLIENT_ID,
+                &auth(),
+                "gamma",
+            )
+            .await
+            .expect_err("unknown slug should error");
             assert!(
                 err.to_string().contains("gamma"),
                 "error should name the slug: {err}"
             );
         }
 
-        /// A slug that resolves to a UUID but is rejected by the token endpoint
-        /// with `403 org_not_member` surfaces the clear membership error — the
-        /// server is the authority on membership even after a local slug match.
+        /// A slug that resolves to a UUID but is rejected by WorkOS with
+        /// `organization_not_found` surfaces the clear membership error — WorkOS
+        /// is the authority on membership even after a local slug match.
         #[tokio::test]
-        async fn token_403_org_not_member_maps_to_membership_error() {
+        async fn organization_not_found_maps_to_membership_error() {
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))
@@ -378,18 +370,25 @@ mod tests {
                 .await;
 
             Mock::given(method("POST"))
-                .and(path("/v1/auth/token"))
-                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
-                    "error": "org_not_member"
+                .and(path("/user_management/authenticate"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": "organization_not_found"
                 })))
                 .expect(1)
                 .mount(&server)
                 .await;
 
             let client = reqwest::Client::new();
-            let err = switch_org(&client, &server.uri(), &auth(), "beta")
-                .await
-                .expect_err("a 403 org_not_member must error");
+            let err = switch_org(
+                &client,
+                &server.uri(),
+                &server.uri(),
+                CLIENT_ID,
+                &auth(),
+                "beta",
+            )
+            .await
+            .expect_err("an organization_not_found must error");
             assert!(
                 err.to_string().contains("not a member"),
                 "expected a clear membership error, got: {err}"
