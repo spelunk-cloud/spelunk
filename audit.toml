@@ -1,6 +1,13 @@
 [advisories]
-ignore = [
-    # RUSTSEC-2026-0097: affects rand 0.10.0 via lopdf 0.40.0 (PDF parsing, optional feature).
-    # lopdf is at the latest release and has no patched version available yet.
-    "RUSTSEC-2026-0097",
-]
+# No active vulnerability ignores.
+#
+# RUSTSEC-2026-0187 (lopdf: stack overflow via deeply nested PDF objects) is fixed by
+#   upgrading lopdf 0.41 -> 0.42 in crates/spelunk-core (optional `rich-formats` feature),
+#   not by ignoring it.
+# RUSTSEC-2026-0097 (rand 0.10.0 pulled via the old lopdf) no longer applies after that bump
+#   — the tree now resolves rand 0.10.1 — so its previous ignore was removed.
+#
+# `cargo audit` still prints two informational `unmaintained` warnings
+#   (paste RUSTSEC-2024-0436, proc-macro-error2 RUSTSEC-2026-0173); these are warnings,
+#   not vulnerabilities, and do not fail the audit.
+ignore = []
