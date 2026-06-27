@@ -96,11 +96,8 @@ pub async fn index(args: IndexArgs, cfg: Config) -> Result<()> {
 
     // Keep the global registry in sync with the current location.
     {
-        let root_now = args
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| args.path.clone());
-        let db_now = db_path.canonicalize().unwrap_or_else(|_| db_path.clone());
+        let root_now = spelunk_core::utils::canonicalize(args.path.as_ref());
+        let db_now = spelunk_core::utils::canonicalize(db_path.as_ref());
         if let Ok(reg) = Registry::open() {
             let _ = reg.register(&root_now, &db_now);
         }
@@ -114,10 +111,7 @@ pub async fn index(args: IndexArgs, cfg: Config) -> Result<()> {
     }
 
     // Canonicalise the root so symlinks don't create duplicate entries.
-    let root_canonical = args
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| args.path.clone());
+    let root_canonical = spelunk_core::utils::canonicalize(args.path.as_ref());
 
     // ── Background-phases mode ────────────────────────────────────────────────
     // When spawned as a background process (--_background-phases), skip phases
@@ -273,7 +267,7 @@ async fn run_phases_3_to_5(
 
     // Register / update this project in the global registry.
     if let Ok(reg) = Registry::open() {
-        let db_canonical = db_path.canonicalize().unwrap_or(db_path.to_path_buf());
+        let db_canonical = spelunk_core::utils::canonicalize(db_path);
         if let Err(e) = reg.register(root_canonical, &db_canonical) {
             tracing::warn!("registry update failed: {e}");
         }

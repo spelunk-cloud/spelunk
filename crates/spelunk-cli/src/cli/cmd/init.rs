@@ -48,15 +48,13 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
     }
 
     // ── 3. Register in global registry ───────────────────────────────────────
-    let root_canonical = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.clone());
+    let root_canonical = spelunk_core::utils::canonicalize(project_root.as_ref());
 
     if let Ok(reg) = Registry::open() {
         // We register with the expected db_path even if it doesn't exist yet —
         // the index step below will create it.
         let db_canonical = if db_path.exists() {
-            db_path.canonicalize().unwrap_or_else(|_| db_path.clone())
+            spelunk_core::utils::canonicalize(db_path.as_ref())
         } else {
             db_path.clone()
         };

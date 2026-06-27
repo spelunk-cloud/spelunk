@@ -41,9 +41,7 @@ pub fn link(args: LinkArgs, _cfg: Config) -> Result<()> {
     } else {
         cwd.join(&args.path)
     };
-    let target_canonical = target_path
-        .canonicalize()
-        .unwrap_or_else(|_| target_path.clone());
+    let target_canonical = spelunk_core::utils::canonicalize(target_path.as_ref());
 
     if target_canonical == primary.root_path {
         anyhow::bail!("A project cannot depend on itself.");
@@ -88,9 +86,7 @@ pub fn unlink(args: UnlinkArgs, _cfg: Config) -> Result<()> {
     } else {
         cwd.join(&args.path)
     };
-    let target_canonical = target_path
-        .canonicalize()
-        .unwrap_or_else(|_| target_path.clone());
+    let target_canonical = spelunk_core::utils::canonicalize(target_path.as_ref());
 
     let dep = reg.find_by_root(&target_canonical)?.with_context(|| {
         format!(

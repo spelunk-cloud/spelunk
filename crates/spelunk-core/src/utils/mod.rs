@@ -125,6 +125,21 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Canonicalize a path to its most compatible absolute form.
+///
+/// Wraps [`dunce::canonicalize`], which resolves symlinks like
+/// `std::fs::canonicalize` but returns the de-UNC'd path on Windows — without the
+/// `\\?\` verbatim prefix that `std::fs::canonicalize` adds (and correctly keeps
+/// the prefix for genuine UNC paths). Canonical project paths are stored in the
+/// registry; the lookup side derives the current project root via gix
+/// ([`resolve_main_worktree_root`]), which yields plain `C:\…` paths, so a
+/// `\\?\`-prefixed registry entry would never match on Windows. Falls back to the
+/// input path if canonicalization fails (e.g. the path does not exist yet). On
+/// macOS/Linux this behaves exactly like `std::fs::canonicalize`.
+pub fn canonicalize(path: &std::path::Path) -> std::path::PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Normalize a file path's separators to forward slashes for indexing + lookup.
 ///
 /// The index stores root-relative paths so it is portable across machines. On

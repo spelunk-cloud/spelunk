@@ -4757,6 +4757,7 @@ dependencies = [
  "chrono",
  "dirs",
  "docx-rs",
+ "dunce",
  "gix",
  "gix-fs",
  "gix-pack 0.72.0",

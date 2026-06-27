@@ -146,7 +146,7 @@ fn normalise_git_url(url: &str) -> String {
 }
 
 fn derive_local_fallback(root: &Path) -> String {
-    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical = crate::utils::canonicalize(root);
     let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
     format!("local/{}", hash.to_hex())
 }

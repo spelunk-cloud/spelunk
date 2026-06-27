@@ -39,6 +39,15 @@ fn registry_dir(home: &Path) -> PathBuf {
     home.join(".config").join("spelunk")
 }
 
+/// Canonicalize a path for storage in the test registry the same way the product
+/// does — via `spelunk_core::utils::canonicalize` (backed by `dunce`), which
+/// de-UNCs the Windows `\\?\` prefix so registry entries match the plain `C:\…`
+/// paths the product's gix-based lookup derives. Without this the cross-project
+/// dep lookup silently finds nothing on Windows.
+fn canon(p: &Path) -> PathBuf {
+    spelunk_core::utils::canonicalize(p)
+}
+
 /// A self-contained test registry backed by a file inside the test's HOME dir.
 ///
 /// The registry is a `registry.db`-format SQLite file.  Every CLI invocation
@@ -84,8 +93,8 @@ impl TestRegistry {
     /// mismatches between the registered path and the path the CLI sees when it
     /// resolves `current_dir()`.
     fn register(&self, root: &Path, db: &Path) -> i64 {
-        let root_c = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let db_c = std::fs::canonicalize(db).unwrap_or_else(|_| db.to_path_buf());
+        let root_c = canon(root);
+        let db_c = canon(db);
         self.conn
             .execute(
                 "INSERT INTO projects (root_path, db_path)
@@ -204,7 +213,7 @@ fn seed_note(
 /// The `db_path` is canonicalized to match what `Registry::register` stores
 /// (both must agree on `/private/var/...` vs `/var/...` on macOS).
 fn write_config(dir: &Path, index_db: &Path) -> PathBuf {
-    let index_db_c = std::fs::canonicalize(index_db).unwrap_or_else(|_| index_db.to_path_buf());
+    let index_db_c = canon(index_db);
     let cfg = format!(
         concat!(
             "db_path = {:?}\n",
@@ -268,10 +277,10 @@ fn setup_linked_projects() -> (
     let dep_index_raw = create_spelunk_dir(&dep_root_raw);
 
     // Canonicalize after the directories exist so symlink resolution succeeds.
-    let primary_root = std::fs::canonicalize(&primary_root_raw).unwrap_or(primary_root_raw);
-    let primary_index = std::fs::canonicalize(&primary_index_raw).unwrap_or(primary_index_raw);
-    let dep_root = std::fs::canonicalize(&dep_root_raw).unwrap_or(dep_root_raw);
-    let dep_index = std::fs::canonicalize(&dep_index_raw).unwrap_or(dep_index_raw);
+    let primary_root = canon(&primary_root_raw);
+    let primary_index = canon(&primary_index_raw);
+    let dep_root = canon(&dep_root_raw);
+    let dep_index = canon(&dep_index_raw);
 
     // Config db_path uses the canonical index.db path.
     let primary_config = write_config(&primary_root, &primary_index);
@@ -650,8 +659,8 @@ fn single_project_no_deps_works_unchanged() {
     let project_root_raw = tmp.path().join("proj");
     fs::create_dir_all(&project_root_raw).expect("create project dir");
     let index_db_raw = create_spelunk_dir(&project_root_raw);
-    let project_root = std::fs::canonicalize(&project_root_raw).unwrap_or(project_root_raw);
-    let index_db = std::fs::canonicalize(&index_db_raw).unwrap_or(index_db_raw);
+    let project_root = canon(&project_root_raw);
+    let index_db = canon(&index_db_raw);
     let config = write_config(&project_root, &index_db);
     let mem = index_db.with_file_name("memory.db");
 
@@ -1108,23 +1117,23 @@ fn multiple_deps_results_are_aggregated_not_duplicated() {
     let primary_root_raw = tmp.path().join("primary");
     fs::create_dir_all(&primary_root_raw).expect("primary dir");
     let primary_index_raw = create_spelunk_dir(&primary_root_raw);
-    let primary_root = std::fs::canonicalize(&primary_root_raw).unwrap_or(primary_root_raw);
-    let primary_index = std::fs::canonicalize(&primary_index_raw).unwrap_or(primary_index_raw);
+    let primary_root = canon(&primary_root_raw);
+    let primary_index = canon(&primary_index_raw);
     let primary_config = write_config(&primary_root, &primary_index);
     let primary_mem = primary_index.with_file_name("memory.db");
 
     let dep_a_root_raw = tmp.path().join("dep-a");
     fs::create_dir_all(&dep_a_root_raw).expect("dep-a dir");
     let dep_a_index_raw = create_spelunk_dir(&dep_a_root_raw);
-    let dep_a_root = std::fs::canonicalize(&dep_a_root_raw).unwrap_or(dep_a_root_raw);
-    let dep_a_index = std::fs::canonicalize(&dep_a_index_raw).unwrap_or(dep_a_index_raw);
+    let dep_a_root = canon(&dep_a_root_raw);
+    let dep_a_index = canon(&dep_a_index_raw);
     let dep_a_mem = dep_a_index.with_file_name("memory.db");
 
     let dep_b_root_raw = tmp.path().join("dep-b");
     fs::create_dir_all(&dep_b_root_raw).expect("dep-b dir");
     let dep_b_index_raw = create_spelunk_dir(&dep_b_root_raw);
-    let dep_b_root = std::fs::canonicalize(&dep_b_root_raw).unwrap_or(dep_b_root_raw);
-    let dep_b_index = std::fs::canonicalize(&dep_b_index_raw).unwrap_or(dep_b_index_raw);
+    let dep_b_root = canon(&dep_b_root_raw);
+    let dep_b_index = canon(&dep_b_index_raw);
     let dep_b_mem = dep_b_index.with_file_name("memory.db");
 
     // Seed a locked decision in each dep.
@@ -1202,8 +1211,8 @@ fn missing_dep_memory_db_is_skipped_silently() {
     let primary_root_raw = tmp.path().join("primary");
     fs::create_dir_all(&primary_root_raw).expect("primary dir");
     let primary_index_raw = create_spelunk_dir(&primary_root_raw);
-    let primary_root = std::fs::canonicalize(&primary_root_raw).unwrap_or(primary_root_raw);
-    let primary_index = std::fs::canonicalize(&primary_index_raw).unwrap_or(primary_index_raw);
+    let primary_root = canon(&primary_root_raw);
+    let primary_index = canon(&primary_index_raw);
     let primary_config = write_config(&primary_root, &primary_index);
     let primary_mem = primary_index.with_file_name("memory.db");
 
@@ -1211,8 +1220,8 @@ fn missing_dep_memory_db_is_skipped_silently() {
     let dep_a_root_raw = tmp.path().join("dep-a");
     fs::create_dir_all(&dep_a_root_raw).expect("dep-a dir");
     let dep_a_index_raw = create_spelunk_dir(&dep_a_root_raw);
-    let dep_a_root = std::fs::canonicalize(&dep_a_root_raw).unwrap_or(dep_a_root_raw);
-    let dep_a_index = std::fs::canonicalize(&dep_a_index_raw).unwrap_or(dep_a_index_raw);
+    let dep_a_root = canon(&dep_a_root_raw);
+    let dep_a_index = canon(&dep_a_index_raw);
     let dep_a_mem = dep_a_index.with_file_name("memory.db");
     let conn_a = open_memory_db(&dep_a_mem);
     seed_note(
@@ -1228,8 +1237,8 @@ fn missing_dep_memory_db_is_skipped_silently() {
     let dep_b_root_raw = tmp.path().join("dep-b");
     fs::create_dir_all(&dep_b_root_raw).expect("dep-b dir");
     let dep_b_index_raw = create_spelunk_dir(&dep_b_root_raw);
-    let dep_b_root = std::fs::canonicalize(&dep_b_root_raw).unwrap_or(dep_b_root_raw);
-    let dep_b_index = std::fs::canonicalize(&dep_b_index_raw).unwrap_or(dep_b_index_raw);
+    let dep_b_root = canon(&dep_b_root_raw);
+    let dep_b_index = canon(&dep_b_index_raw);
     // Deliberately do NOT create dep_b_index.with_file_name("memory.db").
 
     let reg = TestRegistry::new(&home);

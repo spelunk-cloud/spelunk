@@ -27,6 +27,9 @@ percent-encoding = "2.3"
 
 toml = "1.1"
 dirs = "6"
+# Canonicalize paths without the Windows `\\?\` verbatim prefix (std::fs::canonicalize
+# adds it), so registry paths match the plain paths the lookup side derives via gix.
+dunce = "1"
 
 gix = { version = "0.84.0", default-features = false, features = [
     "sha1",
