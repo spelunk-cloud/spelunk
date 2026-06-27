@@ -404,6 +404,15 @@ fn spelunk_only_remnant(path: &std::path::Path) -> bool {
 // ---------------------------------------------------------------------------
 
 fn registry_path() -> Result<PathBuf> {
+    // `SPELUNK_REGISTRY_DIR` overrides the registry location. This exists for
+    // test isolation: the default uses `dirs::config_dir()`, which on Windows
+    // resolves via the Known Folder API (`%APPDATA%`) and is not redirectable by
+    // `HOME`/env, so tests cannot otherwise point the CLI at a temp registry.
+    if let Ok(dir) = std::env::var("SPELUNK_REGISTRY_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir).join("registry.db"));
+    }
     let base = dirs::config_dir()
         .context("could not determine user config directory")?
         .join("spelunk");
