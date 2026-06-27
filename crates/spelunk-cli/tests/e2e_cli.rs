@@ -13,7 +13,9 @@ fn test_help_output() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Usage: spelunk [OPTIONS] <COMMAND>",
+            // On Windows clap includes the `.exe` extension: "spelunk.exe [OPTIONS]…"
+            // Match only the stable prefix so the assertion holds on all platforms.
+            "Usage: spelunk",
         ))
         .stdout(predicate::str::contains("Commands:"));
 }
@@ -781,7 +783,10 @@ fn test_status_json_offline_tier() {
 
 /// When there is no .spelunk/index.db, `spelunk search` in auto mode must
 /// succeed (via ast-grep fallback) rather than printing an opaque error.
+/// Skipped on Windows because `ast-grep` (`sg`) is not available on the
+/// `windows-latest` GitHub Actions runner, so the fallback can't be exercised.
 #[test]
+#[cfg_attr(windows, ignore)]
 fn test_search_no_index_falls_back_to_ast_grep_or_clean_message() {
     let temp = tempdir().unwrap();
     let project_dir = temp.path().join("project");
@@ -823,7 +828,10 @@ fn test_search_no_index_falls_back_to_ast_grep_or_clean_message() {
 /// When the index exists but there is no embedder (api_base_url points
 /// nowhere), `spelunk search` in auto mode must fall back to ast-grep and
 /// succeed, not bail out with a hard error.
+/// Skipped on Windows because `ast-grep` (`sg`) is not available on the
+/// `windows-latest` GitHub Actions runner, so the fallback can't be exercised.
 #[test]
+#[cfg_attr(windows, ignore)]
 fn test_search_index_but_no_embedder_falls_back_to_ast_grep() {
     let temp = tempdir().unwrap();
     let project_dir = temp.path().join("project");
@@ -1207,6 +1215,8 @@ async fn test_memory_add_then_search_round_trip_on_local_store_with_auto_discove
     Command::cargo_bin("spelunk")
         .unwrap()
         .env("HOME", &home)
+        // Windows: dirs::home_dir() reads USERPROFILE, not HOME.
+        .env("USERPROFILE", &home)
         .env("SPELUNK_NO_SERVER", "1")
         .arg("--config")
         .arg(&config_path)
@@ -1221,6 +1231,8 @@ async fn test_memory_add_then_search_round_trip_on_local_store_with_auto_discove
     Command::cargo_bin("spelunk")
         .unwrap()
         .env("HOME", &home)
+        // Windows: dirs::home_dir() reads USERPROFILE, not HOME.
+        .env("USERPROFILE", &home)
         .env_remove("SPELUNK_NO_SERVER")
         .current_dir(&project_dir)
         .arg("--config")
@@ -1246,6 +1258,8 @@ async fn test_memory_add_then_search_round_trip_on_local_store_with_auto_discove
     Command::cargo_bin("spelunk")
         .unwrap()
         .env("HOME", &home)
+        // Windows: dirs::home_dir() reads USERPROFILE, not HOME.
+        .env("USERPROFILE", &home)
         .env_remove("SPELUNK_NO_SERVER")
         .current_dir(&project_dir)
         .arg("--config")
@@ -1263,6 +1277,8 @@ async fn test_memory_add_then_search_round_trip_on_local_store_with_auto_discove
     Command::cargo_bin("spelunk")
         .unwrap()
         .env("HOME", &home)
+        // Windows: dirs::home_dir() reads USERPROFILE, not HOME.
+        .env("USERPROFILE", &home)
         .env_remove("SPELUNK_NO_SERVER")
         .current_dir(&project_dir)
         .arg("--config")
@@ -1307,6 +1323,8 @@ async fn test_memory_timeline_reads_local_store_with_auto_discovered_server() {
     Command::cargo_bin("spelunk")
         .unwrap()
         .env("HOME", &home)
+        // Windows: dirs::home_dir() reads USERPROFILE, not HOME.
+        .env("USERPROFILE", &home)
         .env("SPELUNK_NO_SERVER", "1")
         .arg("--config")
         .arg(&config_path)
@@ -1318,6 +1336,8 @@ async fn test_memory_timeline_reads_local_store_with_auto_discovered_server() {
     Command::cargo_bin("spelunk")
         .unwrap()
         .env("HOME", &home)
+        // Windows: dirs::home_dir() reads USERPROFILE, not HOME.
+        .env("USERPROFILE", &home)
         .env_remove("SPELUNK_NO_SERVER")
         .current_dir(&project_dir)
         .arg("--config")
@@ -1338,6 +1358,8 @@ async fn test_memory_timeline_reads_local_store_with_auto_discovered_server() {
     Command::cargo_bin("spelunk")
         .unwrap()
         .env("HOME", &home)
+        // Windows: dirs::home_dir() reads USERPROFILE, not HOME.
+        .env("USERPROFILE", &home)
         .env_remove("SPELUNK_NO_SERVER")
         .current_dir(&project_dir)
         .arg("--config")
