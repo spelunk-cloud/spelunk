@@ -12,6 +12,21 @@ Docker quick-start that publishes a port nothing can reach, and no first-class
 answer to "how do I actually stand up a shared team server?" This ADR records
 the founder's answer.
 
+> **Correction (2026-07-10, spelunk-oss^122):** Several passages below, namely
+> Context "What the server does and does not do about transport", Decision §1,
+> and Security implications, describe the keyed non-loopback plaintext bind as
+> "permitted by the binary" or a bind the binary "still allows" / "still
+> permits", framed as a footgun to steer operators away from. That is stale
+> relative to shipped code and contradicts this ADR's own Trigger note above:
+> `check_bind_safety` (`crates/spelunk-server/src/main.rs`) refuses **every**
+> non-loopback plaintext bind unconditionally, keyless *and* keyed alike, with no
+> override. There is no keyed-LAN-plaintext bind to warn about; the only off-host
+> path is a loopback bind behind an operator-owned TLS terminator, which is the
+> topology this ADR recommends. Read every "permitted/allowed/permits" phrasing
+> below as "refused." The reconciled operator-facing wording is in
+> [`server.md`](../server.md) and
+> [`THREAT-MODEL.md`](../security/THREAT-MODEL.md).
+
 ---
 
 ## Context

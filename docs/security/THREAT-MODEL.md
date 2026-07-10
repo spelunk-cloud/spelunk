@@ -128,12 +128,17 @@ Client (spelunk CLI / any HTTP client)
 ```
 
 **Key difference from Mode A:** In server mode, memory content is accessible to anyone
-who can reach the server's port. To prevent an open, unauthenticated server on a
-shared network, `spelunk-server` **refuses to start** when `--host` is a non-loopback
-address (`0.0.0.0`, a LAN/public IP) and no `--key` / `SPELUNK_SERVER_KEY` is set. A
-keyless server can therefore only bind loopback (`127.0.0.1`), where it is reachable
-by local processes but not by other machines. (A blank/whitespace key — e.g.
-docker-compose's `${SPELUNK_SERVER_KEY:-}` default — is treated as no key.)
+who can reach the server's port. `spelunk-server` **refuses to start** on any
+non-loopback plaintext bind (`--host 0.0.0.0`, a LAN/public IP), and this refusal is
+**unconditional**: it applies whether or not a `--key` / `SPELUNK_SERVER_KEY` is set,
+with no override. A keyless non-loopback bind would be an open, unauthenticated server;
+a keyed one would send the bearer key across the network in cleartext. Plaintext HTTP
+is therefore loopback-only (`127.0.0.1`), reachable by local processes but not by other
+machines. (A blank or whitespace key, such as docker-compose's `${SPELUNK_SERVER_KEY:-}`
+default, is treated as no key.) A shared, off-host deployment binds `spelunk-server`
+to loopback and puts an operator-owned TLS terminator in front, so the shared key never
+crosses the network in cleartext (see
+[ADR-058](../adr/058-team-server-bare-metal-deployment.md)).
 
 ### Tenancy boundary: single trust domain (ADR-056)
 
@@ -195,7 +200,7 @@ unauthenticated (no bearer required or sent).
 | **Source code sent off-machine for embedding** | A | Medium | **High** | The default loopback server embeds natively on-machine, so nothing leaves. Egress requires an explicit remote team `server_url` (chunk text crosses to the team server) or a server whose operator set an external `--embedding-url` (server forwards post-secret-scan chunks to a third party). Both are explicit operator choices; users must be informed via docs. |
 | **Memory notes / code context sent off-machine for LLM** | A | Low | **High** | `spelunk explore` and `memory harvest` send memory content + code context to `spelunk-server`. On the default loopback server the LLM runs on-machine; egress requires a remote team `server_url` or a server-side `--llm-url` shim. |
 | Server memory accessible without auth | B | Medium | High | No `--key` / `SPELUNK_SERVER_KEY` by default; any process that can reach the port reads all notes |
-| Server bound to 0.0.0.0 exposes data on LAN/internet | B | Medium | High | **Enforced:** a non-loopback bind requires a key — `spelunk-server` refuses to start on `0.0.0.0`/LAN/public addresses without `--key` / `SPELUNK_SERVER_KEY`; loopback (`127.0.0.1`) is the default (spelunk-oss^52 / PR #490) |
+| Server bound to 0.0.0.0 exposes data on LAN/internet | B | Medium | High | **Enforced:** `spelunk-server` refuses to start on any non-loopback plaintext bind (`0.0.0.0`/LAN/public). The refusal is unconditional, covering both the keyless case (an open, unauthenticated server) and the keyed case (the bearer key would cross the network in cleartext), with no override. Plaintext HTTP is loopback-only (`127.0.0.1`, the default); an off-host deployment terminates TLS in an operator-owned front proxy (spelunk-oss^52 / PR #490; see [ADR-058](../adr/058-team-server-bare-metal-deployment.md)) |
 | Indexed content contains credentials missed by scanner | A | Medium | Medium | Pattern gaps tracked in #138 |
 | CLI bearer credential (`server_key`) readable as plaintext at rest (e.g. user syncs `~/.config` into a dotfiles repo or backup) | A | Medium | High | The `server_key` is stored in the OS keychain (macOS Keychain / Linux Secret Service / Windows Credential Manager), not in `config.toml`; a legacy plaintext key is migrated out and stripped on next run. Headless fallback is an owner-only (`0600`) `secrets.toml`; `SPELUNK_SERVER_KEY` is the CI escape hatch. The credential is never logged. |
 | `spelunk memory add`/edit interactive `$EDITOR` draft written to a predictable temp path, enabling symlink/TOCTOU clobber and a world-readable info-leak window | A | Low | Medium | **Fixed (spelunk-oss^62):** the draft is created via `tempfile::Builder` (unpredictable name, `O_EXCL`, mode `0600` on unix) instead of a PID-derived path in `std::env::temp_dir()`. The `NamedTempFile` handle is kept open across the `$EDITOR`/`$VISUAL` spawn and the body is read back by seeking the retained handle (not by re-opening the path), so a symlink swapped in at the draft's path during the edit window is not followed. |

@@ -3,6 +3,19 @@
 **Date:** 2026-07-02
 **Deciders:** founder (Johan), architect
 
+> **Clarification (2026-07-10, spelunk-oss^122):** The Context below refers to
+> `--host 0.0.0.0` with a shared key as the then-documented multi-developer
+> setup. That describes the pre-hardening state the security review examined, not
+> a supported posture today. The shipped binary refuses **any** non-loopback
+> plaintext bind unconditionally, keyless *and* keyed alike, with no override,
+> exactly as this ADR's own Decision and Consequences already require
+> (`check_bind_safety` in `crates/spelunk-server/src/main.rs`). A shared
+> deployment binds loopback and terminates TLS in an operator-owned front proxy
+> ([ADR-058](058-team-server-bare-metal-deployment.md)). The authoritative
+> operator-facing wording lives in [`server.md`](../server.md) and
+> [`THREAT-MODEL.md`](../security/THREAT-MODEL.md). This note clarifies the
+> historical Context; it does not change the decision.
+
 ## Context
 
 `spelunk-server` is an HTTP listener (axum) that can hold a team's memory when a

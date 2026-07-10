@@ -234,10 +234,11 @@ says so explicitly so no one has to infer it from behaviour.
   instances** — each with its own key and its own database — not by relying on
   project slugs within one instance. Two groups that must not see each other's
   memory run two servers.
-- The server enforces this at startup: binding to a non-loopback address with
-  a key configured (a shared/team deployment) logs a prominent warning
-  restating exactly this — every keyholder is a full administrator of every
-  project on the instance.
+- The server enforces the transport half of this at startup: it refuses any
+  non-loopback plaintext bind outright, keyed or keyless (see below), so a
+  shared/team deployment binds loopback behind an operator-owned TLS proxy. On
+  such an instance every keyholder is a full administrator of every project,
+  because the shared key is the only boundary.
 - If you need per-project or per-user access control within a single
   instance, this server does not provide it (and is not planned to for
   v1.0 — see ADR-056's "Revisit if" clause). The managed cloud product
@@ -313,7 +314,7 @@ cargo build --release --bin spelunk-server
 
 | Flag | Env | Default | Purpose |
 |---|---|---|---|
-| `--host` | (none) | `127.0.0.1` | Interface to bind. Non-loopback needs a key and TLS in front (see below). |
+| `--host` | (none) | `127.0.0.1` | Interface to bind. Non-loopback plaintext binds are refused, keyed or not (see below); a shared deployment binds loopback behind a TLS proxy. |
 | `--port` | (none) | `7777` | Port to bind. |
 | `--key` | (none) | unset | Shared bearer API key, passed inline. Visible in the process table — prefer `--key-file` or `SPELUNK_SERVER_KEY`. Leave every key source unset only for a loopback dev server. |
 | `--key-file` | (none) | unset | Read the key from a file (whole contents, trimmed). First-class alternative to `SPELUNK_SERVER_KEY`, not a fallback. |
