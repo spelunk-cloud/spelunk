@@ -359,3 +359,20 @@ Both open questions raised in review are resolved above (§2/§3): the binary
 reads the systemd credential directly (with `SPELUNK_SERVER_KEY` kept as a
 supported alternative), and a `DynamicUser=` variant will ship alongside the
 static-user default unit.
+
+> **Superseded in part (2026-07-10, see [ADR-066](066-server-native-tls-team-mode.md)):**
+> founder directive reversed the "Recommended topology" (§1) and the "Native
+> TLS in `spelunk-server`" Non-goal above. `spelunk-server` now terminates TLS
+> natively; a non-loopback bind requires an in-process TLS cert/key **and** a
+> key, and that — not a same-host operator-owned reverse proxy — is the
+> recommended (and only first-party-documented) team-server shape going
+> forward. The bare-metal + operator-terminator pattern this ADR designed
+> remains valid as an alternative for an operator who prefers to run
+> `spelunk-server` in **Local** (loopback) mode behind TLS infrastructure they
+> already operate — it is no longer the only supported path. The tenancy
+> model (§"Interaction" and all cross-references to ADR-056) is unaffected.
+> The systemd packaging, credential provisioning (§2/§3), and the
+> Docker-cannot-host-networked-serving analysis are unaffected by this ADR in
+> the loopback case, but that Docker analysis no longer applies to a
+> container run in Team mode (native TLS + `0.0.0.0`) — see ADR-066's
+> Consequences.

@@ -132,3 +132,12 @@ the primary mitigation. The consequences for the threat model:
   server-audit checklist items that assume per-project or per-principal scoping
   are reframed as not applicable by design under this ADR, rather than as
   unmet requirements.
+
+> **Clarification (2026-07-10, see [ADR-066](066-server-native-tls-team-mode.md)):**
+> the tenancy model above (single trust domain, shared key is the boundary) is
+> unchanged. What changes is *how* a non-loopback keyed bind stops sending the
+> key in cleartext: `spelunk-server` gains native TLS termination (Team mode),
+> rather than relying solely on an operator's own reverse proxy. The passage
+> above stating "the server restricts plaintext HTTP to loopback and
+> unconditionally requires TLS for any non-loopback deployment" now means TLS
+> can be satisfied in-process, not only via an external terminator.
