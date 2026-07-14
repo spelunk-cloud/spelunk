@@ -166,11 +166,15 @@ fn init_no_origin_prints_hint_and_succeeds() {
         )),
         "no-origin init should print the exact refspec hint, got:\n{stdout}"
     );
-    // The push hint frames the notes push as per-change, not one-time: each
-    // memory add/remove makes a new notes commit that must be pushed to travel.
+    // Publishing is opt-in, so init must name the hook that does it rather than
+    // the old manual push, which orphaned notes on unpushed commits (D1/D3).
     assert!(
-        stdout.contains("push notes after each memory change: git push origin refs/notes/spelunk"),
-        "no-origin init should print the per-change notes push hint, got:\n{stdout}"
+        stdout.contains("spelunk hooks install --pre-push"),
+        "no-origin init should name the pre-push hook install command, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("push notes after each memory change"),
+        "the retired per-change manual push hint must not reappear, got:\n{stdout}"
     );
     // And it must not have invented an `origin` remote.
     assert!(

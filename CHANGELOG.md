@@ -90,14 +90,35 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   remains gated to initialized projects. (ADR-068)
 - **`spelunk init` now configures the `origin` fetch refspec for `refs/notes/spelunk`**,
   so project memory notes travel automatically on `git fetch`. When init detects
-  an `origin` remote, it adds `+refs/notes/spelunk:refs/notes/spelunk` to the
-  fetch config (idempotently) and prints the push command users run to publish
-  their memory to the remote (re-run after each memory change, since every
-  memory add/remove creates a new notes commit). Teammates then run `spelunk init` in their
+  an `origin` remote, it adds the refspec to the fetch config (idempotently) and
+  names the command that publishes memory back (`spelunk hooks install
+  --pre-push`, below). Teammates then run `spelunk init` in their
   clones (or manually add the same refspec) and `git fetch` to receive notes. In
   projects without an `origin`, init prints the exact git commands to run later
   when the remote is added. See [docs/memory.md](#sharing-memory-across-clones-via-git-notes).
-  (ADR-068)
+  (ADR-068; the refspec value is corrected by ADR-069, see Fixed)
+- **`spelunk hooks install --pre-push` publishes your memory on `git push`.** The
+  hook fetches the remote's `refs/notes/spelunk`, merges it into yours with
+  `cat_sort_uniq` (a union, so neither side's entries are dropped), and pushes
+  the result to the remote you are pushing to, so decisions travel with the code
+  they describe. Publishing is **opt-in**: your memory stays local until you
+  install it, and `spelunk init` now says so and names the command. Reading a
+  teammate's memory needs no opt-in and is unchanged.
+
+  Publishing is tied to `git push` because that is the only moment that reliably
+  coincides with "this code is being shared". An entry recorded against a commit
+  you have not pushed can reach the remote while the commit does not, leaving the
+  note unresolvable in a fresh clone: it is on the remote, and nobody ever sees
+  it. That is what the old per-change manual push hint produced whenever you
+  recorded a decision before pushing the commit it describes, which is the normal
+  order of work; `init` no longer advertises it. Pushing the notes ref by hand
+  still works as a no-hook fallback, after you have pushed the commits.
+
+  The hook **never blocks your push**: on failure it warns on stderr and exits 0,
+  so a failed publish cannot cost you your code push. It retries a lost race up
+  to three times and never force-pushes. Teammates without spelunk on their PATH
+  are unaffected, and it never overwrites a pre-push hook it did not write.
+  `spelunk hooks uninstall` removes it. (ADR-069 D1/D3)
 - **Native in-process HTTPS for `spelunk-server`** via `--tls-cert`/`--tls-key`
   (env `SPELUNK_SERVER_TLS_CERT`/`SPELUNK_SERVER_TLS_KEY`), both-or-neither. The
   server terminates TLS itself, so a team/remote deployment is a routable

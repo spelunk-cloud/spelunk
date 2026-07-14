@@ -402,10 +402,11 @@ spelunk autoclean
 
 ## spelunk hooks
 
-Manage git post-commit hooks.
+Manage spelunk's git hooks.
 
 ```
 spelunk hooks install [--ci]
+spelunk hooks install --pre-push
 spelunk hooks uninstall
 ```
 
@@ -413,6 +414,19 @@ spelunk hooks uninstall
 `spelunk memory harvest` after each commit (both `--detach` so git is not
 blocked). Developers without `spelunk` installed are unaffected. `--ci` prints a
 GitHub Actions workflow step instead of writing a hook.
+
+`install --pre-push` writes a pre-push hook that publishes your memory
+(`refs/notes/spelunk`) to the remote you are pushing to, so decisions travel with
+the code they describe. It merges the remote's notes into yours before pushing (a
+union, so neither side is dropped) and retries a lost race up to three times. It
+never blocks your push: on failure it warns on stderr and exits 0, and it never
+force-pushes. Publishing is opt-in, so your memory stays local until you install
+it. See [memory.md](memory.md#sharing-memory-across-clones-via-git-notes).
+
+Neither hook overwrites one it did not write: if a hook of that name already
+exists, `install` reports it and leaves the file alone.
+
+`uninstall` removes every hook spelunk installed, leaving any other hooks alone.
 
 ---
 

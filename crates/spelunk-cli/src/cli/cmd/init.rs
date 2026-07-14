@@ -275,15 +275,14 @@ fn write_spelunk_gitignore(spelunk_dir: &std::path::Path) {
 ///
 /// Push refspec is deliberately NOT set: any `remote.origin.push` value
 /// overrides git's default branch push, so a normal `git push` would stop
-/// pushing the current branch. We keep the branch-push default intact and
-/// surface the manual notes push (needed after each memory change) instead.
+/// pushing the current branch. Publishing rides the opt-in pre-push hook
+/// instead, which this announces (ADR-069 D1/D3) because opt-in only works if
+/// it is discoverable without reading the docs.
 /// Also points `notes.rewriteRef` at spelunk's ref so memory survives history
 /// rewrites. That half is independent of `origin`: rewrites are purely local,
 /// so it runs even in a remote-less repo.
 async fn configure_notes_refspec(project_root: &std::path::Path) -> Vec<String> {
     const FETCH_REFSPEC: &str = "+refs/notes/spelunk*:refs/notes/origin/spelunk*";
-    const PUSH_HINT: &str =
-        "push notes after each memory change: git push origin refs/notes/spelunk";
 
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -303,7 +302,6 @@ async fn configure_notes_refspec(project_root: &std::path::Path) -> Vec<String> 
                 format!(
                     "         run later: git config --add remote.origin.fetch '{FETCH_REFSPEC}'"
                 ),
-                format!("         {PUSH_HINT}"),
             ]
         } else {
             // Idempotent: only `--add` when the identical refspec is not already present.
@@ -317,16 +315,12 @@ async fn configure_notes_refspec(project_root: &std::path::Path) -> Vec<String> 
                 })
                 .unwrap_or(false);
             if already {
-                vec![
-                    "Memory:  notes fetch refspec already configured on 'origin'".to_string(),
-                    format!("         {PUSH_HINT}"),
-                ]
+                vec!["Memory:  notes fetch refspec already configured on 'origin'".to_string()]
             } else {
                 match git(&["config", "--add", "remote.origin.fetch", FETCH_REFSPEC]) {
                     Ok(o) if o.status.success() => vec![
                         "Memory:  configured notes fetch refspec on 'origin' (teammates' memory arrives on fetch)"
                             .to_string(),
-                        format!("         {PUSH_HINT}"),
                     ],
                     Ok(o) => vec![format!(
                         "Memory:  could not configure notes refspec: {}",
@@ -339,6 +333,20 @@ async fn configure_notes_refspec(project_root: &std::path::Path) -> Vec<String> 
     };
 
     // Continuation lines: every branch above already opened a `Memory:` block.
+
+    // Reading a teammate's memory is automatic (the refspec above plus the
+    // read-path merge); publishing yours is opt-in, so say so unprompted.
+    if super::hooks::pre_push_installed() {
+        lines.push(
+            "         pre-push hook installed: your memory publishes on `git push`".to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "         your memory stays local until you install the pre-push hook: {}",
+            super::hooks::PRE_PUSH_INSTALL_CMD
+        ));
+    }
+
     match ensure_notes_rewrite_ref(Some(project_root)).await {
         RewriteRefStatus::Configured => lines.push(
             "         configured notes.rewriteRef (memory survives `git commit --amend` and `git rebase`)"
