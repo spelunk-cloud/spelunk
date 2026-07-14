@@ -129,11 +129,11 @@ jobs:
         run: make test-config TEST_FLAGS="${{ matrix.test-flags }}"
 
       # No make on the Windows image (MSYS2 ships with it but is not on PATH),
-      # so these two call cargo directly. .github/scripts/ci-drift-check.sh fails
-      # if they stop matching `make test-config`. Keep one command per step:
+      # so these two call cargo directly. .github/scripts/ci-drift-check.sh finds
+      # every Windows-reachable cargo step in this job by its `if:` and fails if
+      # they stop matching `make test-config`. Keep one command per step:
       # PowerShell only propagates the last command's exit code, so a combined
       # block would hide a nextest failure behind a passing doctest run.
-      # ci-drift:begin windows-test
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
         run: cargo nextest run ${{ matrix.test-flags }}
@@ -141,7 +141,6 @@ jobs:
       - name: Run doctests (Windows)
         if: runner.os == 'Windows'
         run: cargo test --doc ${{ matrix.test-flags }}
-      # ci-drift:end windows-test
 
   drift:
     name: Workflow/Makefile drift guard
