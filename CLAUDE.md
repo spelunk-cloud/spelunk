@@ -382,17 +382,49 @@ cargo run -p spelunk-server -- --port 7777
 # Verbose logging
 RUST_LOG=debug cargo run -p spelunk-cli -- index .
 
-# Tests (all crates)
-cargo test
+# Verify a change before pushing: the Check & Lint + Test legs of CI.
+# CI calls these same make targets, so green here and green CI agree.
+make check
 
-# Tests for a specific crate
-cargo test -p spelunk-core
-cargo test -p spelunk-cli
-cargo test -p spelunk-server
+# Individual gates (see `make help` for the full list)
+make lint      # fmt --all --check, clippy, check, build (all with rich-formats)
+make test      # nextest + doctests, for default AND --no-default-features
+make fmt       # reformat in place
+
+# Tests for a specific crate (nextest is what CI runs; plain `cargo test` is not)
+cargo nextest run -p spelunk-core
+cargo nextest run -p spelunk-cli
+cargo nextest run -p spelunk-server
 
 # Security audit (requires cargo-audit)
-cargo audit
+make audit
 ```
+
+**Do not hand-assemble the verification command: run `make check`.** Every ad-hoc
+variant of it has been wrong in at least one way, always in the direction of a false
+green:
+
+- CI runs `cargo nextest run`, **not** `cargo test`. Consequence: `#[serial]` is a
+  no-op under nextest (every test gets its own process), so a test relying on it to
+  serialise shared *external* state (a file, a port, a git ref) is unguarded in CI.
+- CI's clippy is `--all-targets --features rich-formats -- -D warnings`. Dropping the
+  feature lints **weaker** than CI: a warning only reachable under it passes locally
+  and fails CI.
+- nextest does not run doctests. CI runs `cargo test --doc` separately, per feature
+  config.
+- `SPELUNK_SECRET_STORE=file` must be set or macOS pops Keychain dialogs mid-run. The
+  make targets export it.
+
+Never pipe a gate into `tail`/`head` to shorten output. In zsh `${PIPESTATUS[0]}` is
+empty (its arrays are 1-indexed), so the pipeline reports a false green and hides the
+failure. Run the target and read its exit status.
+
+`make check` does **not** cover every CI job. The Windows test leg, Docker image build,
+`cargo audit`/`cargo deny`, the OpenAPI snapshot check and the nightly fuzz run are
+listed with their opt-in targets in
+[docs/building.md](docs/building.md#what-make-check-does-not-cover). To get the real CI
+signal on a branch without opening a PR, which is the only way to reach the Windows
+leg, run `gh workflow run ci.yml --ref "$(git branch --show-current)"`.
 
 ---
 

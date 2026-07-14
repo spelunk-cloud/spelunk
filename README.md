@@ -176,12 +176,31 @@ This is a Cargo workspace with three crates:
 ```bash
 cargo build -p spelunk-cli    # build the CLI
 cargo build -p spelunk-server # build the server
-cargo test                    # test all crates
+make check                    # run the lint + test gates CI runs
 ```
 
 ## Contributing
 
 Contributions welcome. See [Building from source](docs/building.md) for setup instructions.
+
+Before pushing, run:
+
+```bash
+make check
+```
+
+This runs the **Check & Lint** and **Test** legs of CI. CI calls the same make targets,
+so a green `make check` and a green CI agree. It does not cover every job: the Windows
+tests, Docker image build, `cargo audit` / `cargo deny`, the OpenAPI snapshot check and
+the nightly fuzz run are listed, with their opt-in targets, in
+[Building from source](docs/building.md#what-make-check-does-not-cover).
+
+To get the real CI signal on a branch without opening a pull request (the only way to
+reach the Windows test leg):
+
+```bash
+gh workflow run ci.yml --ref "$(git branch --show-current)"
+```
 
 ## License
 

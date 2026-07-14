@@ -5,6 +5,10 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  # Run the matrix on any branch without opening a PR. The Windows leg has no
+  # local equivalent, so this is the only way to reach it while iterating:
+  #   gh workflow run ci.yml --ref <branch>
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,17 +50,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Each gate is a make target so `make check` and CI cannot diverge. Keep
+      # them as separate steps: it names the failing gate in the job summary.
       - name: Rustfmt
-        run: cargo fmt --all -- --check
+        run: make fmt-check
 
       - name: Clippy (rich-formats)
-        run: cargo clippy --all-targets --features rich-formats -- -D warnings
+        run: make clippy
 
       - name: Check (rich-formats)
-        run: cargo check --all-targets --features rich-formats
+        run: make cargo-check
 
       - name: Build (rich-formats)
-        run: cargo build --all-targets --features rich-formats
+        run: make build
 
   test:
     name: Test
@@ -118,11 +124,34 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Run tests
+      - name: Run tests and doctests
+        if: runner.os != 'Windows'
+        run: make test-config TEST_FLAGS="${{ matrix.test-flags }}"
+
+      # No make on the Windows image (MSYS2 ships with it but is not on PATH),
+      # so these two call cargo directly. .github/scripts/ci-drift-check.sh fails
+      # if they stop matching `make test-config`. Keep one command per step:
+      # PowerShell only propagates the last command's exit code, so a combined
+      # block would hide a nextest failure behind a passing doctest run.
+      # ci-drift:begin windows-test
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
         run: cargo nextest run ${{ matrix.test-flags }}
 
-      - name: Run doctests
+      - name: Run doctests (Windows)
+        if: runner.os == 'Windows'
         run: cargo test --doc ${{ matrix.test-flags }}
+      # ci-drift:end windows-test
+
+  drift:
+    name: Workflow/Makefile drift guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the Windows test leg matches the Makefile
+        run: make ci-drift
 
   release-scripts:
     name: Release script tests
@@ -183,15 +212,5 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Generate OpenAPI spec
-        run: cargo run -p spelunk-server -- --print-openapi > /tmp/openapi-generated.json
-
       - name: Diff against committed snapshot
-        run: |
-          if ! diff -w -u docs/openapi.json /tmp/openapi-generated.json; then
-            echo ""
-            echo "ERROR: docs/openapi.json is out of date."
-            echo "Run: cargo run -p spelunk-server -- --print-openapi > docs/openapi.json"
-            echo "Then commit the updated snapshot."
-            exit 1
-          fi
+        run: make openapi-check

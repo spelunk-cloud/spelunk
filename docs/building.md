@@ -106,11 +106,61 @@ cargo build --release -p spelunk-cli --features rich-formats
 |---|---|---|
 | `rich-formats` | no | Same as above — `spelunk-cli/rich-formats` propagates to this crate automatically. |
 
-## Running tests
+## Running tests and lints
 
 ```bash
-cargo test
+make check
 ```
+
+`make check` is the one command to run before pushing. It runs the **Check & Lint**
+and **Test** legs of CI, and CI runs the same make targets, so a green `make check`
+and a green CI agree by construction rather than by convention.
+
+Do not hand-assemble the equivalent cargo commands. Every gate has a detail that is
+easy to get wrong: CI lints with `--features rich-formats` (a warning reachable only
+under that feature passes a plain clippy run), it runs `cargo nextest run` rather than
+`cargo test`, doctests need a separate `cargo test --doc` because nextest does not run
+them, and the suite covers two feature configs.
+
+| Target | What it runs |
+|---|---|
+| `make check` | `make lint` then `make test`. |
+| `make lint` | `cargo fmt --all -- --check`, clippy, check, and build, all with `rich-formats`. |
+| `make test` | `cargo nextest run` and `cargo test --doc`, for default and `--no-default-features`. |
+| `make fmt` | Reformat in place. |
+| `make precommit` | fmt and clippy only. A fast subset for a git hook, not a substitute for `make check`. |
+
+Run `make help` for the full list. `make test` needs
+[cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`); the target
+says so rather than falling back to a different runner than CI uses.
+
+The targets honour `CARGO_TARGET_DIR`, so a shared target directory works as usual.
+
+### What `make check` does not cover
+
+A green `make check` does **not** mean every CI job passes. These legs have no local
+equivalent, or are deliberately left opt-in because they are slow or need extra tools:
+
+| CI job | Local target |
+|---|---|
+| cargo-audit (Security) | `make audit` |
+| cargo-deny (Security) | `make deny` |
+| OpenAPI snapshot check | `make openapi-check`, and `make openapi` to regenerate |
+| Workflow/Makefile drift guard | `make ci-drift` |
+| Test (windows-latest) | none |
+| Docker image build | none |
+| Release script tests | none |
+| Fuzz (nightly) | none |
+
+For the legs with no local target, run CI on your branch. It does not need a pull
+request:
+
+```bash
+gh workflow run ci.yml --ref "$(git branch --show-current)"
+```
+
+That is the only way to reach the Windows test leg while iterating, so use it for any
+change with platform-specific risk.
 
 ## Security audit
 
@@ -118,7 +168,7 @@ Requires [cargo-audit](https://crates.io/crates/cargo-audit):
 
 ```bash
 cargo install cargo-audit
-cargo audit
+make audit
 ```
 
 ## Notes

@@ -38,7 +38,7 @@ jobs:
         run: cargo-audit --version || cargo install cargo-audit --locked
 
       - name: Run cargo audit
-        run: cargo audit
+        run: make audit
 
   deny:
     name: cargo-deny
@@ -67,4 +67,4 @@ jobs:
         run: cargo-deny --version || cargo install cargo-deny --locked
 
       - name: Run cargo deny
-        run: cargo deny check advisories licenses bans
+        run: make deny
