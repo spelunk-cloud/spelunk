@@ -106,10 +106,15 @@ Install the hook once per clone:
 spelunk hooks install --pre-push
 ```
 
-From then on, every `git push` publishes your memory to the remote you are
-pushing to: the hook fetches the remote's notes, merges them into yours (a
-union, so nothing is dropped), and pushes `refs/notes/spelunk`. Once it is
-installed, the second line of `init`'s summary changes to confirm it.
+From then on, every `git push` to a named remote publishes your memory there:
+the hook fetches the remote's notes, merges them into yours (a union, so nothing
+is dropped), and pushes `refs/notes/spelunk`. Once it is installed, `init`
+reports that in place of the opt-in line:
+
+```
+Memory:  notes fetch refspec already configured on 'origin'
+         pre-push hook installed: your memory publishes on `git push`
+```
 
 **Publishing is tied to `git push` on purpose.** A note attached to a commit you
 have not pushed can reach the remote while the commit itself does not, and a
@@ -120,9 +125,12 @@ runs there rather than on each `memory add` or on a timer.
 
 **The hook never blocks your push.** If publishing fails (offline, or the remote
 rejects the notes ref) it warns on stderr and exits 0, so your code push lands
-regardless. It retries a lost race up to three times, and never force-pushes: the
-union already carries both sides, so forcing could only discard a teammate's
-memory.
+regardless. Only a lost race is retried, up to three times: that is a teammate
+publishing in the window between the hook's fetch and its push, so re-merging
+theirs lets the next attempt through. Every other failure is attempted once, so
+an unreachable remote costs you one timeout rather than three. It never
+force-pushes: the union already carries both sides, so forcing could only discard
+a teammate's memory.
 
 Teammates without spelunk installed are unaffected: the hook skips itself when
 `spelunk` is not on their PATH. Remove it with `spelunk hooks uninstall`.

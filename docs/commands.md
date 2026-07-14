@@ -43,8 +43,8 @@ slug.
 `refs/notes/spelunk` arrives on `git fetch`, landing on the tracking ref
 `refs/notes/origin/spelunk`. `memory list`, `context`, and `init` merge that
 tracking ref into your own notes, so *reading* teammates' memory needs no extra
-step. *Publishing* yours is still manual: the init output includes the push
-command; re-run it after each memory change so new notes commits travel. See
+step. *Publishing* yours is opt-in: your memory stays local until you install the
+pre-push hook, and the init output names the command that does it. See
 [Sharing memory across clones via git-notes](memory.md#sharing-memory-across-clones-via-git-notes).
 
 **Memory survives history rewrites:** `init` also points `notes.rewriteRef` at
