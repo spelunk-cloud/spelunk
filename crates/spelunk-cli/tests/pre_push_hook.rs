@@ -45,7 +45,7 @@ fn spelunk_bin_dir() -> PathBuf {
 
 /// Run `git args` in `dir` with an explicit `PATH`, returning the `Output`
 /// without asserting. Isolated identity/config so it is hermetic.
-fn git_out_with_path(dir: &Path, path: &str, args: &[&str]) -> Output {
+fn git_out_with_path(dir: &Path, path: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Output {
     std::process::Command::new("git")
         .current_dir(dir)
         .args(args)
@@ -65,11 +65,14 @@ fn git_out_with_path(dir: &Path, path: &str, args: &[&str]) -> Output {
 /// `spelunk` is prepended to PATH so the installed hook clears its own
 /// `command -v spelunk` guard.
 fn git_out(dir: &Path, args: &[&str]) -> Output {
-    let path = format!(
-        "{}:{}",
-        spelunk_bin_dir().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    // split/join rather than a literal separator: it is `;` on Windows, and a
+    // `:` there both fails to prepend the binary and corrupts the first real
+    // entry, leaving the hook's `command -v spelunk` guard to skip everything.
+    let mut dirs = vec![spelunk_bin_dir()];
+    dirs.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(dirs).expect("join PATH");
     git_out_with_path(dir, &path, args)
 }
 
@@ -126,6 +129,12 @@ fn bare_origin(dir: &Path) {
     git(dir, &["init", "-q", "--bare", "-b", "main"]);
 }
 
+/// `path` for embedding in a shell script. Single quotes reach Git Bash with
+/// backslashes intact, so a Windows path must arrive forward-slashed.
+fn sh_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 /// Write `body` to `path` and make it executable. Parent dirs are created: a
 /// bare repo has no `hooks/` until something needs one.
 fn write_executable(path: &Path, body: &str) {
@@ -147,7 +156,7 @@ fn reject_notes_and_count(origin: &Path, counter: &Path) {
         &origin.join("hooks").join("update"),
         &format!(
             "#!/bin/sh\ncase \"$1\" in refs/notes/*) echo try >> '{}' ; exit 1 ;; esac\nexit 0\n",
-            counter.display()
+            sh_path(counter)
         ),
     );
 }
@@ -230,7 +239,7 @@ fn instrument_hook(hook_path: &Path, counter: &Path) {
     let (shebang, rest) = body.split_once('\n').expect("hook starts with a shebang");
     std::fs::write(
         hook_path,
-        format!("{shebang}\necho fired >> '{}'\n{rest}", counter.display()),
+        format!("{shebang}\necho fired >> '{}'\n{rest}", sh_path(counter)),
     )
     .unwrap();
 }
@@ -819,11 +828,7 @@ fn skips_gracefully_without_spelunk_on_path() {
     .to_string();
     std::os::unix::fs::symlink(&git_path, bin.join("git")).unwrap();
 
-    let out = git_out_with_path(
-        &dev,
-        &bin.display().to_string(),
-        &["push", "origin", "main"],
-    );
+    let out = git_out_with_path(&dev, bin.display().to_string(), &["push", "origin", "main"]);
     assert!(
         out.status.success(),
         "the push must succeed without spelunk installed: {}",

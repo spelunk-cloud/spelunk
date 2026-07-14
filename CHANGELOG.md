@@ -185,7 +185,8 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   if the lock is busy the merge is skipped and the read proceeds anyway (the
   union is idempotent, so the next read catches up). Your `notes.mergeStrategy`
   is never written; the strategy is passed per-invocation. *Publishing* your own
-  memory remains a manual `git push origin refs/notes/spelunk`. (ADR-069)
+  memory stays opt-in: install the pre-push hook (see Added) or push
+  `refs/notes/spelunk` by hand. (ADR-069)
 - **Memory entries now read back in chronological order after a merge.** The
   union merge sorts lines lexicographically, so a note's records are no longer
   in append order once teammates' entries are folded in. Reads now sort by
