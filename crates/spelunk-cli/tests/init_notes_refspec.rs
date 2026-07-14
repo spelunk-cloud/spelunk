@@ -185,6 +185,37 @@ fn init_no_origin_prints_hint_and_succeeds() {
     );
 }
 
+/// (2a) With the pre-push hook installed, init announces that memory publishes
+/// rather than repeating that it stays local.
+///
+/// The announce is the only place a user learns whether their memory travels,
+/// so a summary that ignores the installed hook is init telling them the
+/// opposite of the truth.
+#[test]
+fn init_announces_the_pre_push_hook_once_installed() {
+    let tmp = tempdir().unwrap();
+    init_repo_with_commit(tmp.path());
+
+    spelunk_bin()
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .env("SPELUNK_NO_SERVER", "1")
+        .args(["hooks", "install", "--pre-push"])
+        .assert()
+        .success();
+
+    let stdout = run_init(tmp.path());
+
+    assert!(
+        stdout.contains("pre-push hook installed: your memory publishes on `git push`"),
+        "init must report the hook as installed, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("your memory stays local"),
+        "init must not claim memory stays local once the hook publishes it, got:\n{stdout}"
+    );
+}
+
 /// (2b) No `origin` remote: init still configures `notes.rewriteRef`, so memory
 /// survives `git commit --amend` and `git rebase`. The carry is purely local and
 /// must not be gated on having a remote: a remote-less repo is exactly where the

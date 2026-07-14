@@ -12,8 +12,14 @@
 //! - a failing notes push never blocks the branch push: a hook exiting non-zero
 //!   aborts the push outright, so origin never receives the commit.
 //! - two developers annotating the same commit converge, losing neither entry.
+//! - a lost race (a teammate's notes land between our fetch and our push) is
+//!   retried and converges; a rejection is NOT retried.
+//! - a fetch failure never destroys the notes already on the remote.
+//! - the merge strands no `NOTES_MERGE_WORKTREE`.
 //! - repeated pushes are idempotent: no duplicates, no empty re-push.
-//! - graceful skip with no local notes ref, and when pushing by URL.
+//! - graceful skip with no local notes ref, when pushing by URL, and with no
+//!   `spelunk` on PATH.
+//! - the hook publishes to the remote being pushed to, not a hardcoded `origin`.
 //! - a non-spelunk pre-push hook is never clobbered.
 //! - uninstall removes the hook.
 //!
@@ -37,16 +43,9 @@ fn spelunk_bin_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Run `git args` in `dir`, returning the `Output` without asserting.
-///
-/// Isolated identity/config so it is hermetic, and `spelunk` prepended to PATH
-/// so the installed hook clears its own `command -v spelunk` guard.
-fn git_out(dir: &Path, args: &[&str]) -> Output {
-    let path = format!(
-        "{}:{}",
-        spelunk_bin_dir().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+/// Run `git args` in `dir` with an explicit `PATH`, returning the `Output`
+/// without asserting. Isolated identity/config so it is hermetic.
+fn git_out_with_path(dir: &Path, path: &str, args: &[&str]) -> Output {
     std::process::Command::new("git")
         .current_dir(dir)
         .args(args)
@@ -59,6 +58,19 @@ fn git_out(dir: &Path, args: &[&str]) -> Output {
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .expect("spawn git")
+}
+
+/// Run `git args` in `dir`, returning the `Output` without asserting.
+///
+/// `spelunk` is prepended to PATH so the installed hook clears its own
+/// `command -v spelunk` guard.
+fn git_out(dir: &Path, args: &[&str]) -> Output {
+    let path = format!(
+        "{}:{}",
+        spelunk_bin_dir().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    git_out_with_path(dir, &path, args)
 }
 
 /// Like [`git_out`] but asserts the command succeeded.
@@ -112,6 +124,57 @@ fn install_pre_push(home: &Path, repo: &Path) -> PathBuf {
 /// A bare repo standing in for `origin`.
 fn bare_origin(dir: &Path) {
     git(dir, &["init", "-q", "--bare", "-b", "main"]);
+}
+
+/// Write `body` to `path` and make it executable. Parent dirs are created: a
+/// bare repo has no `hooks/` until something needs one.
+fn write_executable(path: &Path, body: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(path).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(path, p).unwrap();
+    }
+}
+
+/// Reject every `refs/notes/*` update on `origin`, recording one line per
+/// attempt in `counter`. Per-ref, so the branch push is untouched.
+fn reject_notes_and_count(origin: &Path, counter: &Path) {
+    write_executable(
+        &origin.join("hooks").join("update"),
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in refs/notes/*) echo try >> '{}' ; exit 1 ;; esac\nexit 0\n",
+            counter.display()
+        ),
+    );
+}
+
+/// Lines in `path`, or 0 when it was never written.
+fn line_count(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+/// Publish `title` from a second clone straight onto `origin`'s notes ref,
+/// standing in for a teammate who shared memory first. Returns the annotated
+/// object, which is the commit both sides share.
+fn teammate_publishes(home: &Path, origin: &Path, dir: &Path, title: &str) -> String {
+    clone_dev(origin, dir);
+    memory_add(home, dir, title);
+    git(
+        dir,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "refs/notes/spelunk:refs/notes/spelunk",
+        ],
+    );
+    git_stdout(dir, &["rev-parse", "HEAD"])
 }
 
 /// Commit `<name>.txt` in `dir`.
@@ -245,21 +308,8 @@ fn failed_notes_push_does_not_block_the_branch_push() {
     bare_origin(&origin);
     seed_origin(&origin, &dev);
 
-    // Reject only the notes ref, per-ref, so the branch push is untouched.
-    let update_hook = origin.join("hooks").join("update");
-    std::fs::create_dir_all(update_hook.parent().unwrap()).unwrap();
-    std::fs::write(
-        &update_hook,
-        "#!/bin/sh\ncase \"$1\" in refs/notes/*) exit 1 ;; esac\nexit 0\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&update_hook).unwrap().permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&update_hook, p).unwrap();
-    }
+    let attempts = tmp.path().join("attempts");
+    reject_notes_and_count(&origin, &attempts);
 
     install_pre_push(home.path(), &dev);
     memory_add(home.path(), &dev, "rejected-notes-decision");
@@ -289,6 +339,249 @@ fn failed_notes_push_does_not_block_the_branch_push() {
         String::from_utf8_lossy(&out.stderr).contains("could not publish memory notes"),
         "the hook should warn on stderr, got: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A rejection is not a lost race: it fails identically every time, so the
+    // hook must give up after one attempt. Retrying every failure would park a
+    // push behind three network timeouts when the remote is simply unreachable.
+    assert_eq!(
+        line_count(&attempts),
+        1,
+        "a rejected notes push must be attempted exactly once, never retried"
+    );
+}
+
+// ── D3: retry only a lost race ────────────────────────────────────────────────
+
+/// A teammate landing notes between our fetch and our push is retried, and the
+/// retry converges without dropping either side.
+///
+/// The race is reproduced by serving a stale view (the world before the
+/// teammate published) to the first fetch only, so the first push is genuinely
+/// non-fast-forward while the second fetch sees the teammate's notes and merges
+/// them. Deterministic: the served *view* changes, so nothing depends on when a
+/// side effect lands.
+#[cfg(unix)]
+#[test]
+fn a_lost_race_is_retried_and_converges_with_no_loss() {
+    let home = TempDir::new().unwrap();
+    let home2 = TempDir::new().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let stale = tmp.path().join("stale.git");
+    let dev = tmp.path().join("dev");
+    let teammate = tmp.path().join("teammate");
+    std::fs::create_dir_all(&origin).unwrap();
+    std::fs::create_dir_all(&dev).unwrap();
+    bare_origin(&origin);
+    seed_origin(&origin, &dev);
+
+    // Snapshot origin before any notes exist: this is the stale view.
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            origin.to_str().unwrap(),
+            stale.to_str().unwrap(),
+        ],
+    );
+
+    let shared = teammate_publishes(home2.path(), &origin, &teammate, "teammate-raced-decision");
+    assert_eq!(
+        shared,
+        git_stdout(&dev, &["rev-parse", "HEAD"]),
+        "setup: both sides must annotate the same commit"
+    );
+
+    install_pre_push(home.path(), &dev);
+    memory_add(home.path(), &dev, "dev-raced-decision");
+
+    let stamp = tmp.path().join("served-stale");
+    let calls = tmp.path().join("upload-pack-calls");
+    let wrapper = tmp.path().join("uploadpack.sh");
+    write_executable(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\n\
+             echo call >> '{}'\n\
+             if [ -f '{}' ]; then exec git upload-pack '{}'; fi\n\
+             : > '{}'\n\
+             exec git upload-pack '{}'\n",
+            calls.display(),
+            stamp.display(),
+            origin.display(),
+            stamp.display(),
+            stale.display(),
+        ),
+    );
+    git(
+        &dev,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            wrapper.to_str().unwrap(),
+        ],
+    );
+
+    commit(&dev, "raced");
+    let out = git_out(&dev, &["push", "origin", "main"]);
+    assert!(
+        out.status.success(),
+        "the branch push must survive the race: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The retry happened: one fetch on the stale view, one on the real origin.
+    assert_eq!(
+        line_count(&calls),
+        2,
+        "the hook should fetch twice: the first push loses the race, the retry wins"
+    );
+
+    // Both entries reached origin, so the lost race cost nobody their memory.
+    let published = note_lines(&origin, &shared);
+    assert!(
+        published
+            .iter()
+            .any(|l| l.contains("teammate-raced-decision")),
+        "the teammate's entry must survive our retry: {published:?}"
+    );
+    assert!(
+        published.iter().any(|l| l.contains("dev-raced-decision")),
+        "our entry must land on the retry: {published:?}"
+    );
+}
+
+// ── D3: never destroy what is already published ───────────────────────────────
+
+/// A fetch that fails must never cost a teammate their published notes.
+///
+/// With the fetch broken there is no tracking ref, so nothing is merged and our
+/// notes ref is missing the teammate's entry. Publishing it anyway (a forced
+/// push) would replace their memory with ours; the correct outcome is a
+/// rejected notes push, an unaffected branch push, and their entry intact.
+#[cfg(unix)]
+#[test]
+fn a_fetch_failure_must_not_destroy_a_teammates_notes() {
+    let home = TempDir::new().unwrap();
+    let home2 = TempDir::new().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let dev = tmp.path().join("dev");
+    let teammate = tmp.path().join("teammate");
+    std::fs::create_dir_all(&origin).unwrap();
+    std::fs::create_dir_all(&dev).unwrap();
+    bare_origin(&origin);
+    seed_origin(&origin, &dev);
+
+    let shared = teammate_publishes(
+        home2.path(),
+        &origin,
+        &teammate,
+        "teammate-published-decision",
+    );
+
+    install_pre_push(home.path(), &dev);
+    memory_add(home.path(), &dev, "dev-unmergeable-decision");
+
+    // Break only the fetch: push rides receive-pack and is unaffected.
+    git(
+        &dev,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            "/nonexistent/upload-pack",
+        ],
+    );
+
+    commit(&dev, "payload");
+    let out = git_out(&dev, &["push", "origin", "main"]);
+    assert!(
+        out.status.success(),
+        "the branch push must survive a broken fetch: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        git_stdout(&dev, &["rev-parse", "HEAD"]),
+        git_stdout(&origin, &["rev-parse", "refs/heads/main"]),
+        "origin must have received the branch commit"
+    );
+
+    // The whole point: their memory is still there.
+    let published = note_lines(&origin, &shared);
+    assert!(
+        published
+            .iter()
+            .any(|l| l.contains("teammate-published-decision")),
+        "a fetch failure must never overwrite the teammate's published notes: {published:?}"
+    );
+}
+
+// ── D2: the merge leaves no wreckage ──────────────────────────────────────────
+
+/// The notes merge must strand no `NOTES_MERGE_WORKTREE`.
+///
+/// `notes.mergeStrategy` defaults to `manual`, which on a genuine add/add
+/// conflict exits 1 and leaves `.git/NOTES_MERGE_WORKTREE` behind for the user
+/// to resolve by hand. A push hook cannot ask for that, so the strategy is
+/// explicit: the union resolves the conflict and there is nothing to strand.
+#[test]
+fn the_notes_merge_strands_no_merge_worktree() {
+    let home = TempDir::new().unwrap();
+    let home2 = TempDir::new().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let dev = tmp.path().join("dev");
+    let teammate = tmp.path().join("teammate");
+    std::fs::create_dir_all(&origin).unwrap();
+    std::fs::create_dir_all(&dev).unwrap();
+    bare_origin(&origin);
+    seed_origin(&origin, &dev);
+
+    // Same object annotated on both sides: the add/add conflict `manual` cannot
+    // resolve.
+    let shared = teammate_publishes(
+        home2.path(),
+        &origin,
+        &teammate,
+        "teammate-conflict-decision",
+    );
+
+    install_pre_push(home.path(), &dev);
+    memory_add(home.path(), &dev, "dev-conflict-decision");
+
+    commit(&dev, "payload");
+    let out = git_out(&dev, &["push", "origin", "main"]);
+    assert!(
+        out.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !dev.join(".git").join("NOTES_MERGE_WORKTREE").exists(),
+        "the merge must not strand .git/NOTES_MERGE_WORKTREE for the user to clean up"
+    );
+    assert!(
+        !dev.join(".git").join("NOTES_MERGE_REF").exists(),
+        "the merge must not strand .git/NOTES_MERGE_REF"
+    );
+
+    // And the conflict was resolved by union rather than by dropping a side.
+    let published = note_lines(&origin, &shared);
+    assert!(
+        published
+            .iter()
+            .any(|l| l.contains("teammate-conflict-decision")),
+        "the union must keep the teammate's entry: {published:?}"
+    );
+    assert!(
+        published
+            .iter()
+            .any(|l| l.contains("dev-conflict-decision")),
+        "the union must keep our entry: {published:?}"
     );
 }
 
@@ -490,6 +783,114 @@ fn skips_gracefully_when_pushing_without_a_named_remote() {
     );
 }
 
+/// A teammate without spelunk installed is unaffected: the hook publishes
+/// nothing and says nothing.
+///
+/// The ambient PATH cannot be reused here: a machine with spelunk actually
+/// installed would clear the guard and void the test, so git is handed a PATH
+/// holding nothing but itself.
+#[cfg(unix)]
+#[test]
+fn skips_gracefully_without_spelunk_on_path() {
+    let home = TempDir::new().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let dev = tmp.path().join("dev");
+    std::fs::create_dir_all(&origin).unwrap();
+    std::fs::create_dir_all(&dev).unwrap();
+    bare_origin(&origin);
+    seed_origin(&origin, &dev);
+
+    install_pre_push(home.path(), &dev);
+    memory_add(home.path(), &dev, "no-spelunk-decision");
+    commit(&dev, "no-spelunk");
+
+    let bin = tmp.path().join("git-only-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git_path = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate git")
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    std::os::unix::fs::symlink(&git_path, bin.join("git")).unwrap();
+
+    let out = git_out_with_path(
+        &dev,
+        &bin.display().to_string(),
+        &["push", "origin", "main"],
+    );
+    assert!(
+        out.status.success(),
+        "the push must succeed without spelunk installed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !git_out(&origin, &["rev-parse", "refs/notes/spelunk"])
+            .status
+            .success(),
+        "the hook must publish nothing when spelunk is not installed"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("spelunk:"),
+        "the skip must be silent, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ── D1: publish to the remote actually being pushed to ────────────────────────
+
+/// Memory follows the push: a repo whose only remote is `upstream` publishes
+/// there. The remote is whatever git handed the hook, never a hardcoded name.
+#[test]
+fn publishes_to_the_remote_being_pushed_to() {
+    let home = TempDir::new().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let upstream = tmp.path().join("upstream.git");
+    let dev = tmp.path().join("dev");
+    std::fs::create_dir_all(&upstream).unwrap();
+    std::fs::create_dir_all(&dev).unwrap();
+    bare_origin(&upstream);
+
+    git(&dev, &["init", "-q", "-b", "main"]);
+    git(&dev, &["config", "user.email", "t@example.com"]);
+    git(&dev, &["config", "user.name", "Test"]);
+    git(
+        &dev,
+        &["remote", "add", "upstream", upstream.to_str().unwrap()],
+    );
+    commit(&dev, "seed");
+    git(&dev, &["push", "-q", "-u", "upstream", "main"]);
+    assert!(
+        !git_out(&dev, &["remote", "get-url", "origin"])
+            .status
+            .success(),
+        "setup: this repo must have no origin remote"
+    );
+
+    install_pre_push(home.path(), &dev);
+    memory_add(home.path(), &dev, "upstream-decision");
+    let annotated = git_stdout(&dev, &["rev-parse", "HEAD"]);
+    commit(&dev, "payload");
+    let out = git_out(&dev, &["push", "upstream", "main"]);
+    assert!(
+        out.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        note_lines(&upstream, &annotated)
+            .iter()
+            .any(|l| l.contains("upstream-decision")),
+        "the notes must reach the remote being pushed to, not a hardcoded 'origin'"
+    );
+}
+
 // ── D3: never clobber someone else's hook ─────────────────────────────────────
 
 /// A pre-push hook spelunk did not write is left exactly as it was.
@@ -514,6 +915,27 @@ fn install_bails_on_a_foreign_pre_push_hook() {
         std::fs::read_to_string(&hook).unwrap(),
         foreign,
         "a foreign pre-push hook must survive byte-for-byte"
+    );
+}
+
+/// The installed hook is executable: git silently ignores a hook it cannot
+/// run, which would make every publish above a no-op rather than an error.
+#[cfg(unix)]
+#[test]
+fn installed_hook_is_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempDir::new().unwrap();
+    let dev = TempDir::new().unwrap();
+    git(dev.path(), &["init", "-q", "-b", "main"]);
+
+    let hook = install_pre_push(home.path(), dev.path());
+    let mode = std::fs::metadata(&hook).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o755,
+        "the installed hook must be 0755, got {:o}",
+        mode & 0o777
     );
 }
 
