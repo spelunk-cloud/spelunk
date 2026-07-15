@@ -122,6 +122,15 @@ under that feature passes a plain clippy run), it runs `cargo nextest run` rathe
 `cargo test`, doctests need a separate `cargo test --doc` because nextest does not run
 them, and the suite covers two feature configs.
 
+Two traps to know about:
+
+- **zsh PIPESTATUS:** Never pipe a gate into `tail` or `head` to shorten output. In zsh,
+  `${PIPESTATUS[0]}` is empty (its arrays are 1-indexed), so `make test | tail -20` prints
+  `exit code 0` and hides the real failure. Run the target and read its true exit status.
+- **Nextest and `#[serial]`:** `#[serial]` is a no-op under nextest (each test gets its own
+  process). A test relying on it to serialise shared external state (a file, a port, a git
+  ref) is unguarded in CI regardless of what it claims locally.
+
 | Target | What it runs |
 |---|---|
 | `make check` | `make lint` then `make test`. |

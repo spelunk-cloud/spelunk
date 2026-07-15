@@ -195,6 +195,10 @@ tests, Docker image build, `cargo audit` / `cargo deny`, the OpenAPI snapshot ch
 the nightly fuzz run are listed, with their opt-in targets, in
 [Building from source](docs/building.md#what-make-check-does-not-cover).
 
+Note: In zsh, never pipe `make check` into `tail` or `head`: the pipeline masks the exit
+status and reports false green. Run it directly. Also, CI runs `cargo nextest run` (not
+`cargo test`), so `#[serial]` does not actually serialize tests in CI.
+
 To get the real CI signal on a branch without opening a pull request (the only way to
 reach the Windows test leg):
 
