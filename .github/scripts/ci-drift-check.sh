@@ -8,6 +8,10 @@
 # can reach Windows is found by its `if:`, not by markers. A guard that only
 # inspects a marked region can be pointed away from the drift by the same edit
 # that introduces it.
+#
+# It recognises the YAML it models and refuses the rest, rather than parsing YAML.
+# Refusing is a weaker requirement than parsing, and it is the requirement that
+# matters: an unread construct then costs a loud failure, never a false green.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -19,9 +23,14 @@ normalize() { awk '{ $1 = $1; print }'; }
 
 # Every cargo command the Windows leg of the `test` job runs, one per line.
 #
-# Exits 3 on any construct it cannot classify (an unrecognised `if:`, a step-level
-# `env:`, tab indentation). Refusing to guess is what keeps a step the guard does
-# not understand from passing silently.
+# This recognises a small fixed subset of YAML and refuses everything else; it is
+# deliberately not a YAML parser. Every line inside a step must be accounted for,
+# so an unread construct fails closed instead of dropping a step on the floor. A
+# dropped step is worse than no steps at all: an empty set trips the -z check
+# below and fails loudly, while a wrong subset looks plausible and passes.
+#
+# Exits 3 on anything it cannot account for: an unrecognised `if:`, a step-level
+# `env:`, a step key it does not model, a flow mapping, tab indentation.
 wf_cargo_cmds() {
 	awk '
 	function fail(msg) {
@@ -48,7 +57,17 @@ wf_cargo_cmds() {
 		return -1
 	}
 
+	# A folded `run: >` scalar joins its lines into one command; a literal `run: |`
+	# keeps one per line. Reading a folded block as one command per line would hide
+	# a flag carried on a continuation line.
+	function end_block() {
+		if (!in_block) return
+		if (fold && fold_buf != "") runs[++nrun] = fold_buf
+		in_block = 0; fold = 0; fold_buf = ""; blk_indent = 0; fold_blank = 0
+	}
+
 	function finish_step(   i, has_cargo, reach) {
+		end_block()
 		if (!step_open) return
 		has_cargo = 0
 		for (i = 1; i <= nrun; i++)
@@ -62,12 +81,19 @@ wf_cargo_cmds() {
 				if (cur_env)
 					fail("step \"" cur_name "\" runs cargo on Windows with a step-level `env:`. " \
 					     "The guard compares commands, not environments, so it cannot verify this " \
-					     "step matches `make test-config`.")
+					     "step matches `make test-config`. Move it to the job-level `env:` of the " \
+					     "test job, which is accepted because it reaches cargo on both legs, or " \
+					     "teach the guard.")
+				if (other_key)
+					fail("step \"" cur_name "\" runs cargo on Windows with a step key the guard " \
+					     "does not model: " other_key ". It reads name, if and run only, so it " \
+					     "cannot tell whether this step still matches `make test-config`.")
 				for (i = 1; i <= nrun; i++)
 					if (runs[i] ~ /^cargo(\.exe)?[ \t]/) print runs[i]
 			}
 		}
 		step_open = 0; nrun = 0; cur_if = ""; has_if = 0; cur_env = 0; cur_name = ""
+		lastkey = ""; other_key = ""
 	}
 
 	{
@@ -76,12 +102,26 @@ wf_cargo_cmds() {
 		rest = substr($0, ind + 1)
 	}
 
-	# Inside a `run: |` block every sufficiently indented line is content, including
-	# one starting with `#` (a shell comment, not a YAML one).
+	# Inside a `run:` block every sufficiently indented line is content, including
+	# one starting with `#` (a shell comment, not a YAML one). The first content
+	# line fixes the block indent, per YAML.
 	in_block {
-		if (rest == "") next
-		if (ind >= blk_indent) { runs[++nrun] = rest; next }
-		in_block = 0
+		if (rest == "") { if (fold) fold_blank = 1; next }
+		if (blk_indent == 0 && ind > key_indent) blk_indent = ind
+		if (blk_indent > 0 && ind >= blk_indent) {
+			if (fold) {
+				if (ind > blk_indent)
+					fail("a more-indented line at line " NR " inside a folded `run: >` block. " \
+					     "YAML keeps those literal rather than folding them, and the guard does " \
+					     "not model that. Use `run: |`, or put the command on one line.")
+				if (fold_blank)
+					fail("a blank line at line " NR " inside a folded `run: >` block. YAML folds " \
+					     "it to a line break, so the block is more than one command. Use `run: |`.")
+				fold_buf = (fold_buf == "" ? rest : fold_buf " " rest)
+			} else runs[++nrun] = rest
+			next
+		}
+		end_block()
 	}
 
 	rest == "" { next }
@@ -112,26 +152,50 @@ wf_cargo_cmds() {
 
 	!in_steps { next }
 
+	# A step starts at the list marker, which is also what fixes its key column:
+	# `- name:` puts keys at 8, `-   name:` at 10. Reading keys at a hardcoded 8
+	# would drop every key of the second form, leaving the step with no `run:` and
+	# no scope check.
 	ind == 6 {
-		if (rest !~ /^- /) fail("unexpected non-list line in the test job steps at line " NR)
 		finish_step()
+		if (rest !~ /^- +/) fail("unexpected non-list line in the test job steps at line " NR)
+		match(rest, /^- +/)
+		key_indent = 6 + RLENGTH
+		rest = substr(rest, RLENGTH + 1)
+		if (substr(rest, 1, 1) == "{")
+			fail("the step at line " NR " is a flow mapping. The guard reads block mappings " \
+			     "only, so it cannot see what this step runs. Write it as a block mapping.")
 		step_open = 1
-		rest = substr(rest, 3)
-		ind = 8
+		ind = key_indent
 	}
 
-	ind == 8 && step_open && rest ~ /^[A-Za-z0-9_.-]+:/ {
+	ind == key_indent && step_open && rest ~ /^[A-Za-z0-9_.-]+:/ {
 		k = rest; sub(/:.*$/, "", k)
 		v = rest; sub(/^[A-Za-z0-9_.-]+:[ \t]*/, "", v)
+		lastkey = k
 		if (k == "name") cur_name = v
 		else if (k == "if") { cur_if = v; has_if = 1 }
 		else if (k == "env") cur_env = 1
 		else if (k == "run") {
-			if (v ~ /^[|>][-+0-9]*$/) { in_block = 1; blk_indent = 9 }
+			if (v ~ /^\|[-+0-9]*$/) { in_block = 1; fold = 0; blk_indent = 0 }
+			else if (v ~ /^>[-+0-9]*$/) { in_block = 1; fold = 1; blk_indent = 0; fold_buf = ""; fold_blank = 0 }
 			else if (v == "") fail("empty `run:` at line " NR)
 			else runs[++nrun] = v
 		}
+		else other_key = other_key (other_key == "" ? "" : ", ") k
 		next
+	}
+
+	# No line inside a step may be dropped: an unread line is how a drifting step
+	# hides. Content nested under a key belongs to that key, so it cannot be a
+	# step-level `run:`; everything else fails closed.
+	step_open {
+		if (ind > key_indent && lastkey != "" && lastkey != "run") next
+		if (ind > key_indent && lastkey == "run")
+			fail("line " NR " continues a plain `run:` value across lines. The guard reads " \
+			     "single-line, `|` and `>` block `run:` values only.")
+		fail("unrecognised line " NR " inside the step \"" cur_name "\" of the test job, so the " \
+		     "guard cannot account for what the step does.")
 	}
 
 	END { if (aborted) exit 3; finish_step() }
