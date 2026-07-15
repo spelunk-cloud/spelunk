@@ -161,7 +161,7 @@ equivalent, or are deliberately left opt-in because they are slow or need extra 
 | Test (windows-latest) | none |
 | Docker image build | none |
 | Release script tests | none |
-| Fuzz (nightly) | none |
+| Fuzz (weekly) | none |
 
 For the legs with no local target, run CI on your branch. It does not need a pull
 request:

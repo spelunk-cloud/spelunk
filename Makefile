@@ -47,7 +47,7 @@ help:
 	@echo "  make ci-drift       Workflow and Makefile agree    (CI workflow)"
 	@echo ""
 	@echo "No local target: Windows tests, Docker image build, release scripts,"
-	@echo "nightly fuzz. For those, run CI on your branch without a PR:"
+	@echo "weekly fuzz. For those, run CI on your branch without a PR:"
 	@echo "  gh workflow run ci.yml --ref \$$(git branch --show-current)"
 
 # The two legs, in fail-fast order: the cheap gates before the slow ones.

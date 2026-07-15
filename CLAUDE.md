@@ -421,7 +421,7 @@ and `${PIPESTATUS[1]}` are both empty, and a bare `$?` after the pipeline is `ta
 not the gate's. Either way the failure is hidden. Run the target and read its exit status.
 
 `make check` does **not** cover every CI job. The Windows test leg, Docker image build,
-`cargo audit`/`cargo deny`, the OpenAPI snapshot check and the nightly fuzz run are
+`cargo audit`/`cargo deny`, the OpenAPI snapshot check and the weekly fuzz run are
 listed with their opt-in targets in
 [docs/building.md](docs/building.md#what-make-check-does-not-cover). To get the real CI
 signal on a branch without opening a PR, which is the only way to reach the Windows

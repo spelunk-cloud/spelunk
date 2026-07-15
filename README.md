@@ -192,7 +192,7 @@ make check
 This runs the **Check & Lint** and **Test** legs of CI. CI calls the same make targets,
 so a green `make check` and a green CI agree. It does not cover every job: the Windows
 tests, Docker image build, `cargo audit` / `cargo deny`, the OpenAPI snapshot check and
-the nightly fuzz run are listed, with their opt-in targets, in
+the weekly fuzz run are listed, with their opt-in targets, in
 [Building from source](docs/building.md#what-make-check-does-not-cover).
 
 Note: In zsh, never pipe `make check` into `tail` or `head`: the pipeline masks the exit
