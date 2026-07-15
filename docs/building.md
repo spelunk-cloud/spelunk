@@ -124,9 +124,11 @@ them, and the suite covers two feature configs.
 
 Two traps to know about:
 
-- **zsh PIPESTATUS:** Never pipe a gate into `tail` or `head` to shorten output. In zsh,
-  `${PIPESTATUS[0]}` is empty (its arrays are 1-indexed), so `make test | tail -20` prints
-  `exit code 0` and hides the real failure. Run the target and read its true exit status.
+- **zsh and `PIPESTATUS`:** Never pipe a gate into `tail` or `head` to shorten output. zsh
+  has no `PIPESTATUS` at all: that is a bash name. zsh's array is `pipestatus`, lowercase and
+  1-indexed, so `${PIPESTATUS[0]}` and `${PIPESTATUS[1]}` are both empty, and a bare `$?`
+  after the pipeline is `tail`'s status rather than the gate's. `make test | tail -20` hides
+  a real failure either way. Run the target and read its true exit status.
 - **Nextest and `#[serial]`:** `#[serial]` is a no-op under nextest (each test gets its own
   process). A test relying on it to serialise shared external state (a file, a port, a git
   ref) is unguarded in CI regardless of what it claims locally.

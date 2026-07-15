@@ -415,9 +415,10 @@ green:
 - `SPELUNK_SECRET_STORE=file` must be set or macOS pops Keychain dialogs mid-run. The
   make targets export it.
 
-Never pipe a gate into `tail`/`head` to shorten output. In zsh `${PIPESTATUS[0]}` is
-empty (its arrays are 1-indexed), so the pipeline reports a false green and hides the
-failure. Run the target and read its exit status.
+Never pipe a gate into `tail`/`head` to shorten output. zsh has no `PIPESTATUS`: that is
+a bash name, and zsh's array is the lowercase, 1-indexed `pipestatus`. So `${PIPESTATUS[0]}`
+and `${PIPESTATUS[1]}` are both empty, and a bare `$?` after the pipeline is `tail`'s status,
+not the gate's. Either way the failure is hidden. Run the target and read its exit status.
 
 `make check` does **not** cover every CI job. The Windows test leg, Docker image build,
 `cargo audit`/`cargo deny`, the OpenAPI snapshot check and the nightly fuzz run are
