@@ -472,4 +472,85 @@ mod tests {
             )
             .expect("a genuinely distinct entity_id must still insert fine");
     }
+
+    // ── Adversarial (QA final review): the public `add_note` API, not the
+    // raw SQL layer, hitting the promoted index with duplicate content.
+    //
+    // The previous test intentionally documents that a raw duplicate INSERT
+    // *should* be rejected at the SQL level once the index is promoted —
+    // that's the index doing its job. This test is about a level up: does
+    // anything in the codebase catch that rejection before it reaches a
+    // real caller? Nothing does. `MemoryStore::add_note` (used directly by
+    // `spelunk memory add`, the most common write path in the CLI, per
+    // CLAUDE.md's own agent-workflow guidance to run it "as you make
+    // decisions") performs a bare `INSERT` with no pre-check and no error
+    // handling for a UNIQUE-constraint rejection.
+    //
+    // Once Step B has promoted `idx_notes_entity_id` to UNIQUE — which, per
+    // AC5, happens on the very next `MemoryStore::open` of *any* store with
+    // zero duplicate groups, the overwhelmingly common steady state for a
+    // real project — the very next `spelunk memory add` (or a harvest/reconcile
+    // retry) that happens to submit byte-identical `kind`/`title`/`body`
+    // content to something already stored no longer succeeds. It hard-fails
+    // with a raw, low-level SQLite error surfaced straight to the user
+    // ("Error: UNIQUE constraint failed: notes.entity_id"), reproduced
+    // directly against a real built binary during this review.
+    //
+    // This directly contradicts this story's own ADR-068 third-amendment
+    // decision text: "Excluding `created_at` from identity is settled... The
+    // consequence, recording byte-identical `kind`/`title`/`body` twice now
+    // yields one entry, is accepted." "Yields one entry" describes a graceful,
+    // idempotent-ish outcome — not an unhandled crash. None of this story's
+    // 24 acceptance criteria or five rounds of adversarial testing exercised
+    // this interaction: every round was scoped to `dedupe.rs`'s own collapse
+    // logic (the DELETE path), never to the ordinary INSERT path colliding
+    // with the index `entity_id_migration.rs` newly promotes.
+    #[test]
+    fn add_note_after_promotion_does_not_hard_crash_on_duplicate_content() {
+        let store = open_store();
+        store
+            .add_note(
+                "decision",
+                "dup entry",
+                "same content",
+                &[],
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Zero duplicate groups at this point: promotes immediately, exactly
+        // as a real `MemoryStore::open` would on this store's very next open.
+        store.promote_entity_id_unique_index().unwrap();
+        assert!(index_is_unique(&store), "precondition: index is now UNIQUE");
+
+        // The exact scenario the ADR's third amendment says "yields one
+        // entry": a second, ordinary `add_note` call for byte-identical
+        // kind/title/body content.
+        let result = store.add_note(
+            "decision",
+            "dup entry",
+            "same content",
+            &[],
+            &[],
+            None,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "BUG: after Step B promotes idx_notes_entity_id to UNIQUE (the \
+             very next open of any store with zero duplicate groups — the \
+             common case), a plain `memory add` of byte-identical \
+             kind/title/body content hard-fails with a raw UNIQUE constraint \
+             SQL error instead of the 'yields one entry' outcome ADR-068's \
+             third amendment says is the accepted consequence of excluding \
+             created_at from identity. Reproduced live against the built \
+             CLI binary: `spelunk memory add` for a second time with \
+             identical kind/title/body prints \
+             'Error: UNIQUE constraint failed: notes.entity_id' and exits 1. \
+             Underlying error: {:?}",
+            result.as_ref().err()
+        );
+    }
 }
