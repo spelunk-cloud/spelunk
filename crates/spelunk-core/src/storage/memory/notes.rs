@@ -223,9 +223,7 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Ids of every row whose `superseded_by` points at `target_id`. Used by
-    /// `memory dedupe` to find edges elsewhere in the table that must be
-    /// rewritten before a duplicate loser row is deleted.
+    /// Ids of every row whose `superseded_by` points at `target_id`.
     pub fn notes_pointing_at(&self, target_id: i64) -> Result<Vec<i64>> {
         let mut stmt = self
             .conn
