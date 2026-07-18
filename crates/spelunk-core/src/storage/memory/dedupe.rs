@@ -1045,6 +1045,134 @@ mod tests {
         }
     }
 
+    // ── Adversarial (re-verification pass): the survivor's OWN pre-existing
+    // `superseded_by` pointed at a fellow in-group loser (not itself, and not
+    // the "loser points at survivor" shape already covered above — this is
+    // the third permutation: *survivor* points at a *loser*). The adoption
+    // fix correctly filters this in-group value out of `external_values` and
+    // falls through to a genuinely-external candidate elsewhere in the group
+    // (mirroring the "3+ losers, first candidate intra-group-dangling, later
+    // candidate valid" check). But the *rewrite* loop below adoption computes
+    // `notes_pointing_at(loser_x.id)` against the ORIGINAL pre-transaction
+    // state, which still shows survivor -> loser_x, so it independently
+    // re-discovers this same edge, treats it as a self-edge case (`ref_id ==
+    // survivor.id`), and clears it back to NULL *after* the adoption write
+    // already ran — clobbering the correctly-adopted external value.
+    #[test]
+    fn adoption_survivor_own_in_group_pointer_does_not_clobber_fallthrough_adoption() {
+        let store = open_store();
+        let external = store
+            .add_note("note", "external target", "b", &[], &[], None, None)
+            .unwrap();
+        let survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_x = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_y = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        // Survivor's own pre-existing value points at a fellow duplicate
+        // (loser_x), an in-group reference that must not be adopted verbatim.
+        store.set_superseded_by(survivor, loser_x).unwrap();
+        // loser_y carries a genuinely-external candidate: once the in-group
+        // value is filtered out, this should be what the survivor ends up
+        // pointing at (fall-through adoption), not NULL.
+        store.set_superseded_by(loser_y, external).unwrap();
+
+        store.dedupe_entity_ids(false).unwrap();
+
+        let note = store.get(survivor).unwrap().unwrap();
+        assert_eq!(
+            note.superseded_by,
+            Some(external),
+            "BUG: the survivor's own pre-existing in-group pointer (at loser_x) \
+             should be filtered out of adoption and fall through to loser_y's \
+             genuinely-external value, same as any other in-group candidate. \
+             Instead the rewrite loop (computed from notes_pointing_at(loser_x), \
+             which still shows the ORIGINAL survivor->loser_x edge) independently \
+             rediscovers survivor as a 'self-edge' dependent of loser_x and clears \
+             it to NULL *after* the adoption write already set the correct \
+             external value, silently discarding a valid adopted candidate."
+        );
+    }
+
+    // ── Adversarial (re-verification pass): 3+ losers, first candidate in
+    // iteration order is intra-group-dangling (points at a fellow loser), a
+    // later candidate is genuinely external. Confirms fall-through works when
+    // the in-group pointer is on a *loser*, not the survivor. ───────────────
+    #[test]
+    fn fallthrough_adoption_skips_intragroup_dangling_candidate_and_adopts_later_external_one() {
+        let store = open_store();
+        let external = store
+            .add_note("note", "external target", "b", &[], &[], None, None)
+            .unwrap();
+        let survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_a = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_b = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        let loser_c = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 400)
+            .unwrap();
+        // loser_a (earliest loser, first candidate in iteration order) points
+        // at a fellow loser: intra-group-dangling, must be skipped.
+        store.set_superseded_by(loser_a, loser_b).unwrap();
+        // loser_c (later in iteration order) carries the only valid external
+        // candidate.
+        store.set_superseded_by(loser_c, external).unwrap();
+
+        store.dedupe_entity_ids(false).unwrap();
+
+        let note = store.get(survivor).unwrap().unwrap();
+        assert_eq!(
+            note.superseded_by,
+            Some(external),
+            "the intra-group-dangling candidate from loser_a must be skipped \
+             and the later, genuinely-external candidate from loser_c adopted"
+        );
+    }
+
+    // ── Adversarial (re-verification pass): only intra-group candidates
+    // exist anywhere in the group (no genuinely external value at all).
+    // Confirms adoption correctly resolves to None rather than erroring or
+    // keeping a bad in-group value. ─────────────────────────────────────────
+    #[test]
+    fn adoption_resolves_to_none_when_every_candidate_is_intragroup() {
+        let store = open_store();
+        let survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_a = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_b = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        // loser_a -> loser_b and loser_b -> survivor: every candidate value
+        // in the group resolves to a fellow group member, none external.
+        store.set_superseded_by(loser_a, loser_b).unwrap();
+        store.set_superseded_by(loser_b, survivor).unwrap();
+
+        let result = store.dedupe_entity_ids(false);
+        assert!(
+            result.is_ok(),
+            "an all-intra-group candidate set must not error: {:?}",
+            result.as_ref().err()
+        );
+        let note = store.get(survivor).unwrap().unwrap();
+        assert_eq!(
+            note.superseded_by, None,
+            "with zero valid external candidates in the group, the survivor \
+             must adopt None, not error and not retain a dangling/self value"
+        );
+    }
+
     // ── AC24 (structural): dedupe is never reachable except via this method ─
     // Covered by construction: `MemoryStore::open` only ever calls
     // `backfill_entity_ids`/`promote_entity_id_unique_index` (see
