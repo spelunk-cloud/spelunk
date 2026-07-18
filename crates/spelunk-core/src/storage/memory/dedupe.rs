@@ -3,11 +3,14 @@
 //! Backs the `spelunk memory dedupe` command. See ADR-068's third amendment
 //! for the merge rule this implements: survivor = earliest `created_at`;
 //! `tags`/`linked_files` union add-wins; archived sticks; `superseded_by`
-//! adoption with an earliest-wins tie-break on conflict; every row elsewhere
-//! pointing at a loser is rewritten to the survivor (self-edges dropped to
-//! NULL instead); losers and their `note_embeddings` row are then deleted.
-//! The whole run is one transaction: any error rolls back, leaving `memory.db`
-//! exactly as it was.
+//! adoption with an earliest-wins tie-break on conflict (any candidate value
+//! that refers to a member of the same duplicate group — the survivor itself
+//! or a fellow loser — is treated as absent rather than adopted, since it
+//! would otherwise create a self-loop or a reference to a row this same run
+//! deletes); every row elsewhere pointing at a loser is rewritten to the
+//! survivor (self-edges dropped to NULL instead); losers and their
+//! `note_embeddings` row are then deleted. The whole run is one transaction:
+//! any error rolls back, leaving `memory.db` exactly as it was.
 //!
 //! This is deliberately never called from `Database`/`MemoryStore::open` or
 //! any other automatic path (`init`, `add`, …): collapsing is destructive,
@@ -15,7 +18,7 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{MemoryStore, Note};
 use crate::storage::entity_id::note_entity_id;
@@ -168,13 +171,31 @@ impl MemoryStore {
         let any_archived = group.iter().any(|n| n.status == "archived");
 
         // ── superseded_by adoption, earliest-wins on conflict ───────────────
-        // Group is created_at ASC, so the first non-null value encountered is
-        // by construction the earliest-created row's value.
-        let first_non_null = group.iter().find_map(|n| n.superseded_by);
+        // A candidate value that refers to a member of *this same* duplicate
+        // group (the survivor itself, or a fellow loser) must never be
+        // adopted as-is: adopting the survivor's own id is a self-loop, and
+        // adopting a fellow loser's id creates a live reference to a row this
+        // very transaction is about to delete, which this SQLite build
+        // rejects outright with a FOREIGN KEY constraint error since
+        // `notes.superseded_by` has no `ON DELETE` clause. This mirrors the
+        // self-edge guard the rewrite loop below already applies to
+        // *external* dependents: any candidate resolving to a group member is
+        // treated as absent (dropped, not chased transitively — the ADR's
+        // merge rule for adoption is a flat "first non-null value", and
+        // chasing a chain through another group's own in-flight resolution
+        // would add order-dependent complexity the spec doesn't ask for), and
+        // the search continues to the next (later-created) candidate. Group
+        // is created_at ASC, so the first surviving candidate is, by
+        // construction, the earliest-created row's genuinely-external value.
+        let group_ids: HashSet<i64> = group.iter().map(|n| n.id).collect();
+        let external_values: Vec<i64> = group
+            .iter()
+            .filter_map(|n| n.superseded_by)
+            .filter(|v| !group_ids.contains(v))
+            .collect();
+        let first_non_null = external_values.first().copied();
         if let Some(val) = first_non_null {
-            let conflicting = group
-                .iter()
-                .any(|n| matches!(n.superseded_by, Some(v) if v != val));
+            let conflicting = external_values.iter().any(|v| *v != val);
             if conflicting {
                 tracing::warn!(
                     "memory dedupe: duplicate-entity_id group for survivor #{} carries \
