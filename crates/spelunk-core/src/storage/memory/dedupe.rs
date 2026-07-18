@@ -2,18 +2,36 @@
 //!
 //! Backs the `spelunk memory dedupe` command. See ADR-068's third amendment
 //! for the merge rule this implements: survivor = earliest `created_at`;
-//! `tags`/`linked_files` union add-wins; archived sticks; `superseded_by` is
-//! resolved once, from a single unified candidate scan over every group
-//! member's own value (survivor included) — any candidate referring to a
-//! member of the same group (the survivor itself, or a fellow loser) is
-//! dropped rather than adopted, since it would otherwise create a self-loop
-//! or a reference to a row this same run deletes, and the earliest-created
-//! surviving candidate wins. Separately, every *other* row in the table
-//! pointing at a loser is rewritten to the survivor — this never touches the
-//! survivor's own field, which is fully decided by the resolution above, so
-//! the two concerns can't stomp each other. Losers and their
-//! `note_embeddings` row are then deleted. The whole run is one transaction:
-//! any error rolls back, leaving `memory.db` exactly as it was.
+//! `tags`/`linked_files` union add-wins; archived sticks.
+//!
+//! `superseded_by` handling treats "this group member's own field refers to
+//! another member of the same group" as a single, first-class fact,
+//! established once per group before anything else acts on the field —
+//! before adoption, before the external rewrite, before any deletion. Such a
+//! value is never worth keeping: its target is either the survivor (whose
+//! own final value is resolved right there) or a loser this same run is
+//! about to delete. Three rounds of adversarial testing each found a
+//! different symptom of treating this reactively instead (a self-loop from
+//! blind adoption; adoption racing the external-rewrite loop over the same
+//! field; the loser-deletion loop hitting a live foreign-key reference from
+//! a not-yet-deleted fellow loser, in both a directional and a two-cycle
+//! shape) — resolving it once up front makes all of those structurally
+//! impossible rather than separately patched:
+//!   - the survivor's final value is the first genuinely-external candidate
+//!     found across the group (survivor's own value included), in
+//!     `created_at` order; if none exists, it resolves to `None`;
+//!   - the external-rewrite loop only ever repoints genuinely-external
+//!     dependents onto the survivor, since an in-group dependent's own field
+//!     is already accounted for above;
+//!   - every group member (survivor or loser) whose own field pointed at a
+//!     fellow group member has that field cleared before any loser is
+//!     deleted, so the deletion loop never meets a live intra-group
+//!     reference and loser deletion order — including a cycle between two
+//!     losers — can no longer matter.
+//!
+//! Losers and their `note_embeddings` row are then deleted. The whole run is
+//! one transaction: any error rolls back, leaving `memory.db` exactly as it
+//! was.
 //!
 //! This is deliberately never called from `Database`/`MemoryStore::open` or
 //! any other automatic path (`init`, `add`, …): collapsing is destructive,
@@ -203,29 +221,46 @@ impl MemoryStore {
         // ── status: archived sticks ──────────────────────────────────────────
         let any_archived = group.iter().any(|n| n.status == "archived");
 
-        // ── superseded_by: single, unified resolution for the survivor's own
-        // field ──────────────────────────────────────────────────────────────
-        // The survivor's final `superseded_by` must be computed once, from
-        // one coherent view, rather than by two independent passes that can
-        // each reach a different answer and stomp each other (that was the
-        // bug: adoption and the rewrite loop below both wrote to the
-        // survivor's own field from separate reads).
+        // ── superseded_by: clear every intra-group reference first, as one
+        // explicit, unconditional step, before adoption, before the external
+        // rewrite, before any deletion ───────────────────────────────────────
         //
-        // Candidates are every group member's own `superseded_by` value,
-        // survivor included, in group order (created_at ASC). A candidate
-        // that refers to a member of *this same* group — the survivor's own
-        // id, or a fellow loser this transaction is about to delete — is
-        // exactly as invalid as any other in-group reference and is dropped
-        // rather than adopted (not chased transitively through another
-        // group's in-flight resolution: the ADR's merge rule is a flat
-        // "first non-null value", and this is the minimal, order-independent
-        // reading of it). The first surviving candidate wins; if none
-        // survive, the resolved value is `None`.
+        // Three rounds of adversarial testing each found a different shape of
+        // the same underlying problem: a group member's own `superseded_by`
+        // pointing at *another member of this same group* is never a value
+        // worth keeping, no matter which member holds it or what it points
+        // at — its target is either the survivor (whose own final value is
+        // resolved right here) or a loser this same run is about to delete.
+        // Treating that as a first-class fact up front, rather than
+        // special-casing it separately at the point it happens to surface
+        // (adoption, the external-rewrite loop, or loser deletion order),
+        // makes all three symptom classes structurally impossible instead of
+        // merely handled:
+        //   - adoption only ever considers genuinely-external candidates;
+        //   - the external-rewrite loop only ever repoints genuinely-external
+        //     dependents;
+        //   - the deletion loop never meets a live intra-group FK reference,
+        //     so loser deletion order (and even a 2-cycle between losers)
+        //     can no longer matter.
+        //
+        // `group_ids` identifies "a member of this group"; `in_group_pointer`
+        // identifies, for each member, whether *that member's own* field
+        // refers to one. Everything below is computed from these two facts.
         let group_ids: HashSet<i64> = group.iter().map(|n| n.id).collect();
+        let in_group_pointer_ids: HashSet<i64> = group
+            .iter()
+            .filter(|n| matches!(n.superseded_by, Some(v) if group_ids.contains(&v)))
+            .map(|n| n.id)
+            .collect();
+
+        // The survivor's final `superseded_by`: the first (earliest-created,
+        // per group order) value anywhere in the group whose owning row does
+        // *not* have an in-group pointer — i.e. the first genuinely-external
+        // candidate. If none exists, the resolved value is `None`.
         let external_values: Vec<i64> = group
             .iter()
+            .filter(|n| !in_group_pointer_ids.contains(&n.id))
             .filter_map(|n| n.superseded_by)
-            .filter(|v| !group_ids.contains(v))
             .collect();
         let resolved_survivor_target = external_values.first().copied();
         if let Some(val) = resolved_survivor_target {
@@ -242,23 +277,22 @@ impl MemoryStore {
         // Did the survivor's *own* pre-existing value refer to a group
         // member? If so it can never survive as-is, whether or not a
         // fall-through external candidate replaces it above — that's what
-        // `supersede_self_edges_dropped` reports.
-        let survivor_self_edge_dropped =
-            matches!(survivor.superseded_by, Some(v) if group_ids.contains(&v));
+        // `supersede_self_edges_dropped` reports. (Losers' own in-group
+        // pointers are cleared too, below, but aren't counted here: those
+        // rows are about to be deleted, so the field's value is not
+        // user-visible state.)
+        let survivor_self_edge_dropped = in_group_pointer_ids.contains(&survivor.id);
         if survivor_self_edge_dropped {
             summary.supersede_self_edges_dropped += 1;
         }
 
         // ── edges elsewhere pointing at a loser: a separate concern ─────────
-        // This only decides *other* rows' fields, never the survivor's own —
-        // that's fully decided by the unified resolution above. Any ref_id
-        // that belongs to this same group (the survivor, or a fellow loser)
-        // is skipped here: the survivor's case is already covered above, and
-        // a fellow loser's own field doesn't matter since that row is being
-        // deleted. A genuinely external ref_id can never equal the survivor's
-        // id (the survivor is part of the group), so no self-loop is
-        // possible for these and every rewrite target is simply the
-        // survivor.
+        // This only decides *other* rows' fields, never a group member's own
+        // — those are fully decided by the resolution above. Any ref_id that
+        // belongs to this same group is skipped: a fellow group member's own
+        // in-group pointer is cleared directly (below), not rewritten, and a
+        // genuinely external ref_id can never resolve to a group member, so
+        // every remaining rewrite target is simply the survivor.
         let mut rewrites: Vec<i64> = Vec::new();
         for loser in losers {
             for ref_id in self.notes_pointing_at(loser.id)? {
@@ -282,12 +316,22 @@ impl MemoryStore {
         if any_archived {
             self.archive(survivor.id)?;
         }
+        // Clear every group member's own in-group pointer first —
+        // unconditionally, before the survivor's resolved value is written
+        // and before any loser is deleted. For the survivor this is
+        // immediately superseded by the write below if a fall-through
+        // external value exists; for losers this is what actually prevents
+        // the deletion loop from hitting a live FK reference to a
+        // not-yet-deleted fellow loser, regardless of deletion order or an
+        // in-group cycle.
+        for note in group {
+            if in_group_pointer_ids.contains(&note.id) {
+                self.clear_superseded_by(note.id)?;
+            }
+        }
         match resolved_survivor_target {
             Some(val) if survivor.superseded_by != Some(val) => {
                 self.set_superseded_by(survivor.id, val)?;
-            }
-            None if survivor_self_edge_dropped => {
-                self.clear_superseded_by(survivor.id)?;
             }
             _ => {}
         }
