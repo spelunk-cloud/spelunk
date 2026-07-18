@@ -65,6 +65,36 @@ fn fault_due(_i: usize) -> bool {
     false
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection at a finer grain than `FAULT_AFTER_GROUP`:
+    /// fires after the (0-indexed) n-th loser *within the current group* has
+    /// been fully deleted (embedding + edges + note row), but before any
+    /// later loser in the same group is touched. Used to prove the whole-run
+    /// rollback guarantee holds mid-group, not only at a group boundary.
+    static FAULT_AFTER_LOSER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_fault_after_loser(n: usize) {
+    FAULT_AFTER_LOSER.with(|f| f.set(Some(n)));
+}
+
+#[cfg(test)]
+fn clear_loser_fault() {
+    FAULT_AFTER_LOSER.with(|f| f.set(None));
+}
+
+#[cfg(test)]
+fn loser_fault_due(i: usize) -> bool {
+    FAULT_AFTER_LOSER.with(|f| f.get() == Some(i))
+}
+
+#[cfg(not(test))]
+fn loser_fault_due(_i: usize) -> bool {
+    false
+}
+
 impl MemoryStore {
     /// Collapse every duplicate `entity_id` group in one all-or-nothing
     /// transaction. `dry_run` computes the same summary via read-only queries
@@ -249,10 +279,13 @@ impl MemoryStore {
                 None => self.clear_superseded_by(*ref_id)?,
             }
         }
-        for loser in losers {
+        for (li, loser) in losers.iter().enumerate() {
             self.delete_note_embedding(loser.id)?;
             self.delete_edges_for_note(loser.id)?;
             self.delete_note(loser.id)?;
+            if loser_fault_due(li) {
+                anyhow::bail!("injected test fault after deleting loser index {li} within group");
+            }
         }
 
         Ok(())
@@ -302,6 +335,42 @@ mod tests {
 
     fn has_embedding(store: &MemoryStore, note_id: i64) -> bool {
         store.get_embedding(note_id).unwrap().is_some()
+    }
+
+    /// Snapshot every column of every row in `table`, ordered by `order_by`,
+    /// as generic SQLite `Value`s. Used to assert a rolled-back or dry-run
+    /// call left the database byte-for-byte unchanged: unlike a row-count or
+    /// single-column check, this catches a regression in *any* column
+    /// (tags, superseded_by, status, entity_id, uuid, remote_id, ...) without
+    /// having to hand-maintain a column list.
+    fn full_table_snapshot(
+        store: &MemoryStore,
+        table: &str,
+        order_by: &str,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        let sql = format!("SELECT * FROM {table} ORDER BY {order_by}");
+        let mut stmt = store.conn.prepare(&sql).unwrap();
+        let n = stmt.column_count();
+        stmt.query_map([], |row| {
+            (0..n)
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    type TableSnapshot = Vec<Vec<rusqlite::types::Value>>;
+
+    /// Snapshot of `notes` + `memory_edges` + `note_embeddings`, the three
+    /// tables `dedupe_entity_ids` can touch.
+    fn full_db_snapshot(store: &MemoryStore) -> (TableSnapshot, TableSnapshot, TableSnapshot) {
+        (
+            full_table_snapshot(store, "notes", "id"),
+            full_table_snapshot(store, "memory_edges", "from_id, to_id, kind"),
+            full_table_snapshot(store, "note_embeddings", "note_id"),
+        )
     }
 
     // ── AC22 (zero groups): all-zero counts, no writes, dry-run or not ──────
@@ -579,6 +648,11 @@ mod tests {
 
         store.dedupe_entity_ids(false).unwrap();
         assert!(has_embedding(&store, survivor), "survivor embedding kept");
+        assert_eq!(
+            store.get_embedding(survivor).unwrap().as_deref(),
+            Some(vec_a.as_slice()),
+            "survivor's embedding bytes must be provably untouched, not merely present"
+        );
         assert!(
             store.get_embedding(loser).unwrap().is_none(),
             "loser's embedding row must be gone (loser row itself is deleted too)"
@@ -620,6 +694,355 @@ mod tests {
             before,
             "memory.db must be unchanged after a rolled-back run (no partial collapse)"
         );
+    }
+
+    // ── Adversarial: fault mid-group (after a loser is fully deleted, before
+    // the next loser in the *same* group is touched), with a byte-for-byte
+    // full-table comparison rather than just a row count. AC21's own test
+    // only proves rollback at a *group* boundary; this proves it holds at a
+    // finer grain too, and that every column of every table dedupe can touch
+    // (notes, memory_edges, note_embeddings) is provably restored, not just
+    // the row count. ─────────────────────────────────────────────────────
+    #[test]
+    fn injected_fault_mid_group_after_partial_loser_deletion_rolls_back_byte_for_byte() {
+        let store = open_store();
+        let survivor = store
+            .add_note_with_created_at(
+                "decision",
+                "dup",
+                "body",
+                &["orig"],
+                &[],
+                None,
+                "active",
+                100,
+            )
+            .unwrap();
+        let loser_a = store
+            .add_note_with_created_at(
+                "decision",
+                "dup",
+                "body",
+                &["from-a"],
+                &[],
+                None,
+                "archived",
+                200,
+            )
+            .unwrap();
+        let loser_b = store
+            .add_note_with_created_at(
+                "decision",
+                "dup",
+                "body",
+                &["from-b"],
+                &[],
+                None,
+                "active",
+                300,
+            )
+            .unwrap();
+        let external = store
+            .add_note("note", "external dependent", "b", &[], &[], None, None)
+            .unwrap();
+        // external's supersede edge points at loser_a; a fully-correct
+        // rollback must restore both the notes.superseded_by column AND this
+        // memory_edges row exactly as they were.
+        store.supersede(external, loser_a).unwrap();
+        store.insert_embedding(loser_a, &[7u8; 896 * 4]).unwrap();
+
+        let before = full_db_snapshot(&store);
+        assert_eq!(before.0.len(), 4, "precondition: 4 notes seeded");
+
+        // Fault fires right after loser_a (index 0) is fully deleted
+        // (embedding + edges + note row gone) but before loser_b is touched
+        // at all: a genuinely different point than the group-boundary fault
+        // AC21's own test injects.
+        inject_fault_after_loser(0);
+        let result = store.dedupe_entity_ids(false);
+        clear_loser_fault();
+
+        assert!(
+            result.is_err(),
+            "the mid-group injected fault must surface as an error"
+        );
+        let after = full_db_snapshot(&store);
+        assert_eq!(
+            after, before,
+            "notes + memory_edges + note_embeddings must be byte-for-byte \
+             unchanged after a run that fails mid-group (partial loser \
+             deletion must roll back too, not just whole-group commits)"
+        );
+        // Sanity: the row that would have been deleted is genuinely still
+        // present with its original content (not just "some 4 rows exist").
+        assert!(
+            store.get(loser_a).unwrap().is_some(),
+            "loser_a survives rollback"
+        );
+        let restored_survivor = store.get(survivor).unwrap().unwrap();
+        assert_eq!(
+            restored_survivor.tags,
+            vec!["orig".to_string()],
+            "survivor's own tags must not have been touched by the aborted run"
+        );
+        let _ = loser_b; // seeded only to make this a real multi-loser group
+    }
+
+    // ── Adversarial: --dry-run must leave every column of every touched
+    // table untouched, not just row count / one column. ────────────────────
+    #[test]
+    fn dry_run_leaves_full_db_state_byte_for_byte_unchanged() {
+        let store = open_store();
+        let survivor = store
+            .add_note_with_created_at(
+                "decision",
+                "dup",
+                "body",
+                &["a"],
+                &["f.rs"],
+                None,
+                "active",
+                100,
+            )
+            .unwrap();
+        let loser = store
+            .add_note_with_created_at(
+                "decision",
+                "dup",
+                "body",
+                &["b"],
+                &[],
+                None,
+                "archived",
+                200,
+            )
+            .unwrap();
+        let external = store
+            .add_note("note", "external", "b", &[], &[], None, None)
+            .unwrap();
+        store.supersede(external, loser).unwrap();
+        store.insert_embedding(survivor, &[1u8; 896 * 4]).unwrap();
+        store.insert_embedding(loser, &[2u8; 896 * 4]).unwrap();
+
+        let before = full_db_snapshot(&store);
+        let summary = store.dedupe_entity_ids(true).unwrap();
+        assert_eq!(
+            summary.duplicate_groups, 1,
+            "precondition: a group exists to report on"
+        );
+
+        let after = full_db_snapshot(&store);
+        assert_eq!(
+            after, before,
+            "dry-run must leave notes + memory_edges + note_embeddings \
+             completely unchanged, in every column, not just row count"
+        );
+    }
+
+    // ── Adversarial: multiple external rows point at *different* losers
+    // within the same duplicate group. Each must be independently repointed
+    // to the survivor. ───────────────────────────────────────────────────────
+    #[test]
+    fn multiple_external_rows_pointing_at_different_losers_all_repoint_to_survivor() {
+        let store = open_store();
+        let survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_a = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_b = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        let dep_a = store
+            .add_note("note", "points at loser_a", "b", &[], &[], None, None)
+            .unwrap();
+        let dep_b = store
+            .add_note("note", "points at loser_b", "b", &[], &[], None, None)
+            .unwrap();
+        store.set_superseded_by(dep_a, loser_a).unwrap();
+        store.set_superseded_by(dep_b, loser_b).unwrap();
+
+        let summary = store.dedupe_entity_ids(false).unwrap();
+        assert_eq!(summary.supersede_edges_repointed, 2);
+        assert_eq!(
+            store.get(dep_a).unwrap().unwrap().superseded_by,
+            Some(survivor),
+            "dep_a's edge to loser_a must repoint to the survivor"
+        );
+        assert_eq!(
+            store.get(dep_b).unwrap().unwrap().superseded_by,
+            Some(survivor),
+            "dep_b's edge to loser_b must repoint to the survivor, independently of dep_a"
+        );
+    }
+
+    // ── Adversarial: delete_edges_for_note must remove edges in *both*
+    // directions for a loser (edges the loser points from, and edges other
+    // notes point at the loser), leaving no orphan. ─────────────────────────
+    #[test]
+    fn loser_deletion_removes_memory_edges_in_both_directions_no_orphan() {
+        let store = open_store();
+        let survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let other_a = store
+            .add_note("note", "a", "b", &[], &[], None, None)
+            .unwrap();
+        let other_b = store
+            .add_note("note", "b", "b", &[], &[], None, None)
+            .unwrap();
+        // loser -> other_a (loser is from_id) and other_b -> loser (loser is to_id).
+        store.add_edge(loser, other_a, "relates_to").unwrap();
+        store.add_edge(other_b, loser, "relates_to").unwrap();
+
+        store.dedupe_entity_ids(false).unwrap();
+
+        let orphans: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_edges WHERE from_id = ?1 OR to_id = ?1",
+                rusqlite::params![loser],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphans, 0,
+            "no memory_edges row may reference the deleted loser id"
+        );
+        let _ = survivor;
+    }
+
+    // ── Adversarial: relates_to/contradicts edges to a loser are dropped
+    // outright by `delete_edges_for_note`, not repointed to the survivor.
+    // This differs from tags/linked_files/superseded_by, which are carefully merged.
+    // This documents current (lossy) behavior so a silent further regression
+    // is still caught; see the board comment for why this is flagged as a
+    // follow-up rather than treated as a spec violation (ADR-068's third
+    // amendment only specifies a merge rule for `superseded_by`, not for the
+    // `memory_edges` relationship graph). ───────────────────────────────────
+    #[test]
+    fn relates_to_edge_to_external_note_is_dropped_not_repointed_known_gap() {
+        let store = open_store();
+        let survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let external = store
+            .add_note("note", "external relation", "b", &[], &[], None, None)
+            .unwrap();
+        store.add_edge(loser, external, "relates_to").unwrap();
+
+        store.dedupe_entity_ids(false).unwrap();
+
+        let (survivor_out, _) = store.get_edges(survivor).unwrap();
+        assert!(
+            !survivor_out.iter().any(|e| e.to_id == external),
+            "documents current behavior: the loser's relates_to edge to an \
+             external note is NOT repointed onto the survivor (it is simply \
+             deleted with the loser). If this assertion ever fails, dedupe's \
+             edge handling changed; update this test alongside the ADR."
+        );
+    }
+
+    // ── Adversarial: the survivor's adoption of a group member's
+    // `superseded_by` value does not validate that the value isn't itself a
+    // member of the same duplicate group. When a loser's own `superseded_by`
+    // points directly at the survivor, adoption creates SURVIVOR -> SURVIVOR
+    // (a self-loop), unlike the *rewrite* path (AC19), which explicitly
+    // guards against exactly this and drops to NULL instead. This is a
+    // genuine bug, not a documented scope gap: a self-referencing
+    // `superseded_by` is nonsensical regardless of the ADR's text. ─────────
+    #[test]
+    fn adoption_must_not_selfloop_when_a_loser_points_at_the_survivor() {
+        let store = open_store();
+        let survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        // loser was (per this row) "superseded by" the survivor itself.
+        store.set_superseded_by(loser, survivor).unwrap();
+
+        store.dedupe_entity_ids(false).unwrap();
+
+        let note = store.get(survivor).unwrap().unwrap();
+        assert_ne!(
+            note.superseded_by,
+            Some(survivor),
+            "BUG: the survivor's superseded_by must never be adopted as its \
+             own id, that is a self-loop. The adoption step at dedupe.rs's \
+             `first_non_null` handling has no self-edge guard, unlike the \
+             rewrite loop just below it (AC19)."
+        );
+    }
+
+    // ── Adversarial: a chained loser->loser `superseded_by` pointer (one
+    // loser's `superseded_by` points at *another* loser in the same group,
+    // not at the survivor) gets blindly adopted onto the survivor by value,
+    // even though that target row is about to be deleted in this very
+    // transaction. The rewrite loop (which repoints external dependents)
+    // never sees this adoption write, because `rewrites` is computed from a
+    // read taken *before* the adoption write happens.
+    //
+    // The practical symptom is even sharper than "a dangling pointer": this
+    // SQLite build enforces `foreign_keys` ON BY DEFAULT (verified directly;
+    // see the board comment, this contradicts `edges.rs`'s own doc comment
+    // and the Engineer's stated rationale for `delete_edges_for_note`, both
+    // of which assume FK enforcement is off on this connection). `notes`
+    // (`superseded_by INTEGER REFERENCES notes(id)`) has no `ON DELETE`
+    // clause, so once the survivor's adoption write leaves it pointing at
+    // loser_b, the later `DELETE FROM notes WHERE id = loser_b` in the same
+    // transaction is rejected outright with a FOREIGN KEY constraint error:
+    // the whole dedupe run fails (and correctly rolls back) for a duplicate
+    // shape it should handle cleanly. ───────────────────────────────────────
+    #[test]
+    fn adoption_must_not_dangle_when_a_loser_points_at_a_fellow_loser() {
+        let store = open_store();
+        let survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_a = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_b = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        // loser_a claims to be "superseded by" loser_b, a fellow member of
+        // the very same duplicate group, not an external note.
+        store.set_superseded_by(loser_a, loser_b).unwrap();
+
+        let result = store.dedupe_entity_ids(false);
+
+        assert!(
+            result.is_ok(),
+            "BUG: a loser's superseded_by pointing at a fellow loser in the \
+             same group (a chained in-group reference) makes the whole \
+             dedupe run fail with a FOREIGN KEY constraint error instead of \
+             collapsing cleanly: {:?}. The adoption step blindly copies that \
+             in-group value onto the survivor before the deletion loop runs, \
+             creating a live FK reference to a row this very transaction \
+             then tries to delete.",
+            result.as_ref().err()
+        );
+        // If a future fix makes this succeed, it must not merely trade the
+        // hard error for a silent dangling pointer.
+        if result.is_ok() {
+            let note = store.get(survivor).unwrap().unwrap();
+            if let Some(target) = note.superseded_by {
+                assert!(
+                    store.get(target).unwrap().is_some(),
+                    "survivor.superseded_by ({target}) must not point at a \
+                     row that no longer exists"
+                );
+            }
+        }
     }
 
     // ── AC24 (structural): dedupe is never reachable except via this method ─

@@ -426,4 +426,50 @@ mod tests {
         );
         assert!(marker_exists(&store));
     }
+
+    // ── Adversarial (AC5/item 8): the promoted index must genuinely reject a
+    // duplicate INSERT at the SQL level, not merely report itself as "UNIQUE"
+    // in `sqlite_master`'s stored SQL text (index_is_unique() above proves
+    // only the latter). A CREATE UNIQUE INDEX statement can be issued against
+    // a table that already violates it in edge cases (e.g. NULLs, or a
+    // logic bug in the WHERE-partial-index clause); the only real proof is a
+    // rejected write. ────────────────────────────────────────────────────────
+    #[test]
+    fn promoted_unique_index_genuinely_rejects_a_duplicate_insert() {
+        let store = open_store();
+        store
+            .add_note("note", "only one", "body", &[], &[], None, None)
+            .unwrap();
+
+        store.promote_entity_id_unique_index().unwrap();
+        assert!(index_is_unique(&store), "precondition: index promoted");
+
+        let dup_entity_id = crate::storage::entity_id::entity_id("note", "only one", "body");
+        let insert_result = store.conn.execute(
+            "INSERT INTO notes (kind, title, body, entity_id) VALUES ('note', 'only one', 'body', ?1)",
+            rusqlite::params![dup_entity_id],
+        );
+        assert!(
+            insert_result.is_err(),
+            "a promoted UNIQUE index must reject a subsequent duplicate \
+             entity_id insert, not merely exist with 'UNIQUE' in its SQL text"
+        );
+        let msg = insert_result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            msg.contains("unique"),
+            "expected a UNIQUE constraint violation, got: {msg}"
+        );
+
+        // A non-duplicate insert must still succeed: the index is selective
+        // (WHERE entity_id IS NOT NULL), not a blanket rejection of writes.
+        let other_entity_id =
+            crate::storage::entity_id::entity_id("note", "a different one", "body");
+        store
+            .conn
+            .execute(
+                "INSERT INTO notes (kind, title, body, entity_id) VALUES ('note', 'a different one', 'body', ?1)",
+                rusqlite::params![other_entity_id],
+            )
+            .expect("a genuinely distinct entity_id must still insert fine");
+    }
 }
