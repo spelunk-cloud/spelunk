@@ -1188,6 +1188,177 @@ mod tests {
         );
     }
 
+    // ── Adversarial (round 3): a LATER-created loser's own `superseded_by`
+    // points at an EARLIER-created fellow loser (not the survivor). Neither
+    // adoption nor the rewrite loop ever touches this value — it's correctly
+    // excluded from both, per the "a fellow loser's own field doesn't matter
+    // since that row is being deleted" comment above the rewrite loop — so it
+    // sits untouched on loser_late's own row until deletion time. But the
+    // deletion loop deletes losers in `created_at` ASC order (loser_early,
+    // then loser_late), i.e. it tries to delete loser_early — the row
+    // loser_late still references — *before* loser_late (the referencing
+    // row) is gone. Under live FK enforcement (empirically confirmed active
+    // on this connection: `notes.superseded_by` has no `ON DELETE` clause)
+    // this must fail with a FOREIGN KEY constraint error on the delete of
+    // loser_early, exactly the same user-visible symptom as the two
+    // previously-fixed bugs, but via the deletion loop's ordering rather than
+    // the adoption/rewrite write paths. ──────────────────────────────────────
+    #[test]
+    fn later_loser_pointing_at_earlier_fellow_loser_must_not_break_deletion_order() {
+        let store = open_store();
+        let _survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_early = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_late = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        // loser_late (deleted SECOND, per created_at ASC order) points at
+        // loser_early (deleted FIRST) — the referencing row outlives, in
+        // deletion order, the row it references.
+        store.set_superseded_by(loser_late, loser_early).unwrap();
+
+        let result = store.dedupe_entity_ids(false);
+
+        assert!(
+            result.is_ok(),
+            "BUG: a later-created loser pointing at an earlier-created \
+             fellow loser breaks the deletion loop's naive created_at-ASC \
+             order — deleting loser_early while loser_late (not yet \
+             deleted) still references it via superseded_by triggers a \
+             live FOREIGN KEY constraint error and the whole run fails \
+             instead of collapsing cleanly: {:?}",
+            result.as_ref().err()
+        );
+    }
+
+    // ── Adversarial (round 3): the same deletion-order hazard as above, but
+    // with the roles swapped per the story's own round-2-repro-swap
+    // instruction: two losers point AT EACH OTHER (a 2-cycle among fellow
+    // losers), survivor points at nothing. Neither value is external, so
+    // nothing is adopted onto the survivor and nothing is queued in
+    // `rewrites` — same as the one-directional case above — but now
+    // *whichever* loser the deletion loop tries to delete first is still
+    // referenced by the other (not-yet-deleted) loser, so this must fail
+    // regardless of `created_at` order, not just in the "later points at
+    // earlier" direction. ────────────────────────────────────────────────────
+    #[test]
+    fn mutually_referencing_fellow_losers_must_not_break_deletion_order() {
+        let store = open_store();
+        let _survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_a = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_b = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        store.set_superseded_by(loser_a, loser_b).unwrap();
+        store.set_superseded_by(loser_b, loser_a).unwrap();
+
+        let result = store.dedupe_entity_ids(false);
+
+        assert!(
+            result.is_ok(),
+            "BUG: two fellow losers pointing at each other (a 2-cycle) \
+             breaks the deletion loop regardless of created_at order — \
+             whichever is deleted first is still referenced by the other, \
+             not-yet-deleted loser, triggering a FOREIGN KEY constraint \
+             error: {:?}",
+            result.as_ref().err()
+        );
+    }
+
+    // ── Adversarial (round 3): a 4-note group where multiple members carry
+    // non-null superseded_by pointing at a mix of intra-group and external
+    // targets, including a chain (loser -> loser -> external). Confirms the
+    // unified resolution still picks a sensible, deterministic external
+    // value, the counts stay accurate, AND — this is the actual failure mode
+    // this round found — the deletion loop must not choke on the in-group
+    // chain reference along the way. ─────────────────────────────────────────
+    #[test]
+    fn four_note_group_with_mixed_intragroup_and_external_pointers_resolves_deterministically() {
+        let store = open_store();
+        let external_a = store
+            .add_note("note", "external a", "b", &[], &[], None, None)
+            .unwrap();
+        let external_b = store
+            .add_note("note", "external b", "b", &[], &[], None, None)
+            .unwrap();
+        let _survivor = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser1 = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser2 = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        let loser3 = store
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 400)
+            .unwrap();
+        // loser1 (earliest loser, first candidate in iteration order) chains
+        // to a fellow loser: intra-group, must be skipped for adoption AND
+        // must not break deletion order.
+        store.set_superseded_by(loser1, loser2).unwrap();
+        // loser2 itself carries a genuinely-external value.
+        store.set_superseded_by(loser2, external_a).unwrap();
+        // loser3 carries a different external value (conflict case).
+        store.set_superseded_by(loser3, external_b).unwrap();
+
+        let summary = store.dedupe_entity_ids(false).unwrap();
+        // Resolution order is group order (created_at ASC): survivor(None),
+        // loser1(->loser2, in-group, dropped), loser2(->external_a, first
+        // surviving external candidate), loser3(->external_b, conflicting).
+        // external_a must win.
+        let note = store.get(_survivor).unwrap().unwrap();
+        assert_eq!(
+            note.superseded_by,
+            Some(external_a),
+            "the earliest-created external candidate (from loser2) must win, \
+             with loser1's in-group chain to loser2 correctly excluded"
+        );
+        assert_eq!(summary.rows_collapsed, 3);
+
+        // Re-run determinism: rebuild an identical store and confirm the same
+        // resolution and counts on a second, independent run (not just
+        // repeatable within one process — a genuinely fresh grouping pass).
+        let store2 = open_store();
+        let external_a2 = store2
+            .add_note("note", "external a", "b", &[], &[], None, None)
+            .unwrap();
+        let external_b2 = store2
+            .add_note("note", "external b", "b", &[], &[], None, None)
+            .unwrap();
+        let survivor2 = store2
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser1b = store2
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser2b = store2
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        let loser3b = store2
+            .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 400)
+            .unwrap();
+        store2.set_superseded_by(loser1b, loser2b).unwrap();
+        store2.set_superseded_by(loser2b, external_a2).unwrap();
+        store2.set_superseded_by(loser3b, external_b2).unwrap();
+        store2.dedupe_entity_ids(false).unwrap();
+        let note2 = store2.get(survivor2).unwrap().unwrap();
+        assert_eq!(
+            note2.superseded_by,
+            Some(external_a2),
+            "the resolution must be deterministic across independent runs \
+             on an equivalent input shape, not HashMap-iteration-order- \
+             dependent"
+        );
+    }
+
     // ── AC24 (structural): dedupe is never reachable except via this method ─
     // Covered by construction: `MemoryStore::open` only ever calls
     // `backfill_entity_ids`/`promote_entity_id_unique_index` (see
