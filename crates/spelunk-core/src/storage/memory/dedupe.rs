@@ -1403,6 +1403,88 @@ mod tests {
         );
     }
 
+    // ── Adversarial (round-4 re-verification): TWO duplicate groups in the
+    // SAME `dedupe_entity_ids` call, where a member of the *second* group
+    // (processed later) has its own `superseded_by` pointing at a member of
+    // the *first* group (processed earlier). This probes whether "the
+    // current group" is scoped correctly when the run collapses more than
+    // one group.
+    //
+    // `group: &[Note]` passed into `collapse_group` is a fixed snapshot taken
+    // by `all_notes_for_dedup()` once, before the transaction begins and
+    // before any group is processed. The external-rewrite loop reads live via
+    // `notes_pointing_at`, so it sees every prior group's writes. But the
+    // in-group/adoption resolution reads a group member's `superseded_by`
+    // straight off that same stale, pre-transaction `Note` snapshot — it has
+    // no way to know a *different* group, processed earlier in this same
+    // run, already rewrote that value or deleted its target.
+    //
+    // Group A (survivor_a, loser_a) is processed first (created_at 100/200).
+    // Group B (survivor_b, external_x) is processed second (created_at
+    // 150/250). `external_x` is itself group B's loser, but its own
+    // `superseded_by` points at `loser_a` — a member of group A, unrelated to
+    // group B's identity.
+    //
+    // Processing group A: the external-rewrite loop's live query correctly
+    // finds external_x pointing at loser_a and repoints it to survivor_a
+    // (external_x is not a member of group A, so this is legitimate), then
+    // deletes loser_a.
+    //
+    // Processing group B: survivor_b's adoption resolution reads external_x's
+    // *stale* snapshot value (still `loser_a`, not survivor_a) and treats it
+    // as a genuinely-external candidate (loser_a isn't a member of group B's
+    // `group_ids`), so it tries to write `survivor_b.superseded_by =
+    // loser_a.id` — a row deleted by group A moments earlier in the very
+    // same transaction. Under live FK enforcement this fails outright instead
+    // of collapsing cleanly, the same user-visible symptom as rounds 1-3, but
+    // via cross-group snapshot staleness rather than a single group's own
+    // internal bookkeeping.
+    #[test]
+    fn external_row_that_is_itself_a_duplicate_in_a_different_group_is_resolved_correctly_across_groups()
+     {
+        let store = open_store();
+        let survivor_a = store
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_a = store
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let survivor_b = store
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 150)
+            .unwrap();
+        let external_x = store
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 250)
+            .unwrap();
+        // external_x is a loser in group B, but its own pre-existing
+        // superseded_by points at loser_a, a member of the unrelated group A.
+        store.set_superseded_by(external_x, loser_a).unwrap();
+
+        let result = store.dedupe_entity_ids(false);
+
+        assert!(
+            result.is_ok(),
+            "BUG: group B's adoption resolution read external_x's \
+             superseded_by from a stale pre-transaction snapshot (still \
+             pointing at loser_a) rather than the live DB (where group A's \
+             earlier processing already repointed it to survivor_a and \
+             deleted loser_a), so it tried to write survivor_b.superseded_by \
+             = loser_a onto a row already deleted in this same transaction: \
+             {:?}",
+            result.as_ref().err()
+        );
+        if let Ok(summary) = &result {
+            assert_eq!(summary.rows_collapsed, 2, "both groups' losers collapsed");
+            let sb = store.get(survivor_b).unwrap().unwrap();
+            assert_eq!(
+                sb.superseded_by,
+                Some(survivor_a),
+                "survivor_b must end up pointing at survivor_a (the row \
+                 loser_a was merged into), not the deleted loser_a, and not \
+                 be left dangling"
+            );
+        }
+    }
+
     // ── AC24 (structural): dedupe is never reachable except via this method ─
     // Covered by construction: `MemoryStore::open` only ever calls
     // `backfill_entity_ids`/`promote_entity_id_unique_index` (see
