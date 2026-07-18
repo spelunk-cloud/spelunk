@@ -2,13 +2,16 @@
 //!
 //! Backs the `spelunk memory dedupe` command. See ADR-068's third amendment
 //! for the merge rule this implements: survivor = earliest `created_at`;
-//! `tags`/`linked_files` union add-wins; archived sticks; `superseded_by`
-//! adoption with an earliest-wins tie-break on conflict (any candidate value
-//! that refers to a member of the same duplicate group — the survivor itself
-//! or a fellow loser — is treated as absent rather than adopted, since it
-//! would otherwise create a self-loop or a reference to a row this same run
-//! deletes); every row elsewhere pointing at a loser is rewritten to the
-//! survivor (self-edges dropped to NULL instead); losers and their
+//! `tags`/`linked_files` union add-wins; archived sticks; `superseded_by` is
+//! resolved once, from a single unified candidate scan over every group
+//! member's own value (survivor included) — any candidate referring to a
+//! member of the same group (the survivor itself, or a fellow loser) is
+//! dropped rather than adopted, since it would otherwise create a self-loop
+//! or a reference to a row this same run deletes, and the earliest-created
+//! surviving candidate wins. Separately, every *other* row in the table
+//! pointing at a loser is rewritten to the survivor — this never touches the
+//! survivor's own field, which is fully decided by the resolution above, so
+//! the two concerns can't stomp each other. Losers and their
 //! `note_embeddings` row are then deleted. The whole run is one transaction:
 //! any error rolls back, leaving `memory.db` exactly as it was.
 //!
@@ -200,31 +203,32 @@ impl MemoryStore {
         // ── status: archived sticks ──────────────────────────────────────────
         let any_archived = group.iter().any(|n| n.status == "archived");
 
-        // ── superseded_by adoption, earliest-wins on conflict ───────────────
-        // A candidate value that refers to a member of *this same* duplicate
-        // group (the survivor itself, or a fellow loser) must never be
-        // adopted as-is: adopting the survivor's own id is a self-loop, and
-        // adopting a fellow loser's id creates a live reference to a row this
-        // very transaction is about to delete, which this SQLite build
-        // rejects outright with a FOREIGN KEY constraint error since
-        // `notes.superseded_by` has no `ON DELETE` clause. This mirrors the
-        // self-edge guard the rewrite loop below already applies to
-        // *external* dependents: any candidate resolving to a group member is
-        // treated as absent (dropped, not chased transitively — the ADR's
-        // merge rule for adoption is a flat "first non-null value", and
-        // chasing a chain through another group's own in-flight resolution
-        // would add order-dependent complexity the spec doesn't ask for), and
-        // the search continues to the next (later-created) candidate. Group
-        // is created_at ASC, so the first surviving candidate is, by
-        // construction, the earliest-created row's genuinely-external value.
+        // ── superseded_by: single, unified resolution for the survivor's own
+        // field ──────────────────────────────────────────────────────────────
+        // The survivor's final `superseded_by` must be computed once, from
+        // one coherent view, rather than by two independent passes that can
+        // each reach a different answer and stomp each other (that was the
+        // bug: adoption and the rewrite loop below both wrote to the
+        // survivor's own field from separate reads).
+        //
+        // Candidates are every group member's own `superseded_by` value,
+        // survivor included, in group order (created_at ASC). A candidate
+        // that refers to a member of *this same* group — the survivor's own
+        // id, or a fellow loser this transaction is about to delete — is
+        // exactly as invalid as any other in-group reference and is dropped
+        // rather than adopted (not chased transitively through another
+        // group's in-flight resolution: the ADR's merge rule is a flat
+        // "first non-null value", and this is the minimal, order-independent
+        // reading of it). The first surviving candidate wins; if none
+        // survive, the resolved value is `None`.
         let group_ids: HashSet<i64> = group.iter().map(|n| n.id).collect();
         let external_values: Vec<i64> = group
             .iter()
             .filter_map(|n| n.superseded_by)
             .filter(|v| !group_ids.contains(v))
             .collect();
-        let first_non_null = external_values.first().copied();
-        if let Some(val) = first_non_null {
+        let resolved_survivor_target = external_values.first().copied();
+        if let Some(val) = resolved_survivor_target {
             let conflicting = external_values.iter().any(|v| *v != val);
             if conflicting {
                 tracing::warn!(
@@ -235,25 +239,35 @@ impl MemoryStore {
                 );
             }
         }
+        // Did the survivor's *own* pre-existing value refer to a group
+        // member? If so it can never survive as-is, whether or not a
+        // fall-through external candidate replaces it above — that's what
+        // `supersede_self_edges_dropped` reports.
+        let survivor_self_edge_dropped =
+            matches!(survivor.superseded_by, Some(v) if group_ids.contains(&v));
+        if survivor_self_edge_dropped {
+            summary.supersede_self_edges_dropped += 1;
+        }
 
-        // ── edges elsewhere pointing at a loser: rewrite before deletion ────
-        // Read-only lookups, safe to run in both dry-run and real mode.
-        let mut rewrites: Vec<(i64, Option<i64>)> = Vec::new();
+        // ── edges elsewhere pointing at a loser: a separate concern ─────────
+        // This only decides *other* rows' fields, never the survivor's own —
+        // that's fully decided by the unified resolution above. Any ref_id
+        // that belongs to this same group (the survivor, or a fellow loser)
+        // is skipped here: the survivor's case is already covered above, and
+        // a fellow loser's own field doesn't matter since that row is being
+        // deleted. A genuinely external ref_id can never equal the survivor's
+        // id (the survivor is part of the group), so no self-loop is
+        // possible for these and every rewrite target is simply the
+        // survivor.
+        let mut rewrites: Vec<i64> = Vec::new();
         for loser in losers {
             for ref_id in self.notes_pointing_at(loser.id)? {
-                if ref_id == survivor.id {
-                    rewrites.push((ref_id, None));
-                } else {
-                    rewrites.push((ref_id, Some(survivor.id)));
+                if !group_ids.contains(&ref_id) {
+                    rewrites.push(ref_id);
                 }
             }
         }
-        for (_, target) in &rewrites {
-            match target {
-                Some(_) => summary.supersede_edges_repointed += 1,
-                None => summary.supersede_self_edges_dropped += 1,
-            }
-        }
+        summary.supersede_edges_repointed += rewrites.len();
 
         summary.rows_collapsed += losers.len();
 
@@ -268,16 +282,17 @@ impl MemoryStore {
         if any_archived {
             self.archive(survivor.id)?;
         }
-        if let Some(val) = first_non_null
-            && survivor.superseded_by != Some(val)
-        {
-            self.set_superseded_by(survivor.id, val)?;
-        }
-        for (ref_id, target) in &rewrites {
-            match target {
-                Some(new_target) => self.set_superseded_by(*ref_id, *new_target)?,
-                None => self.clear_superseded_by(*ref_id)?,
+        match resolved_survivor_target {
+            Some(val) if survivor.superseded_by != Some(val) => {
+                self.set_superseded_by(survivor.id, val)?;
             }
+            None if survivor_self_edge_dropped => {
+                self.clear_superseded_by(survivor.id)?;
+            }
+            _ => {}
+        }
+        for ref_id in &rewrites {
+            self.set_superseded_by(*ref_id, survivor.id)?;
         }
         for (li, loser) in losers.iter().enumerate() {
             self.delete_note_embedding(loser.id)?;
