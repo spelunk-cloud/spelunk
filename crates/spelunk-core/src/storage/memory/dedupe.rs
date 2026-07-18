@@ -1611,4 +1611,310 @@ mod tests {
     // `entity_id_migration::tests::promote_with_duplicates_leaves_index_non_unique_and_does_not_error`,
     // which proves opening a store with duplicates present does not collapse
     // them.
+
+    // ── Adversarial (round-5 re-verification, whole-run restructuring):
+    // a CHAINED cross-group reference. Group A's survivor's own field points
+    // at a *loser* of group B; group B's survivor's own field independently
+    // points at a *loser* of group C. `loser_to_survivor` is a flat, one-hop
+    // map (every doomed id maps directly to its own group's survivor, never
+    // to another doomed id, since group membership partitions disjointly),
+    // so each edge should resolve in exactly one redirect to the concrete
+    // target group's survivor — never a raw loser id, and never chasing
+    // through what the *target* survivor's own field happens to point at
+    // (that would be a different, unrelated edge). This test proves both
+    // hops resolve independently and correctly in the same run. ────────────
+    #[test]
+    fn chained_cross_group_reference_resolves_one_hop_not_to_intermediate_loser() {
+        let store = open_store();
+        let survivor_a = store
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let survivor_b = store
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 150)
+            .unwrap();
+        let loser_b = store
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 250)
+            .unwrap();
+        let survivor_c = store
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 175)
+            .unwrap();
+        let loser_c = store
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 275)
+            .unwrap();
+        // A's survivor points at B's loser; B's survivor independently points
+        // at C's loser. Two separate edges, not a transitive chain.
+        store.set_superseded_by(survivor_a, loser_b).unwrap();
+        store.set_superseded_by(survivor_b, loser_c).unwrap();
+
+        let summary = store.dedupe_entity_ids(false).unwrap();
+        assert_eq!(
+            summary.rows_collapsed, 2,
+            "one loser each in groups B and C"
+        );
+
+        let a = store.get(survivor_a).unwrap().unwrap();
+        assert_eq!(
+            a.superseded_by,
+            Some(survivor_b),
+            "A's edge to B's loser must resolve to B's survivor id directly, \
+             not the raw (now-deleted) loser_b id"
+        );
+        let b = store.get(survivor_b).unwrap().unwrap();
+        assert_eq!(
+            b.superseded_by,
+            Some(survivor_c),
+            "B's own edge to C's loser must resolve to C's survivor \
+             independently of A's edge into B"
+        );
+        assert!(
+            store.get(loser_b).unwrap().is_none() && store.get(loser_c).unwrap().is_none(),
+            "both losers must actually be gone"
+        );
+    }
+
+    // ── Adversarial (round-5 re-verification): an ordinary note that is a
+    // member of *no* duplicate group at all (not a survivor, not a loser of
+    // any group) whose `superseded_by` points at a loser belonging to some
+    // *other* group being collapsed in this same run. `rewrite_cross_references`'s
+    // "every non-survivor row" framing must genuinely include this row: its
+    // id is absent from `note_group_of` entirely (unlike a fellow loser's,
+    // which *is* present), so the `same_group` check must not accidentally
+    // treat "absent from the map" as "same group" (e.g. via a mismatched
+    // default or an `unwrap_or` that coerces both sides to a shared
+    // sentinel). Three unrelated duplicate groups are present simultaneously
+    // so there's a real chance for the ordinary note's id or the target's id
+    // to collide with map bookkeeping if the None-handling were wrong. ─────
+    #[test]
+    fn ordinary_note_outside_every_group_pointing_at_a_loser_is_rewritten_and_counted() {
+        let store = open_store();
+        // Three unrelated duplicate groups, present purely as bookkeeping
+        // noise / potential id-collision surface for note_group_of.
+        let _survivor_a = store
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let _loser_a = store
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 110)
+            .unwrap();
+        let survivor_b = store
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 120)
+            .unwrap();
+        let loser_b = store
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 130)
+            .unwrap();
+        let _survivor_c = store
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 140)
+            .unwrap();
+        let _loser_c = store
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 150)
+            .unwrap();
+        // An ordinary, wholly unique note: not a member of any group above.
+        let ordinary = store
+            .add_note("note", "ordinary unique note", "body", &[], &[], None, None)
+            .unwrap();
+        store.set_superseded_by(ordinary, loser_b).unwrap();
+
+        let summary = store.dedupe_entity_ids(false).unwrap();
+        assert_eq!(summary.rows_collapsed, 3, "one loser in each of 3 groups");
+        assert_eq!(
+            summary.supersede_edges_repointed, 1,
+            "the ordinary note's edge into group B's loser must count as a \
+             genuine (non-same-group) repoint"
+        );
+        let note = store.get(ordinary).unwrap().unwrap();
+        assert_eq!(
+            note.superseded_by,
+            Some(survivor_b),
+            "BUG CHECK: an ordinary note with no group membership at all must \
+             still be rewritten by rewrite_cross_references; note_group_of.get \
+             returning None for this row must not be mistaken for group \
+             membership"
+        );
+    }
+
+    // ── Adversarial (round-5 re-verification): three duplicate groups whose
+    // survivors form a reference CYCLE through each other's losers (A -> B's
+    // loser, B -> C's loser, C -> A's loser). `loser_to_survivor` is computed
+    // once, structurally, before any group is processed, so no group's
+    // resolution can depend on another group having been processed first —
+    // this test constructs the identical relational shape under two
+    // different physical `created_at` orderings (which changes
+    // `duplicate_groups`' internal vector order, since that order follows
+    // each group's earliest-member `created_at`) and confirms the resulting
+    // graph is the same in both cases, proving the whole-run map's
+    // construction is genuinely order-independent rather than accidentally
+    // relying on processing group A before B before C. ──────────────────────
+    #[test]
+    fn three_group_reference_cycle_resolves_identically_under_two_processing_orders() {
+        // Variant 1: groups created in A, B, C order (duplicate_groups will
+        // be ordered A, B, C, since that's each group's earliest-created_at
+        // order too).
+        let store1 = open_store();
+        let survivor_a1 = store1
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_a1 = store1
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 110)
+            .unwrap();
+        let survivor_b1 = store1
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_b1 = store1
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 210)
+            .unwrap();
+        let survivor_c1 = store1
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        let loser_c1 = store1
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 310)
+            .unwrap();
+        store1.set_superseded_by(survivor_a1, loser_b1).unwrap();
+        store1.set_superseded_by(survivor_b1, loser_c1).unwrap();
+        store1.set_superseded_by(survivor_c1, loser_a1).unwrap();
+
+        let summary1 = store1.dedupe_entity_ids(false).unwrap();
+
+        // Variant 2: same relational shape (A -> B's loser -> C's loser ->
+        // A's loser), but groups are created in C, A, B physical order, so
+        // `duplicate_groups`' earliest-created_at-derived vector order is
+        // C, A, B instead of A, B, C.
+        let store2 = open_store();
+        let survivor_c2 = store2
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_c2 = store2
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 110)
+            .unwrap();
+        let survivor_a2 = store2
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_a2 = store2
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 210)
+            .unwrap();
+        let survivor_b2 = store2
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        let loser_b2 = store2
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 310)
+            .unwrap();
+        store2.set_superseded_by(survivor_a2, loser_b2).unwrap();
+        store2.set_superseded_by(survivor_b2, loser_c2).unwrap();
+        store2.set_superseded_by(survivor_c2, loser_a2).unwrap();
+
+        let summary2 = store2.dedupe_entity_ids(false).unwrap();
+
+        assert_eq!(
+            summary1.rows_collapsed, summary2.rows_collapsed,
+            "same relational shape must collapse the same number of rows \
+             regardless of which group's earliest member happens to sort \
+             first"
+        );
+        assert_eq!(summary1.rows_collapsed, 3);
+
+        // Same relational outcome under both physical orderings: each
+        // survivor ends up pointing at the *next* group's survivor around
+        // the cycle, in both variants.
+        let a1 = store1.get(survivor_a1).unwrap().unwrap();
+        let b1 = store1.get(survivor_b1).unwrap().unwrap();
+        let c1 = store1.get(survivor_c1).unwrap().unwrap();
+        assert_eq!(a1.superseded_by, Some(survivor_b1));
+        assert_eq!(b1.superseded_by, Some(survivor_c1));
+        assert_eq!(c1.superseded_by, Some(survivor_a1));
+
+        let a2 = store2.get(survivor_a2).unwrap().unwrap();
+        let b2 = store2.get(survivor_b2).unwrap().unwrap();
+        let c2 = store2.get(survivor_c2).unwrap().unwrap();
+        assert_eq!(
+            a2.superseded_by,
+            Some(survivor_b2),
+            "identical relational outcome under the C, A, B physical/vector order"
+        );
+        assert_eq!(b2.superseded_by, Some(survivor_c2));
+        assert_eq!(c2.superseded_by, Some(survivor_a2));
+    }
+
+    // ── Adversarial (round-5 re-verification): hand-derive every summary
+    // count for a constructed multi-group scenario and assert the reported
+    // numbers match the hand count exactly, not just "no crash" / "no error".
+    // Scenario, worked by hand before running:
+    //   - group A: survivor_a, loser_a1, loser_a2. loser_a1 points at loser_a2
+    //     (a same-group loser->loser reference: inert clean-up, must be
+    //     cleared but NOT counted in supersede_edges_repointed). survivor_a's
+    //     own field points at loser_c1 (a DIFFERENT group's loser): resolves
+    //     to survivor_c, not a self-edge-drop (target != survivor_a), and not
+    //     counted in supersede_edges_repointed either (that counter only
+    //     covers rewrite_cross_references's *non-survivor* rows, per the
+    //     module's own doc — the survivor's own adoption is deliberately a
+    //     separate mechanism from the "elsewhere in the table" rewrite).
+    //   - group B: survivor_b, loser_b1. Nothing points at anything.
+    //   - group C: survivor_c, loser_c1. Nothing points at anything.
+    //   - ordinary (no group at all): points at loser_b1 -> resolves to
+    //     survivor_b, IS counted (genuinely external, non-same-group).
+    // Hand count: total_notes = 8, duplicate_groups = 3, rows_collapsed =
+    // 2 (group A) + 1 (group B) + 1 (group C) = 4, tags_merged = 0,
+    // linked_files_merged = 0, supersede_edges_repointed = 1 (only
+    // `ordinary`'s edge; loser_a1's same-group edge to loser_a2 is excluded),
+    // supersede_self_edges_dropped = 0 (survivor_a's own field resolves to a
+    // genuine external target, survivor_c, not to itself). ─────────────────
+    #[test]
+    fn hand_derived_summary_counts_match_multi_group_scenario_exactly() {
+        let store = open_store();
+        let survivor_a = store
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
+            .unwrap();
+        let loser_a1 = store
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 110)
+            .unwrap();
+        let loser_a2 = store
+            .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 120)
+            .unwrap();
+        let survivor_b = store
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 200)
+            .unwrap();
+        let loser_b1 = store
+            .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 210)
+            .unwrap();
+        let survivor_c = store
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 300)
+            .unwrap();
+        let loser_c1 = store
+            .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 310)
+            .unwrap();
+        let ordinary = store
+            .add_note("note", "ordinary unique note", "body", &[], &[], None, None)
+            .unwrap();
+
+        store.set_superseded_by(loser_a1, loser_a2).unwrap();
+        store.set_superseded_by(survivor_a, loser_c1).unwrap();
+        store.set_superseded_by(ordinary, loser_b1).unwrap();
+
+        let summary = store.dedupe_entity_ids(false).unwrap();
+
+        assert_eq!(summary.total_notes, 8);
+        assert_eq!(summary.duplicate_groups, 3);
+        assert_eq!(summary.rows_collapsed, 4, "hand count: 2 + 1 + 1");
+        assert_eq!(summary.tags_merged, 0);
+        assert_eq!(summary.linked_files_merged, 0);
+        assert_eq!(
+            summary.supersede_edges_repointed, 1,
+            "hand count: only `ordinary`'s edge; loser_a1's same-group edge \
+             to loser_a2 must not be counted"
+        );
+        assert_eq!(
+            summary.supersede_self_edges_dropped, 0,
+            "hand count: survivor_a's own field resolves to a genuine \
+             cross-group external target (survivor_c), not a self-edge"
+        );
+
+        // Cross-check the actual field values agree with the hand-derived
+        // counts, not just the counts in isolation.
+        let a = store.get(survivor_a).unwrap().unwrap();
+        assert_eq!(a.superseded_by, Some(survivor_c));
+        let b = store.get(survivor_b).unwrap().unwrap();
+        assert_eq!(b.superseded_by, None);
+        let c = store.get(survivor_c).unwrap().unwrap();
+        assert_eq!(c.superseded_by, None);
+        let o = store.get(ordinary).unwrap().unwrap();
+        assert_eq!(o.superseded_by, Some(survivor_b));
+        assert_eq!(note_count(&store), 4, "8 - 4 collapsed = 4 remaining rows");
+    }
 }
