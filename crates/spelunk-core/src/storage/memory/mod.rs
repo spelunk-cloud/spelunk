@@ -3,11 +3,14 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::Path;
 
+mod dedupe;
 mod edges;
+mod entity_id_migration;
 mod notes;
 mod search;
 mod sync;
 
+pub use dedupe::DedupeSummary;
 pub use sync::SyncRow;
 
 #[cfg(test)]
@@ -84,6 +87,11 @@ impl MemoryStore {
             .with_context(|| format!("opening memory DB at {}", path.display()))?;
         let store = Self { conn };
         store.migrate()?;
+        // ADR-068 third amendment: Step A (unconditional backfill) then Step B
+        // (conditional UNIQUE-index promotion). Neither ever hard-aborts open;
+        // see `entity_id_migration.rs`.
+        store.backfill_entity_ids()?;
+        store.promote_entity_id_unique_index()?;
         Ok(store)
     }
 

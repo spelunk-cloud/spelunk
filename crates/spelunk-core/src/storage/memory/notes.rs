@@ -212,6 +212,53 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Clear an existing note's `superseded_by` link back to NULL. Used by
+    /// `memory dedupe`'s self-edge guard: a rewrite that would otherwise point
+    /// a row at itself drops the link instead.
+    pub fn clear_superseded_by(&self, note_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE notes SET superseded_by = NULL WHERE id = ?1",
+            rusqlite::params![note_id],
+        )?;
+        Ok(())
+    }
+
+    /// Ids of every row whose `superseded_by` points at `target_id`. Used by
+    /// `memory dedupe` to find edges elsewhere in the table that must be
+    /// rewritten before a duplicate loser row is deleted.
+    pub fn notes_pointing_at(&self, target_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM notes WHERE superseded_by = ?1")?;
+        let ids = stmt
+            .query_map(rusqlite::params![target_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
+    /// Delete a note row outright. Used only by `memory dedupe` to remove a
+    /// duplicate-group loser after its tags/linked_files/superseded_by have
+    /// been folded into the survivor and any edges pointing at it rewritten.
+    pub fn delete_note(&self, note_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM notes WHERE id = ?1",
+            rusqlite::params![note_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a note's embedding row, if present. A no-op when absent. Used by
+    /// `memory dedupe` when deleting a duplicate-group loser: two vectors have
+    /// no meaningful union, so the loser's embedding is dropped rather than
+    /// merged (the survivor's own embedding, if any, is untouched).
+    pub fn delete_note_embedding(&self, note_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM note_embeddings WHERE note_id = ?1",
+            rusqlite::params![note_id],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_embedding(&self, note_id: i64, blob: &[u8]) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO note_embeddings (note_id, embedding) VALUES (?1, ?2)",

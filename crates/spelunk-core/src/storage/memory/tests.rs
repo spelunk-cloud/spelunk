@@ -391,17 +391,26 @@ fn union_tags_keeps_fts_in_sync() {
 
 /// The entity_id migration runs against a store that predates the column and
 /// already holds rows that collide under the new key. It must add the column
-/// without aborting, and without deleting or merging any existing row — those
-/// duplicates are legitimate (the previous key folded in `created_at`).
+/// without aborting, and, per ADR-068's third amendment, backfill every
+/// legacy row's `entity_id` (Step A) while leaving the *rows themselves*
+/// alone: collapsing duplicates is `spelunk memory dedupe`'s job, not an
+/// automatic side effect of opening the store, so Step B must also leave the
+/// index non-unique while a duplicate group remains.
 #[test]
-fn entity_id_migration_is_additive_on_a_store_with_duplicates() {
+fn entity_id_migration_backfills_but_does_not_collapse_duplicates() {
     register_sqlite_vec();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("memory.db");
 
-    // Build a store, then take the column away to model a pre-migration DB.
+    // Build a store via the schema-only path (skips the Step A/B pipeline a
+    // real `open()` runs), so seeding two duplicate-content rows below isn't
+    // rejected by an index a fresh, zero-duplicate store would otherwise have
+    // already promoted to UNIQUE. Then take the column away entirely to model
+    // a genuinely pre-023 DB.
     {
-        let store = MemoryStore::open(&path).expect("open");
+        let conn = rusqlite::Connection::open(&path).expect("open raw");
+        let store = MemoryStore { conn };
+        store.migrate().expect("schema migration only");
         for created_at in [1_700_000_001_i64, 1_700_000_002] {
             store
                 .add_note_with_created_at(
@@ -433,14 +442,15 @@ fn entity_id_migration_is_additive_on_a_store_with_duplicates() {
         assert_eq!(has_col, 0, "precondition: the column is gone");
     }
 
-    // Re-opening runs the migration over that data.
+    // Re-opening (the real `MemoryStore::open`) re-adds the column (migration
+    // 023), then runs Step A (backfill) and Step B (duplicate scan).
     let store = MemoryStore::open(&path).expect("migration must not abort on existing data");
 
     let rows: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(rows, 2, "no existing row may be deleted or merged");
+    assert_eq!(rows, 2, "opening alone must not delete or merge any row");
 
     let has_col: i64 = store
         .conn
@@ -452,7 +462,7 @@ fn entity_id_migration_is_additive_on_a_store_with_duplicates() {
         .unwrap();
     assert_eq!(has_col, 1, "the column is added");
 
-    // Not backfilled: identity for these legacy rows is recomputed on read.
+    // Step A backfills: no legacy row is left NULL.
     let nulls: i64 = store
         .conn
         .query_row(
@@ -461,11 +471,30 @@ fn entity_id_migration_is_additive_on_a_store_with_duplicates() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(nulls, 2, "backfill is a separate decision; rows stay NULL");
+    assert_eq!(
+        nulls, 0,
+        "Step A must backfill entity_id for every legacy row"
+    );
     assert_eq!(
         super::super::entity_id::note_entity_id(&store.list(None, 10, true).unwrap()[0]),
         super::super::entity_id::note_entity_id(&store.list(None, 10, true).unwrap()[1]),
-        "the two legacy rows do collide under the new key — a UNIQUE index would have aborted"
+        "the two legacy rows do collide under the new key"
+    );
+
+    // Step B must not have promoted the index: the two rows above are a
+    // duplicate group, so the store stays on the non-unique index until an
+    // explicit `spelunk memory dedupe` collapses it.
+    let idx_sql: String = store
+        .conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_notes_entity_id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !idx_sql.to_uppercase().contains("UNIQUE"),
+        "a duplicate group must keep the index non-unique: {idx_sql}"
     );
 
     // Idempotent: opening again is a no-op, not a duplicate-column error.

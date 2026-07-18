@@ -27,7 +27,7 @@ pub use git_notes::{
     ensure_notes_rewrite_ref, lock_notes, merge_tracking_notes, publish_notes,
 };
 pub use graph::GraphEdge;
-pub use memory::{MemoryEdge, MemoryStore, SyncRow};
+pub use memory::{DedupeSummary, MemoryEdge, MemoryStore, SyncRow};
 pub use note_record::{NoteRecord, now_millis, now_secs};
 pub use remote::{
     BatchItemResult, BatchPushItem, BatchPushResult, CloudSyncClient, RemoteEntry,
