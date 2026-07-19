@@ -39,10 +39,10 @@ fn count_edges(store: &MemoryStore, from_id: i64, to_id: i64, kind: &str) -> i64
 fn supersede_happy_path() {
     let store = open_store();
 
-    let old_id = store
+    let (old_id, _) = store
         .add_note("decision", "Old decision", "old body", &[], &[], None, None)
         .unwrap();
-    let new_id = store
+    let (new_id, _) = store
         .add_note("decision", "New decision", "new body", &[], &[], None, None)
         .unwrap();
 
@@ -66,10 +66,10 @@ fn supersede_happy_path() {
 fn supersede_idempotent() {
     let store = open_store();
 
-    let old_id = store
+    let (old_id, _) = store
         .add_note("note", "Alpha", "body", &[], &[], None, None)
         .unwrap();
-    let new_id = store
+    let (new_id, _) = store
         .add_note("note", "Beta", "body", &[], &[], None, None)
         .unwrap();
 
@@ -96,10 +96,10 @@ fn supersede_idempotent() {
 #[test]
 fn add_edge_valid_kinds_accepted() {
     let store = open_store();
-    let a = store
+    let (a, _) = store
         .add_note("note", "A", "", &[], &[], None, None)
         .unwrap();
-    let b = store
+    let (b, _) = store
         .add_note("note", "B", "", &[], &[], None, None)
         .unwrap();
 
@@ -113,10 +113,10 @@ fn add_edge_valid_kinds_accepted() {
 #[test]
 fn add_edge_invalid_kind_returns_err() {
     let store = open_store();
-    let a = store
+    let (a, _) = store
         .add_note("note", "A", "", &[], &[], None, None)
         .unwrap();
-    let b = store
+    let (b, _) = store
         .add_note("note", "B", "", &[], &[], None, None)
         .unwrap();
 
@@ -132,10 +132,10 @@ fn add_edge_invalid_kind_returns_err() {
 #[test]
 fn add_edge_duplicate_silently_ignored() {
     let store = open_store();
-    let a = store
+    let (a, _) = store
         .add_note("note", "A", "", &[], &[], None, None)
         .unwrap();
-    let b = store
+    let (b, _) = store
         .add_note("note", "B", "", &[], &[], None, None)
         .unwrap();
 
@@ -154,7 +154,7 @@ fn add_edge_duplicate_silently_ignored() {
 #[test]
 fn ensure_uuid_backfills_and_is_idempotent() {
     let store = open_store();
-    let id = store
+    let (id, _) = store
         .add_note("decision", "D", "body", &[], &[], None, None)
         .unwrap();
 
@@ -266,13 +266,13 @@ fn max_remote_id_is_the_pull_cursor() {
 
     // Record a few cloud ids. UUIDv7 strings sort lexically == time order, so
     // MAX() returns the newest one regardless of insertion order.
-    let a = store
+    let (a, _) = store
         .add_note("note", "A", "b", &[], &[], None, None)
         .unwrap();
-    let b = store
+    let (b, _) = store
         .add_note("note", "B", "b", &[], &[], None, None)
         .unwrap();
-    let c = store
+    let (c, _) = store
         .add_note("note", "C", "b", &[], &[], None, None)
         .unwrap();
     store
@@ -295,7 +295,7 @@ fn max_remote_id_is_the_pull_cursor() {
 #[test]
 fn set_remote_id_records_and_dedupes() {
     let store = open_store();
-    let id = store
+    let (id, _) = store
         .add_note("note", "N", "b", &[], &[], None, None)
         .unwrap();
     store.ensure_uuid(id).unwrap();
@@ -310,7 +310,7 @@ fn set_remote_id_records_and_dedupes() {
 #[test]
 fn add_note_persists_entity_id() {
     let store = open_store();
-    let id = store
+    let (id, _) = store
         .add_note("decision", "HTTP layer", "use axum", &[], &[], None, None)
         .unwrap();
 
@@ -332,7 +332,7 @@ fn add_note_persists_entity_id() {
 #[test]
 fn union_tags_and_files_is_add_wins() {
     let store = open_store();
-    let id = store
+    let (id, _) = store
         .add_note("note", "N", "b", &["alpha"], &["a.rs"], None, None)
         .unwrap();
 
@@ -371,7 +371,7 @@ fn union_tags_and_files_is_add_wins() {
 #[test]
 fn union_tags_keeps_fts_in_sync() {
     let store = open_store();
-    let id = store
+    let (id, _) = store
         .add_note("note", "Findable", "body", &["alpha"], &[], None, None)
         .unwrap();
     store

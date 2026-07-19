@@ -543,7 +543,7 @@ fn import_batch(
                 "active"
             };
 
-            let id = store.add_note_with_created_at(
+            let (id, _created) = store.add_note_with_created_at(
                 &note.kind,
                 &note.title,
                 &note.body,
@@ -1014,7 +1014,7 @@ mod init_import_tests {
         let git_root = repo.path();
 
         let backend = GitNotesBackend::with_root(git_root.to_path_buf());
-        let id = backend
+        let (id, _created) = backend
             .add(NoteInput {
                 kind: "note".to_string(),
                 title: "retired decision".to_string(),

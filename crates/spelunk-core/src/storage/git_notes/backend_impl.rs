@@ -9,7 +9,7 @@ use super::GitNotesBackend;
 
 #[async_trait]
 impl MemoryBackend for GitNotesBackend {
-    async fn add(&self, input: NoteInput) -> Result<i64> {
+    async fn add(&self, input: NoteInput) -> Result<(i64, bool)> {
         let id = now_millis();
         let entity_id =
             crate::storage::entity_id::entity_id(&input.kind, &input.title, &input.body);
@@ -35,7 +35,9 @@ impl MemoryBackend for GitNotesBackend {
         let head = self.head_sha().await?;
         self.append_record(&head, &record).await?;
 
-        Ok(id)
+        // Git notes are append-only: this backend never detects or collapses
+        // a collision, so every add is reported as a fresh insert.
+        Ok((id, true))
     }
 
     async fn list(

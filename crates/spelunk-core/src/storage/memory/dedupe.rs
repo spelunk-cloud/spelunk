@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn dry_run_reports_counts_and_writes_nothing() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at(
                 "decision",
                 "dup",
@@ -588,7 +588,7 @@ mod tests {
                 100,
             )
             .unwrap();
-        let _loser = store
+        let (_loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &["b"], &[], None, "active", 200)
             .unwrap();
 
@@ -624,10 +624,10 @@ mod tests {
     #[test]
     fn real_run_collapses_group_survivor_is_earliest_created() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
 
@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn tags_and_linked_files_union_add_wins() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at(
                 "decision",
                 "dup",
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn any_archived_row_makes_survivor_archived() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
         store
@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn no_archived_row_leaves_survivor_status_unchanged() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
         store
@@ -718,13 +718,13 @@ mod tests {
     #[test]
     fn survivor_adopts_lone_superseded_by_from_group() {
         let store = open_store();
-        let elsewhere = store
+        let (elsewhere, _) = store
             .add_note("note", "elsewhere target", "b", &[], &[], None, None)
             .unwrap();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
         store.set_superseded_by(loser, elsewhere).unwrap();
@@ -738,17 +738,17 @@ mod tests {
     #[test]
     fn conflicting_superseded_by_earliest_wins_no_error() {
         let store = open_store();
-        let target_a = store
+        let (target_a, _) = store
             .add_note("note", "a", "b", &[], &[], None, None)
             .unwrap();
-        let target_b = store
+        let (target_b, _) = store
             .add_note("note", "b", "b", &[], &[], None, None)
             .unwrap();
 
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
         store.set_superseded_by(survivor, target_a).unwrap();
@@ -768,13 +768,13 @@ mod tests {
     #[test]
     fn edge_elsewhere_pointing_at_loser_is_repointed_to_survivor() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let dependent = store
+        let (dependent, _) = store
             .add_note("note", "points at loser", "b", &[], &[], None, None)
             .unwrap();
         store.set_superseded_by(dependent, loser).unwrap();
@@ -789,10 +789,10 @@ mod tests {
     #[test]
     fn rewrite_that_would_self_point_is_dropped_to_null() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
         // The survivor itself already points at its own duplicate-group loser.
@@ -811,10 +811,10 @@ mod tests {
     #[test]
     fn loser_embedding_deleted_survivor_embedding_untouched() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
         // note_embeddings is FLOAT[896]: 896 * 4-byte floats per row.
@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn injected_fault_mid_group_after_partial_loser_deletion_rolls_back_byte_for_byte() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at(
                 "decision",
                 "dup",
@@ -896,7 +896,7 @@ mod tests {
                 100,
             )
             .unwrap();
-        let loser_a = store
+        let (loser_a, _) = store
             .add_note_with_created_at(
                 "decision",
                 "dup",
@@ -908,7 +908,7 @@ mod tests {
                 200,
             )
             .unwrap();
-        let loser_b = store
+        let (loser_b, _) = store
             .add_note_with_created_at(
                 "decision",
                 "dup",
@@ -920,7 +920,7 @@ mod tests {
                 300,
             )
             .unwrap();
-        let external = store
+        let (external, _) = store
             .add_note("note", "external dependent", "b", &[], &[], None, None)
             .unwrap();
         // external's supersede edge points at loser_a; a fully-correct
@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn dry_run_leaves_full_db_state_byte_for_byte_unchanged() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at(
                 "decision",
                 "dup",
@@ -983,7 +983,7 @@ mod tests {
                 100,
             )
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at(
                 "decision",
                 "dup",
@@ -995,7 +995,7 @@ mod tests {
                 200,
             )
             .unwrap();
-        let external = store
+        let (external, _) = store
             .add_note("note", "external", "b", &[], &[], None, None)
             .unwrap();
         store.supersede(external, loser).unwrap();
@@ -1023,19 +1023,19 @@ mod tests {
     #[test]
     fn multiple_external_rows_pointing_at_different_losers_all_repoint_to_survivor() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_a = store
+        let (loser_a, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_b = store
+        let (loser_b, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
             .unwrap();
-        let dep_a = store
+        let (dep_a, _) = store
             .add_note("note", "points at loser_a", "b", &[], &[], None, None)
             .unwrap();
-        let dep_b = store
+        let (dep_b, _) = store
             .add_note("note", "points at loser_b", "b", &[], &[], None, None)
             .unwrap();
         store.set_superseded_by(dep_a, loser_a).unwrap();
@@ -1061,16 +1061,16 @@ mod tests {
     #[test]
     fn loser_deletion_removes_memory_edges_in_both_directions_no_orphan() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let other_a = store
+        let (other_a, _) = store
             .add_note("note", "a", "b", &[], &[], None, None)
             .unwrap();
-        let other_b = store
+        let (other_b, _) = store
             .add_note("note", "b", "b", &[], &[], None, None)
             .unwrap();
         // loser -> other_a (loser is from_id) and other_b -> loser (loser is to_id).
@@ -1105,13 +1105,13 @@ mod tests {
     #[test]
     fn relates_to_edge_to_external_note_is_dropped_not_repointed_known_gap() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let external = store
+        let (external, _) = store
             .add_note("note", "external relation", "b", &[], &[], None, None)
             .unwrap();
         store.add_edge(loser, external, "relates_to").unwrap();
@@ -1139,10 +1139,10 @@ mod tests {
     #[test]
     fn adoption_must_not_selfloop_when_a_loser_points_at_the_survivor() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser = store
+        let (loser, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
         // loser was (per this row) "superseded by" the survivor itself.
@@ -1183,13 +1183,13 @@ mod tests {
     #[test]
     fn adoption_must_not_dangle_when_a_loser_points_at_a_fellow_loser() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_a = store
+        let (loser_a, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_b = store
+        let (loser_b, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
             .unwrap();
         // loser_a claims to be "superseded by" loser_b, a fellow member of
@@ -1239,16 +1239,16 @@ mod tests {
     #[test]
     fn adoption_survivor_own_in_group_pointer_does_not_clobber_fallthrough_adoption() {
         let store = open_store();
-        let external = store
+        let (external, _) = store
             .add_note("note", "external target", "b", &[], &[], None, None)
             .unwrap();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_x = store
+        let (loser_x, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_y = store
+        let (loser_y, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
             .unwrap();
         // Survivor's own pre-existing value points at a fellow duplicate
@@ -1283,19 +1283,19 @@ mod tests {
     #[test]
     fn fallthrough_adoption_skips_intragroup_dangling_candidate_and_adopts_later_external_one() {
         let store = open_store();
-        let external = store
+        let (external, _) = store
             .add_note("note", "external target", "b", &[], &[], None, None)
             .unwrap();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_a = store
+        let (loser_a, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_b = store
+        let (loser_b, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
             .unwrap();
-        let loser_c = store
+        let (loser_c, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 400)
             .unwrap();
         // loser_a (earliest loser, first candidate in iteration order) points
@@ -1323,13 +1323,13 @@ mod tests {
     #[test]
     fn adoption_resolves_to_none_when_every_candidate_is_intragroup() {
         let store = open_store();
-        let survivor = store
+        let (survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_a = store
+        let (loser_a, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_b = store
+        let (loser_b, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
             .unwrap();
         // loser_a -> loser_b and loser_b -> survivor: every candidate value
@@ -1369,13 +1369,13 @@ mod tests {
     #[test]
     fn later_loser_pointing_at_earlier_fellow_loser_must_not_break_deletion_order() {
         let store = open_store();
-        let _survivor = store
+        let (_survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_early = store
+        let (loser_early, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_late = store
+        let (loser_late, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
             .unwrap();
         // loser_late (deleted SECOND, per created_at ASC order) points at
@@ -1410,13 +1410,13 @@ mod tests {
     #[test]
     fn mutually_referencing_fellow_losers_must_not_break_deletion_order() {
         let store = open_store();
-        let _survivor = store
+        let (_survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_a = store
+        let (loser_a, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_b = store
+        let (loser_b, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
             .unwrap();
         store.set_superseded_by(loser_a, loser_b).unwrap();
@@ -1445,22 +1445,22 @@ mod tests {
     #[test]
     fn four_note_group_with_mixed_intragroup_and_external_pointers_resolves_deterministically() {
         let store = open_store();
-        let external_a = store
+        let (external_a, _) = store
             .add_note("note", "external a", "b", &[], &[], None, None)
             .unwrap();
-        let external_b = store
+        let (external_b, _) = store
             .add_note("note", "external b", "b", &[], &[], None, None)
             .unwrap();
-        let _survivor = store
+        let (_survivor, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser1 = store
+        let (loser1, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser2 = store
+        let (loser2, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
             .unwrap();
-        let loser3 = store
+        let (loser3, _) = store
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 400)
             .unwrap();
         // loser1 (earliest loser, first candidate in iteration order) chains
@@ -1490,22 +1490,22 @@ mod tests {
         // resolution and counts on a second, independent run (not just
         // repeatable within one process — a genuinely fresh grouping pass).
         let store2 = open_store();
-        let external_a2 = store2
+        let (external_a2, _) = store2
             .add_note("note", "external a", "b", &[], &[], None, None)
             .unwrap();
-        let external_b2 = store2
+        let (external_b2, _) = store2
             .add_note("note", "external b", "b", &[], &[], None, None)
             .unwrap();
-        let survivor2 = store2
+        let (survivor2, _) = store2
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser1b = store2
+        let (loser1b, _) = store2
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser2b = store2
+        let (loser2b, _) = store2
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 300)
             .unwrap();
-        let loser3b = store2
+        let (loser3b, _) = store2
             .add_note_with_created_at("decision", "dup", "body", &[], &[], None, "active", 400)
             .unwrap();
         store2.set_superseded_by(loser1b, loser2b).unwrap();
@@ -1562,16 +1562,16 @@ mod tests {
     fn external_row_that_is_itself_a_duplicate_in_a_different_group_is_resolved_correctly_across_groups()
      {
         let store = open_store();
-        let survivor_a = store
+        let (survivor_a, _) = store
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_a = store
+        let (loser_a, _) = store
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let survivor_b = store
+        let (survivor_b, _) = store
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 150)
             .unwrap();
-        let external_x = store
+        let (external_x, _) = store
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 250)
             .unwrap();
         // external_x is a loser in group B, but its own pre-existing
@@ -1626,19 +1626,19 @@ mod tests {
     #[test]
     fn chained_cross_group_reference_resolves_one_hop_not_to_intermediate_loser() {
         let store = open_store();
-        let survivor_a = store
+        let (survivor_a, _) = store
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let survivor_b = store
+        let (survivor_b, _) = store
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 150)
             .unwrap();
-        let loser_b = store
+        let (loser_b, _) = store
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 250)
             .unwrap();
-        let survivor_c = store
+        let (survivor_c, _) = store
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 175)
             .unwrap();
-        let loser_c = store
+        let (loser_c, _) = store
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 275)
             .unwrap();
         // A's survivor points at B's loser; B's survivor independently points
@@ -1689,26 +1689,26 @@ mod tests {
         let store = open_store();
         // Three unrelated duplicate groups, present purely as bookkeeping
         // noise / potential id-collision surface for note_group_of.
-        let _survivor_a = store
+        let (_survivor_a, _) = store
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let _loser_a = store
+        let (_loser_a, _) = store
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 110)
             .unwrap();
-        let survivor_b = store
+        let (survivor_b, _) = store
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 120)
             .unwrap();
-        let loser_b = store
+        let (loser_b, _) = store
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 130)
             .unwrap();
-        let _survivor_c = store
+        let (_survivor_c, _) = store
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 140)
             .unwrap();
-        let _loser_c = store
+        let (_loser_c, _) = store
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 150)
             .unwrap();
         // An ordinary, wholly unique note: not a member of any group above.
-        let ordinary = store
+        let (ordinary, _) = store
             .add_note("note", "ordinary unique note", "body", &[], &[], None, None)
             .unwrap();
         store.set_superseded_by(ordinary, loser_b).unwrap();
@@ -1749,22 +1749,22 @@ mod tests {
         // be ordered A, B, C, since that's each group's earliest-created_at
         // order too).
         let store1 = open_store();
-        let survivor_a1 = store1
+        let (survivor_a1, _) = store1
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_a1 = store1
+        let (loser_a1, _) = store1
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 110)
             .unwrap();
-        let survivor_b1 = store1
+        let (survivor_b1, _) = store1
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_b1 = store1
+        let (loser_b1, _) = store1
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 210)
             .unwrap();
-        let survivor_c1 = store1
+        let (survivor_c1, _) = store1
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 300)
             .unwrap();
-        let loser_c1 = store1
+        let (loser_c1, _) = store1
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 310)
             .unwrap();
         store1.set_superseded_by(survivor_a1, loser_b1).unwrap();
@@ -1778,22 +1778,22 @@ mod tests {
         // `duplicate_groups`' earliest-created_at-derived vector order is
         // C, A, B instead of A, B, C.
         let store2 = open_store();
-        let survivor_c2 = store2
+        let (survivor_c2, _) = store2
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_c2 = store2
+        let (loser_c2, _) = store2
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 110)
             .unwrap();
-        let survivor_a2 = store2
+        let (survivor_a2, _) = store2
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_a2 = store2
+        let (loser_a2, _) = store2
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 210)
             .unwrap();
-        let survivor_b2 = store2
+        let (survivor_b2, _) = store2
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 300)
             .unwrap();
-        let loser_b2 = store2
+        let (loser_b2, _) = store2
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 310)
             .unwrap();
         store2.set_superseded_by(survivor_a2, loser_b2).unwrap();
@@ -1858,28 +1858,28 @@ mod tests {
     #[test]
     fn hand_derived_summary_counts_match_multi_group_scenario_exactly() {
         let store = open_store();
-        let survivor_a = store
+        let (survivor_a, _) = store
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 100)
             .unwrap();
-        let loser_a1 = store
+        let (loser_a1, _) = store
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 110)
             .unwrap();
-        let loser_a2 = store
+        let (loser_a2, _) = store
             .add_note_with_created_at("decision", "dup-a", "body", &[], &[], None, "active", 120)
             .unwrap();
-        let survivor_b = store
+        let (survivor_b, _) = store
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 200)
             .unwrap();
-        let loser_b1 = store
+        let (loser_b1, _) = store
             .add_note_with_created_at("decision", "dup-b", "body", &[], &[], None, "active", 210)
             .unwrap();
-        let survivor_c = store
+        let (survivor_c, _) = store
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 300)
             .unwrap();
-        let loser_c1 = store
+        let (loser_c1, _) = store
             .add_note_with_created_at("decision", "dup-c", "body", &[], &[], None, "active", 310)
             .unwrap();
-        let ordinary = store
+        let (ordinary, _) = store
             .add_note("note", "ordinary unique note", "body", &[], &[], None, None)
             .unwrap();
 

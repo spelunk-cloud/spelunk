@@ -112,11 +112,11 @@ pub(super) async fn memory_add(
     // the OLD entry (now archived by the `add` call) and carry its supersede
     // edge to git notes too.
     let mut primary_backend: Option<Box<dyn MemoryBackend + Send>> = None;
-    let id = if pre_init_notes {
-        now_millis()
+    let (id, created) = if pre_init_notes {
+        (now_millis(), true)
     } else {
         let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
-        let id = backend
+        let (id, created) = backend
             .add(NoteInput {
                 kind: args.kind.clone(),
                 title: title.clone(),
@@ -130,7 +130,7 @@ pub(super) async fn memory_add(
             })
             .await?;
         primary_backend = Some(backend);
-        id
+        (id, created)
     };
 
     // ── Git-notes write-through carrier ──────────────────────────────────────
@@ -263,7 +263,14 @@ pub(super) async fn memory_add(
         }
     }
 
-    println!("Stored [{kind}] #{id}: {title}", kind = args.kind);
+    if created {
+        println!("Stored [{kind}] #{id}: {title}", kind = args.kind);
+    } else {
+        println!(
+            "Already recorded as [{kind}] #{id}: {title}",
+            kind = args.kind
+        );
+    }
     if let Some(line) = notes_rewrite_note {
         println!("{line}");
     }

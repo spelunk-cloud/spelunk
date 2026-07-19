@@ -744,6 +744,18 @@ all-zero counts and makes no writes, and the next `spelunk` run promotes
 `memory.db`'s `entity_id` index to enforce uniqueness going forward; after
 that, a duplicate group can no longer occur.
 
+Once that index is promoted, a plain `memory add` for byte-identical
+`kind`/`title`/`body` content no longer inserts a second row: it reuses the
+existing entry (merging the new call's `tags` and `linked_files` into it,
+add-wins) and reports it instead of erroring:
+
+```
+$ spelunk memory add --kind decision --title "dup entry" --body "same content"
+Stored [decision] #3: dup entry
+$ spelunk memory add --kind decision --title "dup entry" --body "same content"
+Already recorded as [decision] #3: dup entry
+```
+
 ### Security notes
 
 `dedupe` only reads and writes the project's own `memory.db`; it never

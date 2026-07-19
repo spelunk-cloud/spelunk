@@ -266,7 +266,7 @@ impl RemoteMemoryBackend {
 
 #[async_trait]
 impl MemoryBackend for RemoteMemoryBackend {
-    async fn add(&self, input: NoteInput) -> Result<i64> {
+    async fn add(&self, input: NoteInput) -> Result<(i64, bool)> {
         let embedding = input.embedding.as_deref().map(blob_to_vec);
         let body = AddNoteRequest {
             kind: input.kind,
@@ -302,7 +302,10 @@ impl MemoryBackend for RemoteMemoryBackend {
                     );
                 }
             }
-            return Ok(resp.id);
+            // `server.db` doesn't enforce this amendment's promoted index, so
+            // there is nothing for this backend to detect as a reuse — report
+            // the conflict-handling outcome as a fresh insert.
+            return Ok((resp.id, true));
         }
 
         let resp = http_resp
@@ -316,7 +319,7 @@ impl MemoryBackend for RemoteMemoryBackend {
         if let Some(remote_id) = &resp.remote_id {
             tracing::debug!(remote_id, "server assigned remote_id for new memory entry");
         }
-        Ok(resp.id)
+        Ok((resp.id, true))
     }
 
     /// Remote backend: timeline search falls back to regular semantic search.

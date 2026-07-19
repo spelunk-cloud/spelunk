@@ -13,7 +13,15 @@ pub(super) fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEdg
 
 impl MemoryStore {
     /// Insert a note in a transaction that also sets `invalid_at` on the superseded entry.
-    /// Returns the new note's id.
+    ///
+    /// Returns `(id, created)` — see `MemoryStore::add_note` for what `created`
+    /// means. ADR-068's fifth amendment (E1): this INSERT populates
+    /// `entity_id` exactly like `add_note`/`add_note_with_created_at`, so it
+    /// is subject to the same UNIQUE constraint once `idx_notes_entity_id` is
+    /// promoted, and gets the same insert-then-recover handling (reusing
+    /// `recover_from_entity_id_collision` from `notes.rs` — not
+    /// reimplemented). On a collision, the *existing* row's id is what the
+    /// archive-`OLD` step below targets, not a fresh one.
     #[allow(clippy::too_many_arguments)]
     pub fn add_note_superseding(
         &self,
@@ -24,12 +32,13 @@ impl MemoryStore {
         linked_files: &[&str],
         valid_at: Option<i64>,
         supersedes_id: i64,
-    ) -> Result<i64> {
+    ) -> Result<(i64, bool)> {
         self.conn.execute_batch("BEGIN")?;
-        let result = (|| -> Result<i64> {
-            self.conn.execute(
-                "INSERT INTO notes (kind, title, body, tags, linked_files, valid_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        let result = (|| -> Result<(i64, bool)> {
+            let entity_id = crate::storage::entity_id::entity_id(kind, title, body);
+            let insert_result = self.conn.execute(
+                "INSERT INTO notes (kind, title, body, tags, linked_files, valid_at, entity_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     kind,
                     title,
@@ -37,27 +46,33 @@ impl MemoryStore {
                     tags.join(","),
                     linked_files.join(","),
                     valid_at,
+                    entity_id,
                 ],
+            );
+            let (id, created) = self.recover_from_entity_id_collision(
+                insert_result,
+                &entity_id,
+                tags,
+                linked_files,
             )?;
-            let new_id = self.conn.last_insert_rowid();
             self.conn.execute(
                 "UPDATE notes
                  SET    status = 'archived',
                         superseded_by = ?2,
                         invalid_at = CASE WHEN invalid_at IS NULL THEN unixepoch() ELSE invalid_at END
                  WHERE  id = ?1 AND status = 'active'",
-                rusqlite::params![supersedes_id, new_id],
+                rusqlite::params![supersedes_id, id],
             )?;
             self.conn.execute(
                 "INSERT OR IGNORE INTO memory_edges (from_id, to_id, kind) VALUES (?1, ?2, 'supersedes')",
-                rusqlite::params![new_id, supersedes_id],
+                rusqlite::params![id, supersedes_id],
             )?;
-            Ok(new_id)
+            Ok((id, created))
         })();
         match result {
-            Ok(id) => {
+            Ok(v) => {
                 self.conn.execute_batch("COMMIT")?;
-                Ok(id)
+                Ok(v)
             }
             Err(e) => {
                 self.conn.execute_batch("ROLLBACK").ok();

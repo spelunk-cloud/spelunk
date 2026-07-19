@@ -398,7 +398,7 @@ async fn memory_harvest_git(
                 })
                 .await
             {
-                Ok(id) => id,
+                Ok((id, _created)) => id,
                 Err(e) => {
                     eprintln!(
                         "  warning: failed to store entry '{title}' ({full_sha}), skipping: {e:#}"
@@ -761,7 +761,7 @@ async fn memory_harvest_failures(
                 })
                 .await
             {
-                Ok(id) => id,
+                Ok((id, _created)) => id,
                 Err(e) => {
                     eprintln!(
                         "  warning: failed to store entry '{title}' ({full_sha}), skipping: {e:#}"
