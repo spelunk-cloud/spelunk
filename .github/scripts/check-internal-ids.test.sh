@@ -313,6 +313,89 @@ assert_status "a range touching only the guard's own excluded paths passes --ran
 rm -rf "$repo"
 
 # =============================================================================
+# case sensitivity — adversarial hardening (test-engineer pass)
+#
+# A differently-cased ref isn't an adversarial trick, it's ordinary writing
+# variance (a PR title auto-titlecased, someone typing in caps) — it must be
+# caught exactly like the lowercase form.
+# =============================================================================
+
+result="$(run_message_case "fix: SPELUNK-OSS^999999 needs follow-up")"
+status="${result%%$'\x1f'*}"; output="${result#*$'\x1f'}"
+assert_status "uppercase project-slug ref fails --message" 1 "$status" "$output"
+
+result="$(run_message_case "fix: closes task_AABBCCDDEEFF00112233")"
+status="${result%%$'\x1f'*}"
+assert_status "uppercase-hex task id fails --message" 1 "$status" "${result#*$'\x1f'}"
+
+result="$(run_message_case "chore: picked up in task/Engineer-Faketest-99990101-0000")"
+status="${result%%$'\x1f'*}"
+assert_status "title-cased task/ branch ref fails --message" 1 "$status" "${result#*$'\x1f'}"
+
+# =============================================================================
+# regression: verified-safe edge cases the range guard must keep passing
+# =============================================================================
+
+repo="$(new_repo)"
+(
+  cd "$repo"
+  # A file containing an already-accepted leak is renamed with no content
+  # change. `git diff` detects this as a 100%-similarity rename (no + lines
+  # at all), so the pre-existing line is correctly never treated as "added".
+  # This locks in real (non-obvious) behavior verified by hand — a rename
+  # with a lower content-similarity would NOT get this protection (git
+  # falls back to representing it as a full delete+add), which is a known,
+  # accepted structural limitation of line-based diffing — see
+  # docs/security/internal-id-guard.md.
+  printf 'legacy note: see spelunk-oss^999998 (fake, pre-existing "history")\n' >legacy.txt
+  git add legacy.txt
+  git commit -q -m "seed: pre-existing accepted history"
+  base="$(git rev-parse HEAD)"
+
+  git mv legacy.txt renamed.txt
+  git commit -q -m "chore: pure rename, no content change"
+  head="$(git rev-parse HEAD)"
+
+  set +e
+  output="$("$SCRIPT" --range "$base..$head" 2>&1)"
+  status=$?
+  set -e
+  printf '%s\x1f%s' "$status" "$output"
+) >/tmp/case_out.$$
+result="$(cat /tmp/case_out.$$)"; rm -f /tmp/case_out.$$
+status="${result%%$'\x1f'*}"
+assert_status "pure rename of a file with a pre-existing leak passes --range" 0 "$status" "${result#*$'\x1f'}"
+rm -rf "$repo"
+
+repo="$(new_repo)"
+(
+  cd "$repo"
+  # A multi-paragraph commit message (subject + blank line + body) still
+  # gets fully scanned: `git log --format=%B` returns the whole message and
+  # check_text scans it line-by-line, so a leak in the body (not just the
+  # subject) is caught.
+  printf 'baseline\n' >f.txt
+  git add f.txt
+  git commit -q -m "chore: baseline"
+  base="$(git rev-parse HEAD)"
+
+  printf 'baseline\nmore\n' >f.txt
+  git add f.txt
+  git commit -q -m "fix: address review feedback" -m "Follow-up on spelunk-oss^999999 per discussion."
+  head="$(git rev-parse HEAD)"
+
+  set +e
+  output="$("$SCRIPT" --range "$base..$head" 2>&1)"
+  status=$?
+  set -e
+  printf '%s\x1f%s' "$status" "$output"
+) >/tmp/case_out.$$
+result="$(cat /tmp/case_out.$$)"; rm -f /tmp/case_out.$$
+status="${result%%$'\x1f'*}"
+assert_status "leak in a commit message body (not subject) fails --range" 1 "$status" "${result#*$'\x1f'}"
+rm -rf "$repo"
+
+# =============================================================================
 # misuse
 # =============================================================================
 

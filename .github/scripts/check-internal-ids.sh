@@ -56,7 +56,10 @@ check_text() {
   local label="$1" text="$2"
   local pattern matches line
   for pattern in "${PATTERNS[@]}"; do
-    matches="$(printf '%s\n' "$text" | grep -E "$pattern" || true)"
+    # -i: a differently-cased ref (e.g. "SPELUNK-OSS^250", a PR title with
+    # title-casing, "Task_<HEX>") is still the same leak — nothing about the
+    # patterns below relies on case to disambiguate from legitimate content.
+    matches="$(printf '%s\n' "$text" | grep -Ei "$pattern" || true)"
     if [ -n "$matches" ]; then
       while IFS= read -r line; do
         if [ -n "$line" ]; then

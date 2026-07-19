@@ -82,6 +82,28 @@ prior instances), not by extending this guard's scope backwards.
   CI is the enforced gate either way; the local hooks just give faster
   feedback before a push.
 
+## Known limitations (accepted)
+
+This is a hygiene guard, not a security boundary — it isn't hardened against
+someone deliberately evading it:
+
+- **Split across lines.** `grep` matches per line; a ref broken across two
+  lines (or two commits) is invisible to it.
+- **Unicode lookalikes / zero-width characters.** A zero-width space inside
+  the ref, or a Unicode caret lookalike instead of ASCII `^`, doesn't match.
+- **A rewrite with low content-similarity that drags forward an
+  already-accepted leak untouched.** `git diff` represents a rename/rewrite
+  below its similarity threshold as a full delete+add, so an untouched
+  historical line inside it reads as newly "added" — a false positive in the
+  rare case this happens, not a missed leak.
+- **A version-style ref glued to a project slug** — a caret-range dependency
+  pin (no separator between the slug and the caret) reads as the project-slug
+  pattern up through the first `.` and is flagged — a false positive, not a
+  missed leak.
+
+None of these have shown up in practice; noted here so a future change to
+`PATTERNS` or the diff strategy doesn't need to rediscover them.
+
 ## Overriding
 
 There is no bypass flag by design — a match means rewrite the offending line
