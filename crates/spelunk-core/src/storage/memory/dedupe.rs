@@ -2068,8 +2068,8 @@ mod tests {
         );
     }
 
-    // ── Test-engineer adversarial round: Step A's collision-skip (^249
-    // criterion 7, entity_id_migration.rs) leaves a colliding row's
+    // ── Test-engineer adversarial round: Step A's collision-skip
+    // (entity_id_migration.rs) leaves a colliding row's
     // `entity_id` column NULL rather than erroring. `dedupe_entity_ids`
     // itself never reads that stored column — `note_entity_id` recomputes
     // fresh from `{kind,title,body}` on every call (see `entity_id.rs`) — so
@@ -2120,7 +2120,7 @@ mod tests {
             .unwrap();
         store.set_superseded_by(pointer_id, stray_id).unwrap();
 
-        // Step A must skip the stray row without error (^249 criterion 7).
+        // Step A must skip the stray row without error.
         store
             .backfill_entity_ids()
             .expect("Step A must not hard-fail on the collision");

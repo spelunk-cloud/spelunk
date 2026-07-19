@@ -1150,10 +1150,10 @@ mod tests {
         assert_eq!(total_rows, 0, "a failed insert must leave no row behind");
     }
 
-    // ── Criterion 9 (^249, Step A): any error other than a UNIQUE violation
-    // from the per-row backfill UPDATE must propagate unchanged. Exercised
-    // via a synthetic trigger on UPDATE, distinct from the UNIQUE-collision
-    // path criterion 7 already covers.
+    // ── Step A: any error other than a UNIQUE violation from the per-row
+    // backfill UPDATE must propagate unchanged. Exercised via a synthetic
+    // trigger on UPDATE, distinct from the UNIQUE-collision path already
+    // covered above.
     #[test]
     fn backfill_other_error_from_update_propagates_unchanged() {
         let store = open_store();

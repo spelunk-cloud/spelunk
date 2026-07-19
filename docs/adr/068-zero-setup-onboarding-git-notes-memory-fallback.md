@@ -952,23 +952,22 @@ import.
   principle once its own identity gap (not setting `entity_id` on insert) is
   closed; that gap is not closed by this amendment.
 
-## Amendment (2026-07-19): `add_note_superseding` identity gap, Step A hardening, and double-supersede carrier consistency
+## Amendment (2026-07-19): `add_note_superseding` identity gap and Step A hardening
 
 **Date:** 2026-07-19
-**Deciders:** founder (Johan) — pending review via this PR; architect
+**Deciders:** founder (Johan); architect
 
 Two gaps in the supersede path, found in the same review pass because both
 sit on the identity-model surface these amendments already cover.
 
 **Provenance check (2026-07-19).** At the time of this amendment, the third
 amendment's Step A/B (`entity_id_migration.rs`) and `spelunk memory dedupe`
-exist only on the in-progress branch `task/engineer-dedupe-20260718-1314`
-(board task spelunk-oss^179) — not yet on `main`. The fourth amendment's C1
-(`add_note`/`add_note_with_created_at` insert-then-recover) is speced but has
-no Rust implementation anywhere yet; it is also in ^179's scope (criteria
-25-35, in progress on a second worktree at the time of this writing). This
-amendment's E1-E3 are therefore corrections to land **in the same
-implementation pass** as ^179, not patches against already-shipped code.
+exist only on an in-progress branch, not yet on `main`. The fourth
+amendment's C1 (`add_note`/`add_note_with_created_at` insert-then-recover) is
+speced but has no Rust implementation anywhere yet; it is landing on that
+same branch. This amendment's E1-E3 are therefore corrections to land **in
+the same implementation pass** as that work, not patches against
+already-shipped code.
 
 ### E1 — `add_note_superseding` gains `entity_id` and the same insert-then-recover as `add_note`
 
@@ -1000,9 +999,10 @@ superseded_by=?2, ... WHERE id=?1 AND status='active'` — must run against
 whichever id is authoritative: the freshly inserted row, or the reused
 existing one). Return type changes to expose both the id and whether a fresh
 row was created, mirroring the fourth amendment's C2 (so the CLI can
-distinguish "created" from "reused" here too, and so E4 below can compose with
-it). `add_note_superseding`'s own archive-`OLD` UPDATE must also report
-whether it actually changed a row — needed independently by E4.
+distinguish "created" from "reused" here too). `add_note_superseding`'s own
+archive-`OLD` UPDATE must also report whether it actually changed a row — a
+signal the separate follow-up work on re-superseding an already-archived
+entry will also need.
 
 ### E2 — Step A backfill hardens against a collision it can now hit
 
@@ -1018,8 +1018,7 @@ fix, or by any future path that has the same gap) hits Step A's bare
 computed value collides with an existing row's `entity_id`, that `UPDATE`
 raises a UNIQUE-constraint error with no handler, which propagates out of
 `backfill_entity_ids` via `?` and hard-fails `MemoryStore::open` itself —
-bricking every `spelunk` command against that store, exactly as
-spelunk-oss^249 described.
+bricking every `spelunk` command against that store.
 
 Step A's per-row `UPDATE` catches a UNIQUE-constraint violation on
 `notes.entity_id` specifically and, on that error only, skips the row
@@ -1032,8 +1031,8 @@ where Step A did not yet live up to it.
 
 ### E3 — A second latent NULL-`entity_id` insert path found: `apply_remote_note` — flagged, not fixed here
 
-Grepping every `INSERT INTO notes` in `spelunk-core`/`spelunk-cli` (requested
-by ^249) found a second path that never populates `entity_id`:
+Grepping every `INSERT INTO notes` in `spelunk-core`/`spelunk-cli` found a
+second path that never populates `entity_id`:
 `MemoryStore::apply_remote_note` (`crates/spelunk-core/src/storage/memory/sync.rs`),
 the cloud-pull idempotency path for an explicit team `server_url`. Unlike
 `add_note_superseding`, this one is not a same-shape fix: its own doc comment
@@ -1052,111 +1051,19 @@ Step A hardening is what keeps this path from being able to hard-fail `open`
 in the meantime — this is additional justification for shipping E2 regardless
 of E1.
 
-### E4 — Re-superseding an already-archived entry: reject, don't silently fork the carrier
-
-**Correction to spelunk-oss^250's own framing.** Its "Problem" section
-describes both `memory add --supersedes` and `memory supersede` as
-unconditional carrier-appenders. Re-reading both CLI commands: **only `memory
-add --supersedes` has this bug.** `memory supersede`
-(`crates/spelunk-cli/src/cli/cmd/memory/supersede.rs`) already gates its
-carrier-append on `backend.supersede(...)`'s returned `bool` (`changed > 0`
-from the SQL layer) and `anyhow::bail!`s with "No active memory entry with id
-{old} (old)" when it is `false` — i.e., re-superseding an already-archived
-`OLD` via `memory supersede` already errors today and never double-writes the
-carrier. The task's own repro section confirms this by construction: both
-repro steps use `memory add --supersedes`, never `memory supersede`.
-
-The actual gap is narrower: `add_note_superseding`'s archive-`OLD` `UPDATE`
-(`WHERE id = ?1 AND status = 'active'`) silently no-ops when `OLD` is already
-archived, and neither `add_note_superseding` nor `add.rs`'s CLI handler
-inspect that outcome — unlike `supersede()`, which already returns whether it
-changed a row, `add_note_superseding` currently discards that information
-entirely.
-
-**Decision: `memory add --supersedes` adopts the same reject-with-error
-semantics `memory supersede` already has, on both storage paths.** This was
-chosen over silent-no-op (would leave the CLI's two supersede entry points
-behaviorally inconsistent, which is what created this bug's asymmetry in the
-first place) and over chained-supersede-by-recency (a real feature nobody has
-asked for; introducing it here would be scope creep against the existing
-"reject" precedent that already ships in `supersede.rs`).
-
-- **`add_note_superseding`** reports whether its archive-`OLD` `UPDATE`
-  actually changed a row (mirrors `supersede()`'s existing `Result<bool>`
-  return). When it did not (OLD absent or already archived), the whole
-  transaction rolls back and the function returns an error — **no new note is
-  created and nothing is written**, the same fail-fast contract `memory
-  supersede` already has. This is a deliberate behavior change from today,
-  where `add --supersedes` against an already-archived `OLD` currently
-  *succeeds*, creating an orphaned new note plus the conflicting carrier
-  write ^250 describes.
-- **`crates/spelunk-cli/src/cli/cmd/memory/add.rs`** (post-`init`, SQLite
-  primary): when `args.supersedes` is `Some`, read `OLD`'s current status
-  *before* calling `backend.add(...)` (the CLI already reads `OLD` later, to
-  build the `append_state_update` call — move that read earlier and reuse it,
-  rather than reading twice). If `OLD` is not `status == "active"`, fail the
-  whole command with an error before any write (SQLite or git-notes) happens,
-  mirroring `supersede.rs`'s message shape ("No active memory entry with id
-  {old} (old)."). This is a control-flow change to `add.rs`: today the
-  `--supersedes` validity check happens implicitly and too late (inside the
-  SQL `UPDATE`'s `WHERE` clause, whose result is discarded); it needs to move
-  to an explicit pre-flight check.
-- **Pre-`init`, git-notes-only path** (no SQLite primary to consult): the same
-  pre-flight check reads `OLD` via `GitNotesBackend::new().get(old_id)` (the
-  CLI already does this for the existing carrier-append block — reuse it,
-  moved earlier) and fails the same way if `OLD.status != "active"`, before
-  writing the new entry's own git-notes record.
-- **`memory supersede`** needs no code change — E4 only extends its
-  already-correct behavior to the other entry point.
-
-### E5 — `fold.rs`: a conflicting `superseded_by_entity_id` resolves by recency, not lexicographic min
-
-E4 stops *future* double-supersede-by-different-successor at write time on
-both CLI paths. It does not repair state already written by a pre-fix client,
-nor state written concurrently by two machines racing before E4's rejection
-is visible to the second writer (the git-notes carrier has no cross-machine
-locking — see ADR-068 D3's "known limitations"). `fold.rs`'s read-time merge
-is the only place such a conflict can still be resolved correctly, and today
-it resolves `superseded_by_entity_id` via `min_some` (lexicographically
-smallest), which is an arbitrary, not-most-recent pick — `fold_group` folds
-onto `base`, the *earliest-created* copy in the group, so `min_some` is
-comparing string bytes, not time.
-
-**Decision:** `superseded_by_entity_id` resolves to the value carried by
-whichever record in the fold group has the greatest `created_at` among those
-where the field is non-`None` (ties broken by `id` ascending, matching
-`base_key`'s existing tie-break order). This requires scanning the whole
-group for this one field specifically, rather than the current pairwise
-`base`-vs-`other` fold — `base` is the earliest-created record and is not
-guaranteed to be, or to have folded in, the most recent state update. `min_some`
-stays unchanged for `valid_at`/`invalid_at`, whose "earliest wins" semantics
-are correct as-is (a temporal validity window, not a conflicting-successor
-pointer) — this is a targeted fix to one field's resolution rule, not a
-rewrite of `merge_into`.
-
-This is a read-time robustness fix, independent of E4: it corrects how any
-already-existing conflicting carrier records fold, regardless of whether they
-were produced by the bug E4 closes, a pre-fix client, or a lost-race write.
-
-### E6 — Non-goals, consequences, security
+### E4 — Non-goals, consequences, security
 
 - **Non-goal:** deciding `apply_remote_note`'s `entity_id`/collision posture
   (E3) — a separate task, not this amendment.
-- **Non-goal:** a chained-supersede-by-recency feature for `add --supersedes`
-  (E4) — rejected in favor of matching `memory supersede`'s existing
-  reject-on-stale-`OLD` behavior; YAGNI absent a stated need for chaining.
-- **Non-goal:** repairing already-written conflicting carrier records in any
-  specific repo's `refs/notes/spelunk` — E5 fixes how they fold at read time;
-  it does not rewrite git-notes history (which this ADR's append-only model
-  never does).
-- **Consequence:** `add --supersedes` against a stale `OLD` now fails
-  loudly instead of silently creating an orphaned entry and a conflicting
-  carrier record — a deliberate, user-visible behavior change, consistent
-  with `memory supersede`'s existing contract.
 - **Consequence:** `MemoryStore::open` cannot be hard-failed by Step A
-  regardless of which insert path left a row `entity_id = NULL`, closing the
-  specific hard-fail risk spelunk-oss^249 raised, though E3's path remains an
-  open question for its own collision semantics.
-- **Security:** no new trust boundary. E4's pre-flight read is a local
-  SQLite/git-notes read already performed by the existing code, just
-  reordered; no new data leaves the machine.
+  regardless of which insert path left a row `entity_id = NULL`, closing that
+  hard-fail risk, though E3's path remains an open question for its own
+  collision semantics.
+- **Security:** no new trust boundary. E1/E2 only change how already-local
+  SQLite operations recover from a constraint violation; no new data leaves
+  the machine.
+
+A separate, related gap in the supersede path — re-superseding an
+already-archived entry, and how a conflicting `superseded_by_entity_id`
+should fold at read time — is being decided and implemented independently,
+with its own ADR-068 amendment once that work lands.
