@@ -1035,4 +1035,165 @@ mod tests {
             "criterion 8: a non-colliding NULL row must still backfill normally"
         );
     }
+
+    // ── Test-engineer adversarial round: self-supersede collision ───────────
+    //
+    // `add_note_superseding`'s collision-recovery path (criterion 3) was only
+    // ever exercised with the colliding "existing" row being a THIRD row,
+    // distinct from both the freshly-superseded OLD row and the new content.
+    // Nothing stops a caller from superseding `old_id` with content that is
+    // byte-identical to `old_id`'s OWN `{kind,title,body}` — e.g. `spelunk
+    // memory add --supersedes <id>` invoked with the same title/body as the
+    // entry it names. Post-promotion, the INSERT then collides with `old_id`
+    // itself: `recover_from_entity_id_collision` looks up the existing row by
+    // `entity_id` and finds `old_id`, so `existing_id == supersedes_id`. The
+    // archive-OLD UPDATE then runs `SET status='archived', superseded_by=?2
+    // WHERE id=?1` with `?1 = ?2 = old_id`: a row would archive itself and
+    // set its own `superseded_by` to its own `id`, a self-loop of exactly the
+    // shape `dedupe.rs`'s own self-edge guard exists to prevent, but on the
+    // supersede path rather than the collapse path.
+    #[test]
+    fn add_note_superseding_self_collision_does_not_create_self_referential_archived_row() {
+        let store = open_store();
+        let (old_id, _) = store
+            .add_note(
+                "decision",
+                "same content",
+                "same body",
+                &[],
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+        store.promote_entity_id_unique_index().unwrap();
+        assert!(index_is_unique(&store), "precondition: index promoted");
+
+        // Supersede `old_id` with content identical to `old_id`'s own
+        // kind/title/body: the INSERT collides with `old_id` itself.
+        let result = store.add_note_superseding(
+            "decision",
+            "same content",
+            "same body",
+            &[],
+            &[],
+            None,
+            old_id,
+        );
+        assert!(
+            result.is_ok(),
+            "a self-collision must not error: {:?}",
+            result.err()
+        );
+        let (returned_id, created) = result.unwrap();
+        assert_eq!(
+            returned_id, old_id,
+            "the collision resolves to old_id itself — there is only one row \
+             with this content"
+        );
+        assert!(!created, "a collision is never a fresh insert");
+
+        let row = store.get(old_id).unwrap().expect("row still exists");
+        assert_ne!(
+            row.superseded_by,
+            Some(old_id),
+            "BUG: a self-supersede collision must not leave a row pointing \
+             superseded_by at its own id — this is a self-loop of the exact \
+             shape dedupe.rs's own self-edge guard exists to prevent, just \
+             reached via the supersede path instead of the collapse path"
+        );
+        let total_rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            total_rows, 1,
+            "no phantom second row must be created by the self-collision"
+        );
+    }
+
+    // ── Criterion 28 (add_note): any error other than the specific
+    // notes.entity_id UNIQUE violation must propagate unchanged, not be
+    // swallowed by the collision-recovery match arm. Exercised via a
+    // synthetic trigger that raises a distinct error for a specific title, so
+    // the failure is unambiguously NOT a UNIQUE-on-entity_id violation —
+    // criterion 5 already proves this for `add_note_superseding` via a
+    // foreign-key violation; this is the sibling proof for plain `add_note`,
+    // which had no such test.
+    #[test]
+    fn add_note_other_error_propagates_unchanged_not_swallowed_as_collision() {
+        let store = open_store();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_specific_title
+                 BEFORE INSERT ON notes
+                 WHEN NEW.title = 'trigger-reject'
+                 BEGIN SELECT RAISE(ABORT, 'synthetic non-unique failure'); END;",
+            )
+            .unwrap();
+
+        let result = store.add_note("note", "trigger-reject", "body", &[], &[], None, None);
+        assert!(
+            result.is_err(),
+            "criterion 28: a non-UNIQUE error must propagate, not be swallowed"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("synthetic non-unique failure"),
+            "expected the synthetic trigger error to propagate verbatim, got: {msg}"
+        );
+        let total_rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total_rows, 0, "a failed insert must leave no row behind");
+    }
+
+    // ── Criterion 9 (^249, Step A): any error other than a UNIQUE violation
+    // from the per-row backfill UPDATE must propagate unchanged. Exercised
+    // via a synthetic trigger on UPDATE, distinct from the UNIQUE-collision
+    // path criterion 7 already covers.
+    #[test]
+    fn backfill_other_error_from_update_propagates_unchanged() {
+        let store = open_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO notes (kind, title, body, entity_id) VALUES ('note', 'stray', 'body', NULL)",
+                [],
+            )
+            .unwrap();
+        let stray_id = store.conn.last_insert_rowid();
+        store
+            .conn
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_specific_update
+                 BEFORE UPDATE ON notes
+                 WHEN NEW.id = {stray_id}
+                 BEGIN SELECT RAISE(ABORT, 'synthetic step a failure'); END;"
+            ))
+            .unwrap();
+
+        let result = store.backfill_entity_ids();
+        assert!(
+            result.is_err(),
+            "criterion 9: a non-UNIQUE error from the backfill UPDATE must propagate"
+        );
+        let err = result.unwrap_err();
+        // `.to_string()` on an anyhow::Error only shows the outermost
+        // `.with_context(...)` layer ("backfilling entity_id for note #1");
+        // the synthetic trigger message is a wrapped source, so it must be
+        // checked via the full chain, not the top-level Display.
+        let full_chain: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            full_chain.contains("synthetic step a failure"),
+            "expected the synthetic trigger error to propagate somewhere in \
+             the error chain, got: {full_chain}"
+        );
+    }
 }

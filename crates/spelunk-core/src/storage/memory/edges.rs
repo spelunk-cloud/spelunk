@@ -22,6 +22,18 @@ impl MemoryStore {
     /// `recover_from_entity_id_collision` from `notes.rs` — not
     /// reimplemented). On a collision, the *existing* row's id is what the
     /// archive-`OLD` step below targets, not a fresh one.
+    ///
+    /// Test-engineer adversarial finding: a collision can resolve to
+    /// `supersedes_id` itself — a caller superseding `old_id` with content
+    /// byte-identical to `old_id`'s own `{kind,title,body}`. Without a guard,
+    /// the archive-`OLD` step below would then run with `id == supersedes_id`
+    /// and leave the row `status = 'archived'`, `superseded_by = <own id>`: a
+    /// self-loop of exactly the shape `dedupe.rs`'s own self-edge guard
+    /// exists to prevent, reached via this path instead. When the collision
+    /// resolves to the supersede target itself there is nothing to archive
+    /// and no edge to add — the "new" entry already *is* that row — so both
+    /// steps are skipped and the row is returned unchanged (`created =
+    /// false`, tags/linked_files already merged by the recovery above).
     #[allow(clippy::too_many_arguments)]
     pub fn add_note_superseding(
         &self,
@@ -55,6 +67,11 @@ impl MemoryStore {
                 tags,
                 linked_files,
             )?;
+            if id == supersedes_id {
+                // Self-collision guard: nothing to archive and no edge to add
+                // when the collision resolved to the supersede target itself.
+                return Ok((id, created));
+            }
             self.conn.execute(
                 "UPDATE notes
                  SET    status = 'archived',

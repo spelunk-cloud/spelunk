@@ -212,17 +212,27 @@ impl MemoryStore {
         }
     }
 
-    /// Return all notes for a project ordered by created_at ASC (used by reconcile
-    /// to compute the memory.db content-hash set).
+    /// Return all notes for a project ordered by created_at ASC, id ASC (used
+    /// by reconcile to compute the memory.db content-hash set, and by
+    /// `dedupe_entity_ids` to pick each duplicate group's survivor).
     ///
     /// Returns all notes regardless of status so that archived entries also
     /// participate in dedup (we must not re-import a note that was already
     /// imported and then archived in memory.db).
+    ///
+    /// The `id ASC` secondary key is a deliberate, explicit tie-break: two
+    /// rows can share the exact same `created_at` (e.g. a batch import, or
+    /// two ordinary inserts landing in the same unixepoch() second), and
+    /// `ORDER BY created_at ASC` alone leaves that tie's resolution order to
+    /// SQLite's query plan rather than a documented invariant. `id` is
+    /// monotonically increasing with insertion order, so this pins "earliest
+    /// created, and among ties, first inserted" as the actual, stable
+    /// definition of "earliest" every caller of this function relies on.
     pub fn all_notes_for_dedup(&self) -> Result<Vec<Note>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, title, body, tags, linked_files, created_at, status, \
              superseded_by, source_ref, valid_at, invalid_at \
-             FROM notes ORDER BY created_at ASC",
+             FROM notes ORDER BY created_at ASC, id ASC",
         )?;
         let notes = stmt
             .query_map([], super::notes::row_to_note)?

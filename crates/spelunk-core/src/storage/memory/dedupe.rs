@@ -1917,4 +1917,265 @@ mod tests {
         assert_eq!(o.superseded_by, Some(survivor_b));
         assert_eq!(note_count(&store), 4, "8 - 4 collapsed = 4 remaining rows");
     }
+
+    // ── Test-engineer adversarial round: fold-group tie-breaking boundary ───
+    //
+    // The merge rule says "survivor = earliest created_at", but says nothing
+    // about what happens when two rows in a duplicate group share the exact
+    // same `created_at` (plausible for anything inserted in the same batch
+    // import or the same second via `add_note_with_created_at`, or even two
+    // ordinary `add_note` calls landing in the same unixepoch() second).
+    // `all_notes_for_dedup` orders `ORDER BY created_at ASC` with no
+    // secondary key, so a tie's resolution order is whatever SQLite's query
+    // plan happens to produce — not guaranteed stable by the SQL standard.
+    // Pin the id as an explicit secondary tie-break (lower id = inserted
+    // first = survivor) so the choice is a documented invariant instead of
+    // an accident of the query planner, and prove it holds across repeated
+    // runs on independently-built stores.
+    #[test]
+    fn tied_created_at_breaks_deterministically_on_lower_id() {
+        for _ in 0..5 {
+            let store = open_store();
+            let (first, _) = store
+                .add_note_with_created_at(
+                    "decision",
+                    "tied dup",
+                    "body",
+                    &[],
+                    &[],
+                    None,
+                    "active",
+                    500,
+                )
+                .unwrap();
+            let (second, _) = store
+                .add_note_with_created_at(
+                    "decision",
+                    "tied dup",
+                    "body",
+                    &[],
+                    &[],
+                    None,
+                    "active",
+                    500,
+                )
+                .unwrap();
+            assert!(
+                first < second,
+                "precondition: insertion order gives first the lower id"
+            );
+
+            let summary = store.dedupe_entity_ids(false).unwrap();
+            assert_eq!(summary.rows_collapsed, 1);
+            assert!(
+                store.get(first).unwrap().is_some(),
+                "the lower-id (first-inserted) row must be the deterministic \
+                 survivor when created_at ties, on every run"
+            );
+            assert!(
+                store.get(second).unwrap().is_none(),
+                "the higher-id row must be the loser when created_at ties"
+            );
+        }
+    }
+
+    // ── Test-engineer adversarial round: dedupe interacting with rows built
+    // via `add_note_superseding` (ADR-068 fifth amendment E1), not just
+    // `add_note`/`add_note_with_created_at` as every prior dedupe.rs test
+    // does. Pre-promotion, two independent `add_note_superseding` calls for
+    // byte-identical content (each superseding a *different* OLD row) create
+    // two distinct rows sharing one entity_id — a duplicate group whose
+    // members both carry an *inbound* edge from an OLD row's own
+    // `superseded_by`, not an outbound one. Verifies `dedupe_entity_ids`
+    // repoints those inbound edges to the survivor exactly like any other
+    // external reference, proving the two features (E1's supersede path and
+    // the third amendment's dedupe) compose correctly rather than only ever
+    // having been tested in isolation.
+    #[test]
+    fn duplicate_group_built_via_add_note_superseding_repoints_old_rows_to_survivor() {
+        let store = open_store();
+        assert!(
+            !index_is_unique_for_test(&store),
+            "precondition: not yet promoted, so add_note_superseding can \
+             still create two distinct rows for identical content"
+        );
+
+        let (old1, _) = store
+            .add_note("decision", "old one", "old body one", &[], &[], None, None)
+            .unwrap();
+        let (old2, _) = store
+            .add_note("decision", "old two", "old body two", &[], &[], None, None)
+            .unwrap();
+
+        let (new1, created1) = store
+            .add_note_superseding(
+                "decision",
+                "dup replacement",
+                "dup body",
+                &[],
+                &[],
+                None,
+                old1,
+            )
+            .unwrap();
+        assert!(created1, "pre-promotion: fresh row");
+        let (new2, created2) = store
+            .add_note_superseding(
+                "decision",
+                "dup replacement",
+                "dup body",
+                &[],
+                &[],
+                None,
+                old2,
+            )
+            .unwrap();
+        assert!(
+            created2,
+            "pre-promotion: identical content still creates a second, \
+             distinct row (the duplicate-group precondition for this test)"
+        );
+        assert_ne!(new1, new2);
+
+        // Precondition: each OLD row now points at its own distinct
+        // successor — new1 and new2, which are themselves a duplicate group.
+        assert_eq!(store.get(old1).unwrap().unwrap().superseded_by, Some(new1));
+        assert_eq!(store.get(old2).unwrap().unwrap().superseded_by, Some(new2));
+
+        let summary = store.dedupe_entity_ids(false).unwrap();
+        assert_eq!(summary.duplicate_groups, 1, "new1/new2 form one group");
+        assert_eq!(summary.rows_collapsed, 1);
+
+        // new1 (earlier created_at) survives; new2 is the loser.
+        assert!(store.get(new1).unwrap().is_some());
+        assert!(store.get(new2).unwrap().is_none());
+
+        // old2's superseded_by, which pointed at the now-deleted new2, must
+        // be repointed to the survivor new1 — this is the cross-reference
+        // rewrite exercising an edge that originated from the supersede path
+        // rather than a plain add_note/set_superseded_by call.
+        assert_eq!(
+            store.get(old2).unwrap().unwrap().superseded_by,
+            Some(new1),
+            "old2's supersede edge, created by add_note_superseding, must be \
+             repointed off the deleted duplicate onto the survivor"
+        );
+        assert_eq!(
+            store.get(old1).unwrap().unwrap().superseded_by,
+            Some(new1),
+            "old1's own edge already pointed at the survivor and must be \
+             unaffected"
+        );
+    }
+
+    // ── Test-engineer adversarial round: Step A's collision-skip (^249
+    // criterion 7, entity_id_migration.rs) leaves a colliding row's
+    // `entity_id` column NULL rather than erroring. `dedupe_entity_ids`
+    // itself never reads that stored column — `note_entity_id` recomputes
+    // fresh from `{kind,title,body}` on every call (see `entity_id.rs`) — so
+    // a row Step A was forced to skip is still discoverable and collapsible
+    // by `spelunk memory dedupe`, exactly the recovery path the fifth
+    // amendment's warning message ("run `spelunk memory dedupe` to collapse
+    // them") promises. This proves that promise end to end rather than
+    // trusting the two mechanisms compose from reading each in isolation:
+    // the skipped row is also, simultaneously, the target of an unrelated
+    // row's `superseded_by` — the exact "a row that's simultaneously a
+    // supersede target" scenario Step A's hardening was written to survive.
+    #[test]
+    fn step_a_skipped_row_that_is_a_supersede_target_is_still_collapsed_by_dedupe() {
+        let store = open_store();
+        let (existing_id, _) = store
+            .add_note(
+                "decision",
+                "dup entry",
+                "same content",
+                &[],
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+        store.promote_entity_id_unique_index().unwrap();
+        assert!(
+            index_is_unique_for_test(&store),
+            "precondition: index promoted"
+        );
+
+        // A stray NULL-entity_id row colliding with `existing_id` (simulating
+        // a pre-E1 add_note_superseding row, or any other latent NULL-id
+        // insert path) — bypasses add_note's own recovery entirely.
+        store
+            .conn
+            .execute(
+                "INSERT INTO notes (kind, title, body) VALUES ('decision', 'dup entry', 'same content')",
+                [],
+            )
+            .unwrap();
+        let stray_id = store.conn.last_insert_rowid();
+
+        // A third, unrelated row whose superseded_by points AT the stray
+        // row: the stray is simultaneously a supersede target.
+        let (pointer_id, _) = store
+            .add_note("note", "points at stray", "b", &[], &[], None, None)
+            .unwrap();
+        store.set_superseded_by(pointer_id, stray_id).unwrap();
+
+        // Step A must skip the stray row without error (^249 criterion 7).
+        store
+            .backfill_entity_ids()
+            .expect("Step A must not hard-fail on the collision");
+        let stray_eid: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT entity_id FROM notes WHERE id = ?1",
+                rusqlite::params![stray_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stray_eid, None,
+            "precondition: Step A left the colliding row's entity_id NULL"
+        );
+
+        // `spelunk memory dedupe` must still find and collapse it, even
+        // though the stored `entity_id` column never got populated: it
+        // recomputes entity_id from {kind,title,body}, not from the column.
+        let summary = store.dedupe_entity_ids(false).unwrap();
+        assert_eq!(
+            summary.duplicate_groups, 1,
+            "dedupe must discover the group despite the stray row's NULL \
+             stored entity_id column"
+        );
+        assert_eq!(summary.rows_collapsed, 1);
+        assert!(
+            store.get(existing_id).unwrap().is_some(),
+            "existing_id (earlier-created) survives"
+        );
+        assert!(
+            store.get(stray_id).unwrap().is_none(),
+            "the stray row is collapsed away"
+        );
+        assert_eq!(
+            store.get(pointer_id).unwrap().unwrap().superseded_by,
+            Some(existing_id),
+            "pointer_id's edge to the now-deleted stray row must be \
+             repointed to the survivor — proving the promised \
+             Step-A-skip-then-dedupe recovery path actually closes the loop"
+        );
+    }
+
+    /// Test-only helper mirroring `entity_id_migration.rs`'s private
+    /// `index_is_unique`, needed here since this module's tests also drive
+    /// `promote_entity_id_unique_index` directly.
+    fn index_is_unique_for_test(store: &MemoryStore) -> bool {
+        let sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_notes_entity_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        sql.to_uppercase().contains("UNIQUE")
+    }
 }
