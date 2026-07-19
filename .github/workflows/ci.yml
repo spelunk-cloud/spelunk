@@ -216,3 +216,30 @@ jobs:
             echo "Then commit the updated snapshot."
             exit 1
           fi
+
+  internal-id-guard:
+    name: Internal board-id guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The guard needs the base ref (PR) or previous ref (push) present
+          # locally to diff against; a shallow checkout wouldn't have it.
+          fetch-depth: 0
+
+      - name: Run guard self-tests
+        run: bash .github/scripts/check-internal-ids.test.sh
+
+      - name: Scan the introduced commits for internal board-id references
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            range="${{ github.event.pull_request.base.sha }}...${{ github.sha }}"
+          elif [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            range="${{ github.event.before }}...${{ github.event.after }}"
+          else
+            # First push of a new branch: no meaningful "before". Fall back
+            # to just the tip commit rather than skipping the check.
+            range="${{ github.sha }}~1...${{ github.sha }}"
+          fi
+          .github/scripts/check-internal-ids.sh --range "$range"

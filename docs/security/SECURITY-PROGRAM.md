@@ -90,6 +90,7 @@ server-specific pre-v1.0 checklist is
 | Dependency advisory scan         | `cargo audit`              | Yes — blocks merge |
 | Dependency license/source policy | `cargo deny`               | Yes — blocks merge |
 | Static analysis                  | `cargo clippy -D warnings` | Yes — blocks merge |
+| Internal task-tracker ID leak guard | `.github/scripts/check-internal-ids.sh` | Yes — blocks merge |
 
 ### Design controls
 
