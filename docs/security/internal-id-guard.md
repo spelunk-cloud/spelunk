@@ -23,8 +23,9 @@ landing silently.
 
 ## What it matches
 
-Three patterns, `grep -E`, checked against **only the lines a change
-introduces** — never a whole file, never existing history:
+Three patterns, `grep -Ei` (case-insensitive — a differently-cased ref, e.g.
+a title-cased PR subject, is the same leak), checked against **only the
+lines a change introduces** — never a whole file, never existing history:
 
 | Pattern | Matches | Example shape (not a real id) |
 | --- | --- | --- |
