@@ -50,6 +50,8 @@ pub enum MemoryCommand {
     Failures(MemoryFailuresArgs),
     /// Import unique notes from server.db into the local memory.db (recovery / migration tool)
     Reconcile(MemoryReconcileArgs),
+    /// Collapse duplicate-entity_id groups already resident in local memory.db (recovery tool)
+    Dedupe(MemoryDedupeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -350,11 +352,23 @@ pub struct MemoryReconcileArgs {
     pub format: String,
 }
 
+#[derive(Args, Debug)]
+pub struct MemoryDedupeArgs {
+    /// Detect and report duplicate entity_id groups without collapsing anything
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format: text or json (NDJSON summary object)
+    #[arg(long, default_value = "text")]
+    pub format: String,
+}
+
 use super::status::format_age;
 
 mod add;
 mod archive;
 pub(crate) mod cross_project;
+mod dedupe;
 mod failures;
 mod graph_cmd;
 mod harvest;
@@ -397,6 +411,7 @@ pub async fn memory(args: MemoryArgs, cfg: crate::config::Config) -> Result<()> 
         MemoryCommand::Watch(a) => watch::memory_watch(a, &cfg).await,
         MemoryCommand::Failures(a) => failures::memory_failures(a, &mem_path, &cfg, be).await,
         MemoryCommand::Reconcile(a) => reconcile::memory_reconcile(a, &mem_path, &cfg).await,
+        MemoryCommand::Dedupe(a) => dedupe::memory_dedupe(a, &mem_path).await,
     }
 }
 

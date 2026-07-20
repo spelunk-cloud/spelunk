@@ -107,6 +107,19 @@ impl MemoryStore {
         }
     }
 
+    /// Delete every `memory_edges` row touching `note_id` (either endpoint).
+    ///
+    /// `memory dedupe` is the first place in this codebase that deletes an
+    /// existing note row, so it cleans up incident edges explicitly here
+    /// rather than relying on `memory_edges`' `ON DELETE CASCADE`.
+    pub fn delete_edges_for_note(&self, note_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM memory_edges WHERE from_id = ?1 OR to_id = ?1",
+            rusqlite::params![note_id],
+        )?;
+        Ok(())
+    }
+
     /// Insert a directed edge between two notes.
     /// `kind` must be one of: supersedes, relates_to, contradicts.
     pub fn add_edge(&self, from_id: i64, to_id: i64, kind: &str) -> Result<()> {

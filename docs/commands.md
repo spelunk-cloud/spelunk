@@ -765,6 +765,7 @@ spelunk memory pull                         # one-way: pull new server entries i
 spelunk memory sync                         # two-way: push local + pull remote (see `spelunk sync`)
 spelunk memory watch                        # stream new entries from the server (SSE)
 spelunk memory reconcile [--dry-run] [--all-projects] [--source-db <path>]
+spelunk memory dedupe [--dry-run] [--format text|json]
 ```
 
 All `memory` subcommands accept `--backend sqlite|git-notes` (default `sqlite`)
@@ -796,6 +797,9 @@ import dedup on it: entries with identical text collapse into one even when
 their creation time, tags, or linked files differ, and the survivor carries the
 union of the tags and linked files. The `id` shown by `memory list` is a local
 row number, not this identity. See [Entry identity](memory.md#project-memory).
+Existing duplicate rows already resident in `memory.db` are never collapsed
+automatically; use `spelunk memory dedupe` to do that explicitly (see
+[Collapsing duplicate entries already in memory.db](memory.md#collapsing-duplicate-entries-already-in-memorydb)).
 
 ---
 

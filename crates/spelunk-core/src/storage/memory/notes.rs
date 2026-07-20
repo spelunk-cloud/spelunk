@@ -148,17 +148,24 @@ impl MemoryStore {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Return all notes for a project ordered by created_at ASC (used by reconcile
-    /// to compute the memory.db content-hash set).
+    /// Return all notes for a project ordered by created_at ASC, id ASC (used
+    /// by reconcile to compute the memory.db content-hash set, and by
+    /// `dedupe_entity_ids` to pick each duplicate group's survivor).
     ///
     /// Returns all notes regardless of status so that archived entries also
     /// participate in dedup (we must not re-import a note that was already
     /// imported and then archived in memory.db).
+    ///
+    /// The `id ASC` secondary key is a deliberate tie-break: two rows can
+    /// share the same `created_at` (e.g. a batch import), and `id` is
+    /// monotonically increasing with insertion order, so this pins
+    /// "earliest created, and among ties, first inserted" as the actual
+    /// definition of "earliest" every caller relies on.
     pub fn all_notes_for_dedup(&self) -> Result<Vec<Note>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, title, body, tags, linked_files, created_at, status, \
              superseded_by, source_ref, valid_at, invalid_at \
-             FROM notes ORDER BY created_at ASC",
+             FROM notes ORDER BY created_at ASC, id ASC",
         )?;
         let notes = stmt
             .query_map([], super::notes::row_to_note)?
@@ -208,6 +215,51 @@ impl MemoryStore {
         self.conn.execute(
             "UPDATE notes SET superseded_by = ?1 WHERE id = ?2",
             rusqlite::params![successor_id, note_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear an existing note's `superseded_by` link back to NULL. Used by
+    /// `memory dedupe`'s self-edge guard: a rewrite that would otherwise point
+    /// a row at itself drops the link instead.
+    pub fn clear_superseded_by(&self, note_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE notes SET superseded_by = NULL WHERE id = ?1",
+            rusqlite::params![note_id],
+        )?;
+        Ok(())
+    }
+
+    /// Ids of every row whose `superseded_by` points at `target_id`.
+    pub fn notes_pointing_at(&self, target_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM notes WHERE superseded_by = ?1")?;
+        let ids = stmt
+            .query_map(rusqlite::params![target_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
+    /// Delete a note row outright. Used only by `memory dedupe` to remove a
+    /// duplicate-group loser after its tags/linked_files/superseded_by have
+    /// been folded into the survivor and any edges pointing at it rewritten.
+    pub fn delete_note(&self, note_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM notes WHERE id = ?1",
+            rusqlite::params![note_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a note's embedding row, if present. A no-op when absent. Used by
+    /// `memory dedupe` when deleting a duplicate-group loser: two vectors have
+    /// no meaningful union, so the loser's embedding is dropped rather than
+    /// merged (the survivor's own embedding, if any, is untouched).
+    pub fn delete_note_embedding(&self, note_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM note_embeddings WHERE note_id = ?1",
+            rusqlite::params![note_id],
         )?;
         Ok(())
     }
