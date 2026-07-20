@@ -299,7 +299,7 @@ pub struct Capabilities {
     #[allow(dead_code)]
     pub plan: bool,
     /// The server accepts a client-pushed embedding vector on `POST
-    /// /memory/batch` (ADR-053 #4b), advertised as a top-level `bool` in
+    /// /memory/batch`, advertised as a top-level `bool` in
     /// `/v1/health` (NOT an entry in the `capabilities` array). When set, the
     /// sync push may send the locally-computed fp32/896 vector instead of making
     /// the server re-embed; when unset (older server / OSS team server) the push
@@ -533,7 +533,7 @@ impl Tier {
 /// = one config), but unsuitable for long-running daemons that may use multiple
 /// configs — they would always see the tier determined by the first call.
 pub async fn get_tier(cfg: &Config) -> &'static Tier {
-    // ADR-037 D1: an *explicit* offline mode (config `mode = "offline"`,
+    // An *explicit* offline mode (config `mode = "offline"`,
     // `SPELUNK_MODE=offline`, or the `SPELUNK_NO_SERVER=1` kill-switch) skips all
     // server probes — the user has asked for a provable no-cloud run.
     //
@@ -798,7 +798,7 @@ async fn parse_health(
         #[serde(default)]
         limits: Option<ServerLimits>,
         /// Whether the server accepts a client-pushed embedding vector on
-        /// `POST /memory/batch` (ADR-053 #4b). Top-level bool, not a
+        /// `POST /memory/batch`. Top-level bool, not a
         /// `capabilities` entry. Absent on servers without the accept side
         /// (older servers, the OSS team server) → defaults false.
         #[serde(default)]
@@ -1401,7 +1401,7 @@ mod tests {
         );
     }
 
-    // ── accepts_pushed_vectors (top-level health bool, ADR-053 #4b) ────────────
+    // ── accepts_pushed_vectors (top-level health bool) ──────────────────────────
 
     /// A server advertising `accepts_pushed_vectors: true` must parse into
     /// `caps.accepts_pushed_vectors == true` — the gate the sync push reads

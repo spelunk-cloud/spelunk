@@ -92,8 +92,8 @@ struct Args {
     embedding_url: Option<String>,
 
     /// Deprecated and ignored. The embedding model is fixed to F2LLM-v2-330M@896
-    /// product-wide (ADR-053); a mismatched model silently corrupts the shared
-    /// vector space (ADR-010). Retained hidden only so a legacy
+    /// product-wide; a mismatched model silently corrupts the shared
+    /// vector space. Retained hidden only so a legacy
     /// `SPELUNK_EMBEDDING_MODEL` / `--embedding-model` warns and is ignored
     /// instead of hard-failing an old deployment on upgrade. Never selects a model.
     #[arg(long, env = "SPELUNK_EMBEDDING_MODEL", hide = true)]
@@ -466,7 +466,7 @@ fn resolve_embed_thread_budget() -> ThreadBudget {
 
 /// Warning to emit when a legacy `SPELUNK_EMBEDDING_MODEL` / `--embedding-model`
 /// is set. The embedding model is fixed to `NATIVE_MODEL_ID` product-wide
-/// (ADR-053) and can no longer be selected; a non-blank value is ignored, not
+/// and can no longer be selected; a non-blank value is ignored, not
 /// honoured. Returns `None` when unset/blank so upgrades stay quiet.
 fn legacy_embedding_model_warning(model: Option<&str>) -> Option<String> {
     let value = model.map(str::trim).filter(|m| !m.is_empty())?;

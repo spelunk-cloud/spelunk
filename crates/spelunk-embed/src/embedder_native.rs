@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -304,7 +305,19 @@ impl Qwen3EmbedWeights {
     /// uses the sequential path instead: its buffer pool grows unboundedly with
     /// batched inference because `(b × n_head × seq²)` attention tensors are
     /// never compacted between passes → OOM.
-    fn embed_batch(&self, batch_ids: &[&[u32]]) -> Result<Vec<Vec<f32>>> {
+    ///
+    /// `cancel`, when set, is checked before each chunk on the sequential path
+    /// (the only path where a per-iteration check is cheap and meaningful  -  the
+    /// CPU batched path below is one indivisible BLAS call, so mid-call
+    /// cancellation isn't worth the complexity; its floor is one sub-batch,
+    /// bounded by the caller). On observing cancellation this bails with an
+    /// error before doing the next chunk's forward pass  -  see
+    /// GH#631.
+    fn embed_batch(
+        &self,
+        batch_ids: &[&[u32]],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Vec<f32>>> {
         let b = batch_ids.len();
         assert!(b > 0);
 
@@ -316,6 +329,12 @@ impl Qwen3EmbedWeights {
         if b == 1 || !matches!(self.device, Device::Cpu) || max_seq > BATCH_MAX_SEQ {
             let mut out = Vec::with_capacity(b);
             for ids in batch_ids {
+                if let Some(flag) = cancel {
+                    anyhow::ensure!(
+                        !flag.load(Ordering::Relaxed),
+                        "embed cancelled mid sub-batch (sequential path)"
+                    );
+                }
                 let hidden = self.forward_one(ids)?;
                 let last = hidden.i((0, ids.len() - 1))?;
                 let mut v: Vec<f32> = last.to_dtype(DType::F32)?.to_vec1()?;
@@ -593,7 +612,17 @@ fn l2_normalise(v: &mut [f32]) {
 
 #[async_trait::async_trait]
 impl crate::EmbeddingBackend for NativeEmbedder {
-    /// Embed a batch of strings using F2LLM-v2-330M (Q8_0).
+    /// Embed a batch of strings using F2LLM-v2-330M (Q8_0), with no way to
+    /// cancel early. Delegates to [`Self::embed_with_cancel`] with a flag
+    /// that's never set, so there is exactly one implementation of the
+    /// tokenize/sub-batch logic.
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed_with_cancel(texts, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    /// Embed a batch of strings using F2LLM-v2-330M (Q8_0), stopping early if
+    /// `cancel` is observed set.
     ///
     /// Texts are tokenized, sorted by token length (to minimise padding waste),
     /// then forwarded through the Qwen3 decoder in padded sub-batches of
@@ -601,7 +630,21 @@ impl crate::EmbeddingBackend for NativeEmbedder {
     /// which amortises the per-call overhead.  The last token's hidden state is
     /// L2-normalised to produce a 896-dim embedding; results are returned in the
     /// original input order.
-    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    ///
+    /// `cancel` is checked in three places (see GH#631): once
+    /// immediately after acquiring the embedder lock (a batch abandoned while
+    /// queued behind another does zero forward passes  -  this is the cascade
+    /// killer for the mutex-serialized embedder), once between each sub-batch,
+    /// and once per chunk inside the sequential path of `embed_batch` (bounds
+    /// waste to ~one chunk on Metal, where every chunk is sequential). The one
+    /// place it is deliberately NOT checked is mid-BLAS-call in the CPU batched
+    /// path  -  not worth the complexity; its floor is one `EMBED_BATCH_SIZE`
+    /// sub-batch.
+    async fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Arc<AtomicBool>,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         let owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
         let inner = Arc::clone(&self.inner);
 
@@ -609,6 +652,19 @@ impl crate::EmbeddingBackend for NativeEmbedder {
             let guard = inner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("native embedder lock poisoned"))?;
+
+            let total = owned.len();
+            if cancel.load(Ordering::Relaxed) {
+                tracing::info!(
+                    "embed batch abandoned before starting (0/{total} chunks completed)  -  \
+                     client disconnected or server timed out while queued"
+                );
+                return Err(EmbedError::Cancelled {
+                    completed: 0,
+                    total,
+                }
+                .into());
+            }
 
             // 1. Tokenize all texts upfront, capping each to `effective_cap`.
             // `token_cap` is the memory-budget-derived bound that keeps the
@@ -651,16 +707,38 @@ impl crate::EmbeddingBackend for NativeEmbedder {
 
             // 3. Process in sub-batches; reassemble into original order.
             let mut results: Vec<Vec<f32>> = vec![Vec::new(); owned.len()];
+            let mut completed = 0usize;
             for sub_batch in indexed.chunks(EMBED_BATCH_SIZE) {
+                if cancel.load(Ordering::Relaxed) {
+                    tracing::info!(
+                        "embed batch abandoned between sub-batches \
+                         ({completed}/{total} chunks completed)  -  client disconnected or \
+                         server timed out"
+                    );
+                    return Err(EmbedError::Cancelled { completed, total }.into());
+                }
                 let batch_ids: Vec<&[u32]> =
                     sub_batch.iter().map(|(_, ids)| ids.as_slice()).collect();
                 let vecs = guard
                     .weights
-                    .embed_batch(&batch_ids)
-                    .map_err(|e| EmbedError::Inference(e.to_string()))?;
+                    .embed_batch(&batch_ids, Some(&cancel))
+                    .map_err(|e| {
+                        if cancel.load(Ordering::Relaxed) {
+                            tracing::info!(
+                                "embed batch abandoned mid sub-batch \
+                             ({completed}/{total} chunks completed, current sub-batch of \
+                             {} interrupted)  -  client disconnected or server timed out",
+                                sub_batch.len()
+                            );
+                            EmbedError::Cancelled { completed, total }
+                        } else {
+                            EmbedError::Inference(e.to_string())
+                        }
+                    })?;
                 for ((orig_idx, _), vec) in sub_batch.iter().zip(vecs) {
                     results[*orig_idx] = vec;
                 }
+                completed += sub_batch.len();
             }
 
             Ok(results)

@@ -15,18 +15,18 @@
 # docs/server.md#non-loopback-plaintext-binds-are-refused-no-override), and
 # this repo does not ship a proxy to pair with it.
 #
-# Run (dev, reachable only from other containers on the same Docker network):
-#   docker network create spelunk-dev
-#   docker run --rm --network spelunk-dev --name spelunk-server \
-#     -v spelunk-data:/data spelunk-server
-#   docker run --rm --network spelunk-dev curlimages/curl \
-#     curl http://spelunk-server:7777/v1/health
+# Run (dev, no compose): the server binds loopback only (see above), so a
+# sibling container on its own network can't reach it: sibling-container DNS
+# resolves to the bridge IP, and nothing listens there. A sidecar has to share
+# the server's network namespace instead, then reach it at 127.0.0.1:
+#   docker run -d --name spelunk-server -v spelunk-data:/data spelunk-server
+#   docker run --rm --network container:spelunk-server curlimages/curl \
+#     curl http://127.0.0.1:7777/v1/health
 #
 # Run (local scaffold, with API key): see docker-compose.yml. It runs this
-# image with a persistent volume — nothing more. It does not publish a
-# host-reachable port; reach the server from a separate container sharing
-# this one's network namespace (`--network container:spelunk-server`), the
-# same pattern as the dev recipe above but pointed at 127.0.0.1.
+# image with a persistent volume, wired up with the same
+# `--network container:spelunk-server` + 127.0.0.1 pattern above. Nothing
+# more; it does not publish a host-reachable port.
 #
 # For a team-reachable deployment, don't containerize this at all: run the
 # binary bare-metal/systemd on a host, with your own TLS terminator (nginx,

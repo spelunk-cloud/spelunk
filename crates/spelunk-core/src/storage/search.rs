@@ -196,7 +196,7 @@ mod tests {
 
     fn seed_chunk(db: &Database, content: &str) {
         let file_id = db
-            .upsert_file("src/lib.rs", Some("rust"), "deadbeef")
+            .upsert_file("src/lib.rs", Some("rust"), "deadbeef", 0)
             .expect("upsert file");
         db.insert_chunk(file_id, "function", Some("f"), 1, 5, content, None, 4)
             .expect("insert chunk");

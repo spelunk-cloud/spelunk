@@ -3290,7 +3290,7 @@ async fn same_head_duplicate_folds_to_one_entry() {
 /// so only a fold that sees every commit can collapse them.
 ///
 /// This is the test that pins the fold's placement: it fails if the fold moves
-/// into `read_records`, which sees one commit's blob at a time.
+/// into a per-commit blob read, which sees one commit's blob at a time.
 #[tokio::test]
 #[serial]
 async fn different_head_duplicate_folds_to_one_entry() {
@@ -3791,4 +3791,108 @@ async fn supersede_is_idempotent_across_repeated_state_updates() {
         "repeating the identical state update must still fold to one entry: {all:?}"
     );
     assert_eq!(x_entries[0].status, "archived");
+}
+
+// ── ADR-068 E4/E5: the pre-flight check does not close every race ──────────
+//
+// E4's pre-flight ("is OLD still active?") runs once, as a plain read, before
+// either write in `memory add --supersedes`'s pre-init (git-notes-only) path;
+// nothing holds `writer_lock` across the read and the eventual write, and
+// there is no SQL-style atomic "UPDATE ... WHERE status = 'active'" available
+// on a git-notes carrier to re-validate at write time (unlike the post-init
+// SQLite path, where `add_note_superseding`'s own guarded UPDATE is what
+// actually enforces correctness under a race — the CLI's pre-flight read is
+// there only to fail fast, not to carry the guarantee).
+//
+// So two `memory add --supersedes OLD` processes racing pre-init, each reading
+// OLD as active before either commits, can both proceed to append their own
+// "OLD archived, superseded by ME" state update — reproducing, via a genuine
+// race, the exact conflicting-carrier state E4 was written to stop from a
+// single sequential caller. This is not fixable without real cross-process
+// locking around the read (out of scope here — ADR-068 D3 already documents
+// the carrier has no cross-machine locking); what following documents and
+// pins is the shape of the residual gap, plus the one guarantee that *does*
+// still hold: `status` still folds to a coherent, monotonic "archived",
+// because `merge_into`'s archival rule is whole-group-safe regardless of how
+// many conflicting copies exist. (Which successor `superseded_by_entity_id`
+// resolves to is the E5 fold rule, pinned separately and exhaustively in
+// `storage::git_notes::fold`'s own unit tests — `Note`, the type every public
+// `MemoryBackend` method returns, does not carry that field, so it cannot be
+// asserted on from an external integration test like this one.)
+
+/// Simulates exactly what two `memory add --supersedes OLD` CLI invocations
+/// racing on the same OLD (both reading it as active before either writes)
+/// leave behind: two independent, both-successful `append_state_update` calls
+/// against the same OLD, naming two different successors. Pins that this is
+/// still possible today (the write-side race window E4 cannot fully close
+/// pre-init) and that it does not corrupt the fold beyond the successor
+/// pointer: `status` still converges to exactly one archived entry.
+#[tokio::test]
+#[serial]
+async fn racing_supersedes_of_the_same_old_both_land_conflicting_state_updates() {
+    let dir = make_temp_git_repo();
+    let root = dir.path();
+
+    append_to_git_notes(Some(root), &make_note_record(1, "decision OLD"))
+        .await
+        .expect("record OLD");
+    append_to_git_notes(Some(root), &make_note_record(2, "successor A"))
+        .await
+        .expect("record successor A");
+    append_to_git_notes(Some(root), &make_note_record(3, "successor B"))
+        .await
+        .expect("record successor B");
+
+    // Both racers' pre-flight reads see OLD as active (neither has written
+    // yet) — modeled by reading OLD once, here, and reusing it for both
+    // "processes'" writes below, exactly like `add.rs`'s `old_note_for_carrier`
+    // reuses one pre-flight read for its own single write.
+    let old = note_for("decision OLD", 1, 100);
+    let successor_a = note_for("successor A", 2, 200);
+    let successor_b = note_for("successor B", 3, 250);
+    let entity_id_a = spelunk_core::storage::note_entity_id(&successor_a);
+    let entity_id_b = spelunk_core::storage::note_entity_id(&successor_b);
+
+    // Racer A commits first.
+    append_state_update(Some(root), &old, "archived", Some(300), Some(entity_id_a))
+        .await
+        .expect("racer A's state update");
+    // Racer B commits second, having made its own "OLD is active" decision
+    // before racer A's write landed — nothing prevents this today.
+    append_state_update(Some(root), &old, "archived", Some(300), Some(entity_id_b))
+        .await
+        .expect("racer B's state update");
+
+    // The write-side gap: both conflicting state updates actually landed: two
+    // JSON lines both naming OLD's entity_id, with `status: archived`, and two
+    // different `superseded_by_entity_id` values. A closed race would have
+    // rejected the second.
+    let blob = read_raw_note(root);
+    let old_entity_id =
+        spelunk_core::storage::entity_id("decision", "decision OLD", "body for decision OLD");
+    let conflicting_lines = blob
+        .lines()
+        .filter(|l| l.contains(&old_entity_id) && l.contains("\"archived\""))
+        .count();
+    assert_eq!(
+        conflicting_lines, 2,
+        "both racers' conflicting state updates must have landed (the gap this \
+         test documents); got blob: {blob:?}"
+    );
+
+    // What still holds despite the race: the fold's monotonic archival rule
+    // means every reader sees OLD as archived, coherently, exactly once —
+    // never a resurrected active copy, never two entries.
+    let backend = GitNotesBackend::with_root(root.to_path_buf());
+    let all = backend.list(None, 50, true, None).await.expect("list all");
+    let old_entries: Vec<_> = all.iter().filter(|n| n.title == "decision OLD").collect();
+    assert_eq!(
+        old_entries.len(),
+        1,
+        "conflicting copies must still fold to exactly one entry: {all:?}"
+    );
+    assert_eq!(
+        old_entries[0].status, "archived",
+        "must fold to archived regardless of which successor's copy is newer"
+    );
 }

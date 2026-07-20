@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-15
 **Deciders:** founder (Johan); architect
-**Relationship to prior ADRs:** operates strictly inside ADR-010's embedding
+**Relationship to prior ADRs:** operates strictly inside the existing embedding
 split (the server computes vectors, the CLI is the only persistent store for
 index data) and does not reopen it. Extends
 [ADR-068](068-zero-setup-onboarding-git-notes-memory-fallback.md)'s honesty
@@ -51,7 +51,7 @@ tree, and two of them are not what the intake ticket recorded.
    does not store them. The server has no access to the project's SQLite
    database, no notion of which chunks lack embeddings, and no project path. A
    server-side drain loop is not missing, it is **not expressible** without
-   inverting ADR-010. The idle server is correct behaviour, not a bug.
+   inverting that split. The idle server is correct behaviour, not a bug.
 
 4. **Search then declines to fall back.** In `auto` mode the fallback to
    ast-grep on an empty result set is gated on `index_is_stale(&db_path)`, which
@@ -134,13 +134,18 @@ The recovery path has always worked. It was only ever undiscoverable.
 
 Resume granularity is **per batch, not per chunk**. `insert_embeddings` writes
 each batch's rows in a single transaction (matching the `update_graph_ranks`
-batch pattern), so a batch either lands whole or not at all. The queue-durability
-argument holds unchanged: a worker killed mid-batch keeps every batch it had
-already committed, the interrupted batch commits nothing, and the `LEFT JOIN`
-re-queues exactly that batch on the next run, with no duplicate row (the insert
-is keyed on `chunk_id`) and no silent gap. The trade this buys is bounded: the
-worst case on an untimely kill is recomputing one batch's embeddings, capped by
-the calibrated batch size (at most 256 chunks, and usually the smaller
+batch pattern), so a batch either lands whole or not at all. Each row within
+that transaction is written via an atomic delete-then-insert, not a bare
+`INSERT OR REPLACE` — the `embeddings` table is a `vec0` virtual table, which
+does not honour that conflict clause, so a repeated `chunk_id` (within or
+across batches) genuinely replaces the existing row instead of raising a
+UNIQUE-constraint error. The queue-durability argument holds unchanged: a
+worker killed mid-batch keeps every batch it had already committed, the
+interrupted batch commits nothing, and the `LEFT JOIN` re-queues exactly that
+batch on the next run, with no duplicate row (the insert is keyed on
+`chunk_id`) and no silent gap. The trade this buys is bounded: the worst case
+on an untimely kill is recomputing one batch's embeddings, capped by the
+calibrated batch size (at most 256 chunks, and usually the smaller
 duration-calibrated size rather than the ceiling), not unbounded work. This
 supersedes an earlier per-chunk autocommit whose per-row transaction commit
 bought finer resumability than this ADR requires; batching the commits trades
@@ -524,7 +529,7 @@ observation, read by every consumer. That was the right design and it stays.
   work is explicitly the `Device::Cpu` path, where these constants are live.
 - **Cloud or remote embedding.** Trades a GPU-bound constraint for a metered
   network one with no wall-clock win.
-- **Reopening ADR-010.** The server stays stateless with respect to index data.
+- **Reopening the embedding split.** The server stays stateless with respect to index data.
   Every alternative that "just has the server finish the job" is a rewrite of
   the storage boundary, and none of them is needed: the CLI-side worker already
   has the database, the queue, and the resume path.

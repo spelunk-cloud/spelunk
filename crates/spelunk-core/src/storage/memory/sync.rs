@@ -1,4 +1,4 @@
-//! Sync support for the local memory store (ADR-037 D2).
+//! Sync support for the local memory store.
 //!
 //! Identity model. Two stable identifiers bridge the local and cloud stores:
 //!
@@ -20,12 +20,12 @@ use uuid::Uuid;
 
 use super::MemoryStore;
 
-/// A local note prepared for push to the cloud (ADR-037 D2/D3).
+/// A local note prepared for push to the cloud.
 ///
 /// Carries the stable `uuid` (used as the cloud `external_id` / idempotency key)
 /// and **text only** — no embedding vector. The server backfills the embedding
-/// with its configured model (ADR-010/ADR-020 conformance); shipping a local
-/// vector would reintroduce the embedding-space mismatch ADR-020 removed.
+/// with its configured model (embedding-model conformance); shipping a local
+/// vector would reintroduce the embedding-space mismatch that conformance removed.
 #[derive(Debug, Clone)]
 pub struct SyncRow {
     /// Local autoincrement id (for recording the cloud id after a push).
@@ -46,7 +46,7 @@ impl MemoryStore {
     /// Assign a fresh UUIDv7 to `note_id` if it lacks one; return the entry's
     /// UUID. Idempotent. This is the Founder-decided backfill (§3) — a *fresh*
     /// UUIDv7 minted on first sync, not a content-derived UUIDv5 — so identity is
-    /// uniform with cloud-api's UUIDv7 default (ADR-032).
+    /// uniform with cloud-api's UUIDv7 default.
     pub fn ensure_uuid(&self, note_id: i64) -> Result<String> {
         if let Some(existing) = self.uuid_for(note_id)? {
             return Ok(existing);
@@ -103,7 +103,7 @@ impl MemoryStore {
     /// (`push_local`) partitions on `remote_id`/`archived`.
     ///
     /// `include_archived` mirrors the caller's flag; archived rows are still
-    /// returned (as tombstones) when requested so deletes propagate (ADR-037 D2).
+    /// returned (as tombstones) when requested so deletes propagate.
     pub fn rows_for_sync(&self, include_archived: bool) -> Result<Vec<SyncRow>> {
         let status_clause = if include_archived {
             ""
@@ -175,7 +175,7 @@ impl MemoryStore {
     ///
     /// - If a local note already carries this `remote_id` (we pushed it, or we
     ///   pulled it before), reconcile lifecycle only — a cloud tombstone archives
-    ///   the local copy. Content is append-only and never mutated (ADR-005).
+    ///   the local copy. Content is append-only and never mutated.
     /// - Otherwise insert a new local row carrying `remote_id`. Add-Wins /
     ///   keep-both: pulled entries are added, never overwriting local ones.
     ///
@@ -226,7 +226,7 @@ impl MemoryStore {
     }
 
     /// The pull cursor: the max cloud `remote_id` already synced locally
-    /// (ADR-037 D2, decision #183).
+    /// (decision #183).
     ///
     /// `remote_id` holds the cloud-minted UUIDv7 `id`. Because UUIDv7 strings
     /// sort lexically the same as their byte/time order, `MAX(remote_id)` is the

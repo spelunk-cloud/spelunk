@@ -670,7 +670,9 @@ fn run_extraction_end_to_end() {
     let db = common::open_test_db();
 
     // Seed 10 Rust snake_case functions.
-    let rust_file_id = db.upsert_file("src/lib.rs", Some("rust"), "hash1").unwrap();
+    let rust_file_id = db
+        .upsert_file("src/lib.rs", Some("rust"), "hash1", 0)
+        .unwrap();
     for i in 0..10 {
         db.insert_chunk(
             rust_file_id,
@@ -687,7 +689,7 @@ fn run_extraction_end_to_end() {
 
     // Seed 10 TypeScript camelCase functions.
     let ts_file_id = db
-        .upsert_file("src/index.ts", Some("typescript"), "hash2")
+        .upsert_file("src/index.ts", Some("typescript"), "hash2", 0)
         .unwrap();
     for i in 0..10 {
         db.insert_chunk(

@@ -676,11 +676,13 @@ fn coverage_disposition(embedded: i64, total: i64, auto_mode: bool) -> CoverageD
 }
 
 /// One-line warmup notice for a partially-embedded corpus: carries the
-/// coverage percentage AND its shape. The queue drains in indexing order, so
-/// a prefix is the first N files, not a sample across the repo: the user has
-/// a complete picture of some of the codebase and a systematic blind spot
-/// over the rest, and a bare percentage would read as the opposite failure
-/// mode (a uniformly thinner picture of everything).
+/// coverage percentage AND its shape. The queue drains in priority order
+/// (`graph_rank DESC, mtime DESC` — most-referenced code first, then most
+/// recently modified), so a prefix is the most important/recent code, not a
+/// sample across the repo: the user has a complete picture of the code most
+/// likely to matter and a blind spot over the rest, and a bare percentage
+/// would read as the opposite failure mode (a uniformly thinner picture of
+/// everything).
 fn warmup_notice_partial(embedded: i64, total: i64) -> String {
     let pct = if total > 0 {
         (embedded.max(0) as u64).saturating_mul(100) / total as u64
@@ -688,9 +690,9 @@ fn warmup_notice_partial(embedded: i64, total: i64) -> String {
         0
     };
     format!(
-        "[warmup: searchable {embedded}/{total} chunks ({pct}%), front-loaded by indexing \
-         order; a missing result may mean \"not embedded yet\", not \"not in the codebase\" \
-         (check `spelunk status`)]"
+        "[warmup: searchable {embedded}/{total} chunks ({pct}%), front-loaded by importance \
+         and recency; a missing result may mean \"not embedded yet\", not \"not in the \
+         codebase\" (check `spelunk status`)]"
     )
 }
 
@@ -865,10 +867,34 @@ mod tests {
         assert!(n.contains("11813/27734"), "labelled coverage: {n}");
         assert!(n.contains("42%"), "carries the percentage: {n}");
         assert!(
-            n.contains("front-loaded by indexing order"),
+            n.contains("front-loaded by importance and recency"),
             "names the shape so a subsystem miss reads as a blind spot, not a thin sample: {n}"
         );
         assert!(n.contains("spelunk status"), "actionable: {n}");
+    }
+
+    /// Regression guard (spelunk-oss embed-queue reorder): the embed queue's
+    /// `ORDER BY` changed from raw parse/insertion order (`c.id`) to
+    /// `graph_rank DESC, mtime DESC, c.id` — the queue is no longer "the first
+    /// N files walked" in any sense. The warmup notice's copy was corrected to
+    /// "front-loaded by importance and recency" to match; this guards against
+    /// any regression to the stale "indexing order" wording, which described a
+    /// mechanism that no longer exists.
+    ///
+    /// The reorder does not affect the coverage/completeness contract (verified
+    /// above: `coverage_disposition` only ever reads `(embedded, total)`
+    /// counts, never queue order, so "ordering mistaken for completeness" does
+    /// not regress) — this is purely about the notice's user-facing
+    /// *explanation* of the ordering mechanism staying accurate.
+    #[test]
+    fn partial_notice_no_longer_claims_indexing_order_after_the_reorder() {
+        let n = warmup_notice_partial(11_813, 27_734);
+        assert!(
+            !n.contains("indexing order"),
+            "the embed queue is no longer ordered by parse/indexing order since the \
+             recency+graph_rank reorder (ORDER BY c.graph_rank DESC, f.mtime DESC, c.id) — \
+             this notice's copy is stale and describes a mechanism that no longer exists: {n}"
+        );
     }
 
     #[test]

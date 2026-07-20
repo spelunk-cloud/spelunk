@@ -72,7 +72,7 @@ impl MemoryStore {
                 // when the collision resolved to the supersede target itself.
                 return Ok((id, created));
             }
-            self.conn.execute(
+            let changed = self.conn.execute(
                 "UPDATE notes
                  SET    status = 'archived',
                         superseded_by = ?2,
@@ -80,6 +80,14 @@ impl MemoryStore {
                  WHERE  id = ?1 AND status = 'active'",
                 rusqlite::params![supersedes_id, id],
             )?;
+            if changed == 0 {
+                // OLD is absent or already archived (e.g. a prior --supersedes
+                // call already claimed it). Mirrors supersede()'s existing
+                // reject-on-stale-OLD contract (ADR-068 E4): bail so the outer
+                // match rolls the whole transaction back — the just-inserted
+                // new note is never committed and no carrier write happens.
+                anyhow::bail!("No active memory entry with id {supersedes_id} (old).");
+            }
             self.conn.execute(
                 "INSERT OR IGNORE INTO memory_edges (from_id, to_id, kind) VALUES (?1, ?2, 'supersedes')",
                 rusqlite::params![id, supersedes_id],

@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Sync mode (ADR-037 D1)
+// Sync mode
 // ---------------------------------------------------------------------------
 
 /// Persistent, per-project control over where memory reads/writes go and whether
-/// the CLI ever contacts the cloud (ADR-037 D1).
+/// the CLI ever contacts the cloud.
 ///
 /// Replaces the implicit "is the server reachable" branch that previously drove
 /// backend selection. The mode is resolved once from config + environment (see
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// | `cloud_first` | server (error if unreachable) | server (error if unreachable) | required |
 ///
 /// `cloud_first` is the **server-authoritative** option: it is a deliberate
-/// override of ADR-005's local-as-source-of-truth invariant, and an
+/// override of ADR-004's local-as-source-of-truth invariant, and an
 /// unreachable or untrusted server is a hard error. There is no silent local
 /// fallback and no local write queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +74,7 @@ impl SyncMode {
 mod tests {
     use super::*;
 
-    // ── SyncMode parse / as_str (ADR-037 D1) ─────────────────────────────────
+    // ── SyncMode parse / as_str ───────────────────────────────────────────────
 
     #[test]
     fn sync_mode_parse_accepts_canonical_and_variant_forms() {

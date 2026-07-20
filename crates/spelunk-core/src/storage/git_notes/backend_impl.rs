@@ -70,15 +70,21 @@ impl MemoryBackend for GitNotesBackend {
         Err(crate::error::SpelunkError::BackendUnsupported("list_by_source_ref".into()).into())
     }
 
+    /// Folds every commit's records first (`folded_records`), then looks up
+    /// `id` in the *folded* result. A raw unfolded scan would return an
+    /// entity's original record verbatim even after a later state-update
+    /// (e.g. from `append_state_update`) archived it — the folded record
+    /// keeps the original `id` (the earliest-created copy is always
+    /// `fold_group`'s base) but reflects the entity's current `status` and
+    /// `superseded_by_entity_id`, which callers checking "is OLD still
+    /// active" (ADR-068 E4) depend on.
     async fn get(&self, id: i64) -> Result<Option<Note>> {
-        for noted in self.noted_commits().await? {
-            for record in self.read_records(&noted.commit).await? {
-                if record.id == id {
-                    return Ok(Some(record_to_note(record)));
-                }
-            }
-        }
-        Ok(None)
+        Ok(self
+            .folded_records()
+            .await?
+            .into_iter()
+            .find(|record| record.id == id)
+            .map(record_to_note))
     }
 
     async fn count(&self) -> Result<i64> {

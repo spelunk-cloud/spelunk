@@ -45,7 +45,7 @@ src/
 
   config/
     mod.rs             Config struct, loads from ~/.config/spelunk/config.toml
-    sync_mode.rs       SyncMode enum (ADR-037 D1)
+    sync_mode.rs       SyncMode enum: offline / local_first / cloud_first mode selection
     project_id.rs      project-id derivation from git remote / local fallback
     paths.rs           config-dir + project/db discovery
     persist.rs         config.toml / secret-store read-write

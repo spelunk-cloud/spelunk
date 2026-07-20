@@ -548,7 +548,7 @@ async fn test_status_json_includes_tier_fields() {
     assert!(body["capabilities"]["plan"].is_null());
     assert!(!body["capabilities"]["explore"].as_bool().unwrap());
     // With an explicit server_url and no `mode` override, the default is
-    // local_first (ADR-037 D1) even though the tier probe found the server
+    // local_first even though the tier probe found the server
     // reachable: tier and sync mode are independent axes.
     assert_eq!(body["mode"], "local_first", "got: {body}");
 }
@@ -2177,7 +2177,7 @@ async fn test_search_auto_partial_coverage_emits_warmup_notice_on_stderr() {
         "partial coverage must emit the warmup notice, got stderr: {stderr}"
     );
     assert!(
-        stderr.contains("front-loaded by indexing order"),
+        stderr.contains("front-loaded by importance and recency"),
         "the notice must name the prefix shape, got stderr: {stderr}"
     );
     assert!(

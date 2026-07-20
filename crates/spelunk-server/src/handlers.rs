@@ -618,9 +618,9 @@ pub async fn add_note(
 
 /// One entry in a `POST /memory/batch` request. Field-for-field match of the
 /// CLI's `BatchPushItem` (`spelunk-core/src/storage/remote/sync.rs`): the CLI
-/// never sends `embedding` today (its push is text-only, ADR-037 D3), but the
-/// field is accepted when present for forward compatibility with a future
-/// pushed-vector optimization (ADR-053 #4b): the server must not require it.
+/// never sends `embedding` today (its push is text-only), but the
+/// field is accepted when present for forward compatibility with a possible
+/// future pushed-vector optimization: the server must not require it.
 #[derive(Deserialize, ToSchema)]
 pub struct BatchNoteItem {
     pub kind: String,
@@ -1310,6 +1310,41 @@ pub struct EmbedResponse {
     pub chunks: Vec<EmbedChunkOut>,
 }
 
+/// Observability guard for an in-flight `/index/embed` call (GH#631 /
+/// GH#631). Created armed right before the `embed_with_cancel` await and
+/// disarmed right after it returns. If the surrounding handler future is
+/// dropped while still armed  -  client disconnect or the router's
+/// `TimeoutLayer` firing a 408, both of which drop the handler future rather
+/// than running it to completion  -  `Drop` fires instead: it flips the shared
+/// cancellation flag (which `embed_with_cancel` polls from inside its detached
+/// `spawn_blocking` task, the only way to reach in there) and logs the
+/// abandonment, since today the server otherwise cannot distinguish a slow
+/// client from a gone one.
+struct EmbedAbandonGuard {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+    project_id: String,
+    batch_size: usize,
+    started: std::time::Instant,
+}
+
+impl Drop for EmbedAbandonGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                "embed request abandoned: project={} batch_size={} elapsed={:?} \
+                 (client disconnected or server-side timeout fired before the embed \
+                 call returned)",
+                self.project_id,
+                self.batch_size,
+                self.started.elapsed(),
+            );
+        }
+    }
+}
+
 /// Generate embeddings for code chunks. The server encodes each chunk and returns the
 /// vectors. **The server does not store the vectors** — the CLI is the only persistent
 /// store for index data.
@@ -1365,7 +1400,25 @@ pub async fn index_embed(
 
     // Collect texts, preserving order for reassembly.
     let texts: Vec<&str> = body.chunks.iter().map(|c| c.content.as_str()).collect();
-    let vectors = embedder.embed(&texts).await.map_err(AppError::Internal)?;
+
+    // Cancellation seam (GH#631): if this handler's future is
+    // dropped mid-embed  -  client disconnect or the router's `TimeoutLayer`
+    // firing a 408  -  `cancel_guard` drops while still armed and flips
+    // `cancel_flag`, which `embed_with_cancel` polls from inside its detached
+    // `spawn_blocking` task (a plain `.await` drop does not otherwise reach in
+    // there). Disarmed once the embed call returns on its own, so an ordinary
+    // completed request (success or a real embed error) never logs abandonment.
+    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut cancel_guard = EmbedAbandonGuard {
+        cancel: Arc::clone(&cancel_flag),
+        armed: true,
+        project_id: project_id.clone(),
+        batch_size: body.chunks.len(),
+        started: std::time::Instant::now(),
+    };
+    let embed_result = embedder.embed_with_cancel(&texts, cancel_flag).await;
+    cancel_guard.armed = false;
+    let vectors = embed_result.map_err(AppError::Internal)?;
 
     if vectors.len() != body.chunks.len() {
         return Err(AppError::Internal(anyhow::anyhow!(
@@ -3770,6 +3823,562 @@ mod tests {
         );
 
         release_task.await.expect("release task panicked");
+    }
+
+    // ── Embed cancellation on client disconnect / server timeout ─────────────
+    // (GH#631)
+    //
+    // These bind the real router to a real TCP listener and drive it with a
+    // real HTTP client (same style as the TimeoutLayer tests above), so they
+    // prove actual wire behaviour: hyper genuinely drops the in-flight
+    // handler future on disconnect, and that drop must reach into the
+    // embedder's `embed_with_cancel`  -  modeled here via a fake backend since a
+    // real `NativeEmbedder` needs model weights this crate doesn't ship.
+
+    /// An embedder that loops `iterations` times, checking `cancel` before each
+    /// `step`-long sleep and bumping `progress` after it  -  models
+    /// `NativeEmbedder::embed_with_cancel`'s sub-batch loop. Flags
+    /// `observed_cancel` the moment it sees `cancel` set, so a test can assert
+    /// cancellation was actually observed rather than the counter merely
+    /// stopping for an unrelated reason.
+    ///
+    /// Runs the loop in a **detached `tokio::spawn`**, not directly in the
+    /// returned future: this is the load-bearing detail that makes the fake
+    /// reproduce the actual fault rather than paper over it. A plain async
+    /// loop would already stop the instant the handler's future is dropped
+    /// (ordinary Rust cancellation-on-drop  -  exactly how the existing
+    /// `ServerEmbedder` shim behaves, which is why it needs no fix). Dropping
+    /// a `JoinHandle` does **not** abort the task it points to  -  the same
+    /// "detached" property `spawn_blocking` has in `NativeEmbedder`  -  so this
+    /// loop only stops if it observes `cancel` itself, which is exactly what's
+    /// under test.
+    struct CancelAwareEmbedder {
+        iterations: usize,
+        step: std::time::Duration,
+        dim: usize,
+        progress: Arc<std::sync::atomic::AtomicUsize>,
+        observed_cancel: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl spelunk_core::embeddings::EmbeddingBackend for CancelAwareEmbedder {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.embed_with_cancel(texts, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .await
+        }
+
+        async fn embed_with_cancel(
+            &self,
+            texts: &[&str],
+            cancel: Arc<std::sync::atomic::AtomicBool>,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            let iterations = self.iterations;
+            let step = self.step;
+            let n = texts.len();
+            let dim = self.dim;
+            let progress = Arc::clone(&self.progress);
+            let observed_cancel = Arc::clone(&self.observed_cancel);
+
+            let handle = tokio::spawn(async move {
+                for _ in 0..iterations {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        observed_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        anyhow::bail!("embed cancelled");
+                    }
+                    tokio::time::sleep(step).await;
+                    progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(vec![vec![0.0_f32; dim]; n])
+            });
+            handle
+                .await
+                .map_err(|e| anyhow::anyhow!("embed task panicked: {e}"))?
+        }
+
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+    }
+
+    /// **T1 (load-bearing):** a client that disconnects mid-embed (here, via its
+    /// own short request timeout) must stop the embedder's progress  -  not let
+    /// it compute to completion for a result nobody reads. This is also the
+    /// empirical proof that hyper drops the in-flight handler future on
+    /// disconnect: on current main (no cancellation wiring), the fake's
+    /// progress counter keeps advancing to 100 regardless of the client giving
+    /// up, because `index_embed` calls a plain `embed()` with no way to signal
+    /// abandonment into the detached work.
+    #[tokio::test]
+    async fn client_disconnect_stops_embedder_progress() {
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let embedder = super::super::EmbedderSlot::ready(Arc::new(CancelAwareEmbedder {
+            iterations: 100,
+            step: std::time::Duration::from_millis(50),
+            dim: 4,
+            progress: Arc::clone(&progress),
+            observed_cancel: Arc::clone(&observed_cancel),
+        }));
+        // Generous router-level timeouts: the client's own short timeout below
+        // is what triggers the disconnect, not either TimeoutLayer.
+        let (base, _db) = spawn_test_server_with_embed(
+            embedder,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .expect("building client with short timeout");
+        let result = client
+            .post(format!("{base}/v1/projects/timeout-test/index/embed"))
+            .json(&json!({
+                "chunks": [{"chunk_id": "1", "content": "fn f() {}"}],
+            }))
+            .send()
+            .await;
+        assert!(
+            result.is_err(),
+            "the client's own timeout must abort the connection  -  proves a real \
+             disconnect happened, not that the server answered in time"
+        );
+
+        // Let the server notice the closed connection and let the fake's loop
+        // observe the cancellation flag  -  it only checks between 50ms steps,
+        // so a few steps' worth of settling avoids racing the exact instant
+        // cancellation takes effect.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let settled = progress.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let after_wait = progress.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            settled, after_wait,
+            "the embedder must stop making progress once the client disconnects  -  \
+             this counter running on to completion (100) is exactly the measured \
+             fault (GH#631): a batch computed in full for a \
+             result nobody reads"
+        );
+        assert!(
+            observed_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "the embedder must have observed the cancellation flag itself, not just \
+             stopped for some unrelated reason"
+        );
+    }
+
+    /// An embedder that serializes on an internal async mutex (mirroring
+    /// `NativeEmbedder`'s `Arc<Mutex<EmbedderInner>>`) and checks `cancel`
+    /// immediately after acquiring it, before doing any work  -  the "cascade
+    /// killer" check. `iterations_done` is shared across every call through
+    /// this embedder, so if a queued call is cancelled before it starts, it
+    /// contributes nothing to the total.
+    ///
+    /// As with `CancelAwareEmbedder`, the lock-and-loop runs in a **detached
+    /// `tokio::spawn`** so dropping the caller's future (client disconnect)
+    /// doesn't auto-cancel it via ordinary Rust drop semantics  -  only the
+    /// explicit `cancel` check does, matching `NativeEmbedder`'s
+    /// `spawn_blocking`.
+    struct QueuedCancelEmbedder {
+        lock: Arc<tokio::sync::Mutex<()>>,
+        iterations: usize,
+        step: std::time::Duration,
+        dim: usize,
+        iterations_done: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl spelunk_core::embeddings::EmbeddingBackend for QueuedCancelEmbedder {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.embed_with_cancel(texts, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .await
+        }
+
+        async fn embed_with_cancel(
+            &self,
+            texts: &[&str],
+            cancel: Arc<std::sync::atomic::AtomicBool>,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            let lock = Arc::clone(&self.lock);
+            let iterations = self.iterations;
+            let step = self.step;
+            let n = texts.len();
+            let dim = self.dim;
+            let iterations_done = Arc::clone(&self.iterations_done);
+
+            let handle = tokio::spawn(async move {
+                let _guard = lock.lock().await;
+                anyhow::ensure!(
+                    !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                    "cancelled while queued behind another batch  -  zero forward passes done"
+                );
+                for _ in 0..iterations {
+                    anyhow::ensure!(
+                        !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                        "cancelled mid-batch"
+                    );
+                    tokio::time::sleep(step).await;
+                    iterations_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(vec![vec![0.0_f32; dim]; n])
+            });
+            handle
+                .await
+                .map_err(|e| anyhow::anyhow!("embed task panicked: {e}"))?
+        }
+
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+    }
+
+    /// **T2 (queue ghost):** two overlapping requests share the same
+    /// mutex-serialized embedder. The first holds the lock and runs to
+    /// completion; the second is abandoned (client-side timeout) while still
+    /// queued waiting for the lock. Once the lock is handed to it, it must do
+    /// zero forward passes  -  proving the "check immediately after acquiring
+    /// the lock" seam kills a ghost before it does any work, which is what
+    /// stops a live retry from queuing behind a ghost batch (the compounding
+    /// cascade this guards against).
+    #[tokio::test]
+    async fn queued_request_abandoned_while_waiting_does_zero_forward_passes() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let iterations_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        const FIRST_ITERATIONS: usize = 5;
+        const STEP: std::time::Duration = std::time::Duration::from_millis(60);
+
+        let embedder = super::super::EmbedderSlot::ready(Arc::new(QueuedCancelEmbedder {
+            lock: Arc::clone(&lock),
+            iterations: FIRST_ITERATIONS,
+            step: STEP,
+            dim: 4,
+            iterations_done: Arc::clone(&iterations_done),
+        }));
+        let (base, _db) = spawn_test_server_with_embed(
+            embedder,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        // First request: normal client, no timeout  -  must complete, holding
+        // the embedder's internal lock for FIRST_ITERATIONS * STEP.
+        let base_a = base.clone();
+        let first = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_a}/v1/projects/timeout-test/index/embed"))
+                .json(&json!({"chunks": [{"chunk_id": "1", "content": "fn a() {}"}]}))
+                .send()
+                .await
+        });
+
+        // Give the first request time to actually acquire the lock and start
+        // iterating before the second is sent.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Second request: short client timeout that fires while it is still
+        // queued waiting for the lock (well before the first releases it).
+        let second_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(60))
+            .build()
+            .expect("building client with short timeout");
+        let second_result = second_client
+            .post(format!("{base}/v1/projects/timeout-test/index/embed"))
+            .json(&json!({"chunks": [{"chunk_id": "2", "content": "fn b() {}"}]}))
+            .send()
+            .await;
+        assert!(
+            second_result.is_err(),
+            "the second request's own short timeout must abort its connection while \
+             still queued behind the first"
+        );
+
+        let first_result = first
+            .await
+            .expect("first request task panicked")
+            .expect("first request should complete normally (not abandoned)");
+        assert_eq!(
+            first_result.status().as_u16(),
+            200,
+            "the first (non-abandoned) request must complete successfully"
+        );
+
+        // Let the second call's queued `embed_with_cancel` actually get the
+        // lock (freed when the first completed) and observe cancellation.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            iterations_done.load(std::sync::atomic::Ordering::Relaxed),
+            FIRST_ITERATIONS,
+            "the second (abandoned-while-queued) request must contribute zero \
+             forward passes  -  on current main it would run its own \
+             {FIRST_ITERATIONS} iterations once granted the lock, doubling wasted \
+             work instead of being killed by the cascade-killer check"
+        );
+    }
+
+    /// **T3 (server 408):** a server-side timeout (the embed sub-router's own
+    /// `TimeoutLayer`, mirroring `EMBED_REQUEST_TIMEOUT`) must cancel the
+    /// in-flight batch the same way a client disconnect does  -  one fix covers
+    /// both, since both drop the handler future the same way.
+    #[tokio::test]
+    async fn server_side_embed_timeout_cancels_in_flight_batch() {
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let general_timeout = std::time::Duration::from_secs(60);
+        let embed_timeout = std::time::Duration::from_millis(100);
+
+        let embedder = super::super::EmbedderSlot::ready(Arc::new(CancelAwareEmbedder {
+            iterations: 100,
+            step: std::time::Duration::from_millis(50),
+            dim: 4,
+            progress: Arc::clone(&progress),
+            observed_cancel: Arc::clone(&observed_cancel),
+        }));
+        let (base, _db) =
+            spawn_test_server_with_embed(embedder, general_timeout, embed_timeout).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/v1/projects/timeout-test/index/embed"))
+            .json(&json!({
+                "chunks": [{"chunk_id": "1", "content": "fn f() {}"}],
+            }))
+            .send()
+            .await
+            .expect("request should complete (with a timeout status), not hang forever");
+        assert_eq!(
+            resp.status().as_u16(),
+            408,
+            "the embed sub-router's own TimeoutLayer must still fire a 408 (same as \
+             embed_still_times_out_within_its_own_budget above)"
+        );
+
+        // Let the cancellation actually propagate before taking the baseline
+        // sample  -  same settling rationale as `client_disconnect_stops_embedder_progress`.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let settled = progress.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let after_wait = progress.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            settled, after_wait,
+            "a server-side 408 must cancel the in-flight native batch the same way a \
+             client disconnect does  -  on current main the ghost batch keeps computing \
+             after the 408 response is already sent"
+        );
+        assert!(
+            observed_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "the embedder must have observed the cancellation flag after the 408"
+        );
+    }
+
+    /// Edge case: cancellation observed on exactly the **last** iteration of a
+    /// batch  -  the boundary the sub-batch/per-chunk checks are meant to catch
+    /// early elsewhere, but here there is no "next" chunk left to abandon into.
+    /// Deterministic (no HTTP, no timing race): a watcher task flips `cancel`
+    /// as soon as `progress` reaches `ITERATIONS - 2`, i.e. once every chunk
+    /// but the last *two* has completed. That leaves a full iteration's sleep
+    /// (`step`) as slack for the watcher to actually act before the check that
+    /// matters: the loop's own check-then-sleep-then-increment body has no
+    /// `.await` between one iteration's increment and the next iteration's
+    /// check, so a watcher targeting `ITERATIONS - 1` directly can never win
+    /// that race under a single-threaded runtime  -  it would only ever be
+    /// woken up (and act) *after* the following check had already run.
+    /// Targeting one iteration earlier gives the watcher the preceding
+    /// iteration's whole `step` duration to act, so the final iteration is the
+    /// one deterministically guaranteed to observe cancellation. Proves the
+    /// loop bails out cleanly (an `Err`, no panic, no double-counted progress)
+    /// rather than e.g. running one past the check or leaving the
+    /// `JoinHandle` unresolved.
+    #[tokio::test]
+    async fn cancellation_on_last_chunk_completes_cleanly_no_panic() {
+        use spelunk_core::embeddings::EmbeddingBackend;
+
+        const ITERATIONS: usize = 5;
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let embedder = CancelAwareEmbedder {
+            iterations: ITERATIONS,
+            step: std::time::Duration::from_millis(20),
+            dim: 4,
+            progress: Arc::clone(&progress),
+            observed_cancel: Arc::clone(&observed_cancel),
+        };
+
+        let watch_progress = Arc::clone(&progress);
+        let watch_cancel = Arc::clone(&cancel);
+        let watcher = tokio::spawn(async move {
+            loop {
+                if watch_progress.load(std::sync::atomic::Ordering::Relaxed) >= ITERATIONS - 2 {
+                    watch_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let result = embedder
+            .embed_with_cancel(&["fn f() {}"], Arc::clone(&cancel))
+            .await;
+        watcher.await.expect("watcher task panicked");
+
+        assert!(
+            result.is_err(),
+            "cancellation observed on the final chunk must still bail out cleanly \
+             with an error, not silently return a (now-meaningless) success"
+        );
+        assert_eq!(
+            progress.load(std::sync::atomic::Ordering::Relaxed),
+            ITERATIONS - 1,
+            "the final iteration must be the one that observes cancellation and \
+             never runs  -  no off-by-one either completing one extra iteration or \
+             stopping one short"
+        );
+        assert!(
+            observed_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "the embedder must have observed the cancellation flag itself on the \
+             final iteration"
+        );
+    }
+
+    /// Edge case explicitly called out alongside T2: a solo request  -  no
+    /// other batch ever holds the embedder, so there is no queue delay for
+    /// the client's disconnect to race against  -  that is abandoned as early
+    /// as physically possible. This is deliberately **not** asserting zero
+    /// forward passes: `queued_request_abandoned_while_waiting_does_zero_forward_passes`
+    /// (T2, above) proves zero waste specifically for a ghost that loses a
+    /// race for the mutex to a live occupier, because the wait for the lock
+    /// gives the disconnect time to land before the ghost's own check runs.
+    /// A solo request has no such delay to exploit: the mutex-acquire check
+    /// fires essentially instantly, almost certainly before the disconnect
+    /// (which has to round-trip a real TCP close) can possibly have
+    /// propagated, so it inevitably starts its first chunk. What's
+    /// guaranteed here is acceptance criterion #1  -  bounded to at most one
+    /// wasted chunk, then stopped for good  -  not criterion #2's "zero,"
+    /// which is scoped to the queued-behind-another-batch case. This test
+    /// pins that distinction down so it isn't mistaken for a regression
+    /// later.
+    #[tokio::test]
+    async fn solo_request_disconnected_stops_within_one_chunk_no_contention() {
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let embedder = super::super::EmbedderSlot::ready(Arc::new(CancelAwareEmbedder {
+            iterations: 100,
+            // Deliberately long relative to the client's timeout below, so the
+            // first check-before-sleep is essentially certain to run before the
+            // client would ever have given the loop a chance to advance.
+            step: std::time::Duration::from_millis(200),
+            dim: 4,
+            progress: Arc::clone(&progress),
+            observed_cancel: Arc::clone(&observed_cancel),
+        }));
+        let (base, _db) = spawn_test_server_with_embed(
+            embedder,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(10))
+            .build()
+            .expect("building client with short timeout");
+        let result = client
+            .post(format!("{base}/v1/projects/timeout-test/index/embed"))
+            .json(&json!({
+                "chunks": [{"chunk_id": "1", "content": "fn f() {}"}],
+            }))
+            .send()
+            .await;
+        assert!(
+            result.is_err(),
+            "the client's own very short timeout must abort the connection long \
+             before the (much longer) embed loop's first sleep completes"
+        );
+
+        // Settle past the first step so the in-flight (already-started) chunk
+        // finishes, then confirm progress goes no further  -  same
+        // settling rationale as `client_disconnect_stops_embedder_progress`.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let settled = progress.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let after_wait = progress.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            settled, after_wait,
+            "progress must stop for good once cancellation is observed, not merely \
+             pause"
+        );
+        assert!(
+            settled <= 1,
+            "a solo (uncontended) request must be bounded to at most one wasted \
+             chunk's forward pass (acceptance criterion #1)  -  got {settled}"
+        );
+        assert!(
+            observed_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "the embedder must have observed the cancellation flag itself"
+        );
+    }
+
+    /// The abandon guard must be a no-op when dropped already-disarmed (the
+    /// ordinary "request completed" path, success or a real embed error
+    /// alike) — and must be safe to fire on a flag that was *already* true,
+    /// without panicking or otherwise corrupting state. Two independent
+    /// guards sharing one flag is the closest reachable proxy in safe Rust for
+    /// "the guard fires twice": Rust's ownership model makes a literal double
+    /// `Drop::drop` call on one guard instance unreachable, but nothing stops
+    /// two guards (e.g. from two abandonment sources racing) from firing on
+    /// the same shared `Arc<AtomicBool>`.
+    #[test]
+    fn embed_abandon_guard_drop_is_idempotent_when_flag_already_set() {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let disarmed = super::EmbedAbandonGuard {
+            cancel: Arc::clone(&cancel),
+            armed: false,
+            project_id: "p".to_string(),
+            batch_size: 1,
+            started: std::time::Instant::now(),
+        };
+        drop(disarmed);
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "a disarmed guard (the normal completed-request path) must never touch \
+             the flag"
+        );
+
+        let first = super::EmbedAbandonGuard {
+            cancel: Arc::clone(&cancel),
+            armed: true,
+            project_id: "p".to_string(),
+            batch_size: 1,
+            started: std::time::Instant::now(),
+        };
+        drop(first);
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "an armed guard must set the flag on drop"
+        );
+
+        // A second, independent armed guard firing on an already-cancelled flag
+        // must not panic and must leave the flag exactly as-is (true).
+        let second = super::EmbedAbandonGuard {
+            cancel: Arc::clone(&cancel),
+            armed: true,
+            project_id: "p".to_string(),
+            batch_size: 1,
+            started: std::time::Instant::now(),
+        };
+        drop(second);
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "a second armed guard firing on an already-set flag must be idempotent, \
+             not panic or clear it"
+        );
     }
 
     // ── ConcurrencyLimitLayer under concurrent load ───────────────────────────

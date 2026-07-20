@@ -292,7 +292,7 @@ mod tests {
     /// Returns (file_id, caller_id, callee_id).
     fn seed_graph(db: &Database) -> (i64, i64, i64) {
         let file_id = db
-            .upsert_file("src/lib.rs", Some("rust"), "deadbeef")
+            .upsert_file("src/lib.rs", Some("rust"), "deadbeef", 0)
             .expect("upsert file");
         let caller_id = insert_named_chunk(db, file_id, "caller");
         let callee_id = insert_named_chunk(db, file_id, "callee");
@@ -329,7 +329,7 @@ mod tests {
         // Seed a real edge so the table is non-empty and a successful query
         // could in principle return rows — the injection string still must not.
         let file_id = db
-            .upsert_file("src/lib.rs", Some("rust"), "deadbeef")
+            .upsert_file("src/lib.rs", Some("rust"), "deadbeef", 0)
             .expect("upsert file");
         db.insert_chunk(
             file_id,

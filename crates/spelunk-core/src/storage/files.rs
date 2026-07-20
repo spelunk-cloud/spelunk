@@ -12,20 +12,33 @@ pub struct FileRecord {
 }
 
 impl Database {
-    pub fn upsert_file(&self, path: &str, language: Option<&str>, hash: &str) -> Result<i64> {
+    /// Insert or update a file record. `mtime` is the file's filesystem
+    /// modification time in unix seconds (0 when unavailable), persisted so the
+    /// embed queue can order by file recency without re-stat()ing at
+    /// queue-build time. On a hash-unchanged file the caller skips this call
+    /// entirely, so a file's stored mtime is only refreshed when it is
+    /// re-parsed.
+    pub fn upsert_file(
+        &self,
+        path: &str,
+        language: Option<&str>,
+        hash: &str,
+        mtime: i64,
+    ) -> Result<i64> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
 
         self.conn.execute(
-            "INSERT INTO files (path, language, hash, indexed_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO files (path, language, hash, indexed_at, mtime)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET
                 language   = excluded.language,
                 hash       = excluded.hash,
-                indexed_at = excluded.indexed_at",
-            rusqlite::params![path, language, hash, now],
+                indexed_at = excluded.indexed_at,
+                mtime      = excluded.mtime",
+            rusqlite::params![path, language, hash, now, mtime],
         )?;
 
         // ON CONFLICT UPDATE doesn't reset last_insert_rowid; fetch it explicitly.
@@ -42,6 +55,17 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT hash FROM files WHERE path = ?1")?;
+        let mut rows = stmt.query(rusqlite::params![path])?;
+        Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+    }
+
+    /// Returns the stored filesystem mtime (unix secs) for a file path, or None
+    /// if not indexed. The persisted counterpart of the recency key the embed
+    /// queue orders on.
+    pub fn file_mtime(&self, path: &str) -> Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT mtime FROM files WHERE path = ?1")?;
         let mut rows = stmt.query(rusqlite::params![path])?;
         Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
     }

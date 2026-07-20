@@ -102,21 +102,50 @@ pub(super) async fn memory_add(
         .valid_at
         .and_then(|s| super::parse_as_of(Some(&s)).ok().flatten());
 
+    // ── Supersede pre-flight (ADR-068 E4) ────────────────────────────────────
+    // If `--supersedes OLD` is given, OLD must still be active — checked
+    // *before* any write (SQLite or git-notes), on both storage paths,
+    // mirroring `memory supersede`'s existing reject-on-stale-OLD contract.
+    // Without this, the SQL layer's `WHERE status = 'active'` guard on the
+    // archive-OLD UPDATE silently no-ops on a stale OLD, leaving an orphaned
+    // new note plus a conflicting git-notes carrier record — the bug this
+    // amendment closes. The read is reused below by the write-through
+    // carrier instead of reading OLD a second time.
+    let mut backend_for_add: Option<Box<dyn MemoryBackend + Send>> = None;
+    let mut old_note_for_carrier = None;
+    if let Some(old_id) = args.supersedes {
+        let old = if pre_init_notes {
+            GitNotesBackend::new().get(old_id).await?
+        } else {
+            let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
+            let old = backend.get(old_id).await?;
+            backend_for_add = Some(backend);
+            old
+        };
+        match old {
+            Some(note) if note.status == "active" => {
+                old_note_for_carrier = Some(note);
+            }
+            _ => {
+                anyhow::bail!("No active memory entry with id {old_id} (old).");
+            }
+        }
+    }
+
     // Primary store (ADR-004): the local SQLite `memory.db`, an explicit team
     // server, or (with `--backend git-notes`) git notes itself. Pre-init there
     // is no primary; the write-through carrier below is the sole writer, so mint
-    // an id the same way the backends do (`now_millis`).
-    //
-    // The backend handle is kept (not just its returned id) so that, when
-    // `--supersedes` is given, the write-through carrier below can read back
-    // the OLD entry (now archived by the `add` call) and carry its supersede
-    // edge to git notes too.
-    let mut primary_backend: Option<Box<dyn MemoryBackend + Send>> = None;
+    // an id the same way the backends do (`now_millis`). Reuses the backend
+    // opened above for the E4 pre-flight read (`backend_for_add`) instead of
+    // opening it twice.
     let (id, created) = if pre_init_notes {
         (now_millis(), true)
     } else {
-        let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
-        let (id, created) = backend
+        let backend = match backend_for_add.take() {
+            Some(backend) => backend,
+            None => open_memory_backend(cfg, mem_path, backend_override).await?,
+        };
+        backend
             .add(NoteInput {
                 kind: args.kind.clone(),
                 title: title.clone(),
@@ -128,9 +157,7 @@ pub(super) async fn memory_add(
                 valid_at,
                 supersedes: args.supersedes,
             })
-            .await?;
-        primary_backend = Some(backend);
-        (id, created)
+            .await?
     };
 
     // ── Git-notes write-through carrier ──────────────────────────────────────
@@ -214,51 +241,21 @@ pub(super) async fn memory_add(
         // and non-fatal like the write above: SQLite already holds the
         // authoritative archive.
         //
-        // Pre-`init` there is no SQLite primary to re-read OLD from (`primary_backend`
-        // is `None`), but OLD was never in SQLite anyway — it only ever lived in
-        // git notes, via this same write-through, so a fresh `GitNotesBackend`
-        // (its `get` reads purely off `refs/notes/spelunk`, no SQLite involved)
-        // resolves it the same way. Without this, `--supersedes` pre-init used to
-        // silently drop the edge: the block below never ran because
-        // `primary_backend` was always `None`, yet the command still printed a
-        // plain "Stored" success line.
-        if let Some(old_id) = args.supersedes {
-            let old_lookup = if let Some(backend) = primary_backend.as_ref() {
-                backend.get(old_id).await
-            } else {
-                GitNotesBackend::new().get(old_id).await
-            };
-            match old_lookup {
-                Ok(Some(old_note)) => {
-                    let invalid_at = old_note.invalid_at.or_else(|| Some(now_secs()));
-                    if let Err(e) = append_state_update(
-                        None,
-                        &old_note,
-                        "archived",
-                        invalid_at,
-                        Some(new_entity_id),
-                    )
+        // Reuses the pre-flight read above (`old_note_for_carrier`) rather than
+        // re-reading OLD a second time — it was already validated `active`
+        // there, before either write in this function ran (ADR-068 E4).
+        if let Some(old_note) = old_note_for_carrier {
+            let old_id = old_note.id;
+            let invalid_at = old_note.invalid_at.or_else(|| Some(now_secs()));
+            if let Err(e) =
+                append_state_update(None, &old_note, "archived", invalid_at, Some(new_entity_id))
                     .await
-                    {
-                        eprintln!(
-                            "Warning: entry stored locally, but carrying #{old_id}'s \
-                             supersede edge to git notes failed, so it will not travel \
-                             with the repo: {e:#}"
-                        );
-                    }
-                }
-                Ok(None) => {
-                    eprintln!(
-                        "Warning: --supersedes {old_id} not found; no supersede edge was \
-                         carried to git notes."
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: could not re-read #{old_id} to carry its supersede edge \
-                         to git notes: {e:#}"
-                    );
-                }
+            {
+                eprintln!(
+                    "Warning: entry stored locally, but carrying #{old_id}'s \
+                     supersede edge to git notes failed, so it will not travel \
+                     with the repo: {e:#}"
+                );
             }
         }
     }

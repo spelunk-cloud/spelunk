@@ -79,12 +79,24 @@ impl Database {
             usize,
         )>,
     > {
+        // Ordering is data-driven, no cold/warm branching (see spelunk-oss
+        // onboarding embed-queue work):
+        //   - graph_rank DESC leads. On a cold first index every chunk's rank is
+        //     the 0.0 default (rank is written in phase 3, after embed), so this
+        //     key is inert and the order collapses to the next keys. On a warm
+        //     re-index the prior run's ranks put hot code first; newly-added
+        //     chunks (rank 0) naturally sort after under DESC.
+        //   - f.mtime DESC then orders by file recency (most-recently-modified
+        //     first) — the recency signal for a cold index. Legacy/pre-migration
+        //     rows carry mtime 0 and deterministically sort last.
+        //   - c.id is the final deterministic tiebreak.
         let mut stmt = self.conn.prepare_cached(
             "SELECT c.id, c.name, c.metadata, c.summary, c.content, c.token_count
              FROM chunks c
              LEFT JOIN embeddings e ON e.chunk_id = c.id
+             JOIN files f ON f.id = c.file_id
              WHERE e.chunk_id IS NULL
-             ORDER BY c.id",
+             ORDER BY c.graph_rank DESC, f.mtime DESC, c.id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -291,7 +303,7 @@ mod tests {
     /// Insert two chunks and return their ids.
     fn seed_two_chunks(db: &Database) -> (i64, i64) {
         let file_id = db
-            .upsert_file("src/lib.rs", Some("rust"), "deadbeef")
+            .upsert_file("src/lib.rs", Some("rust"), "deadbeef", 0)
             .expect("upsert file");
         let a = db
             .insert_chunk(file_id, "function", Some("a"), 1, 5, "fn a() {}", None, 4)
@@ -300,6 +312,197 @@ mod tests {
             .insert_chunk(file_id, "function", Some("b"), 6, 9, "fn b() {}", None, 4)
             .expect("insert b");
         (a, b)
+    }
+
+    /// Upsert one file at `mtime` (unix secs) and insert a named chunk per entry
+    /// in `names`, returning the chunk ids in insertion order.
+    fn seed_file_chunks(db: &Database, path: &str, mtime: i64, names: &[&str]) -> Vec<i64> {
+        let file_id = db
+            .upsert_file(path, Some("rust"), "h", mtime)
+            .expect("upsert file");
+        names
+            .iter()
+            .map(|n| {
+                db.insert_chunk(file_id, "function", Some(n), 1, 2, "fn x() {}", None, 4)
+                    .expect("insert chunk")
+            })
+            .collect()
+    }
+
+    fn missing_ids(db: &Database) -> Vec<i64> {
+        db.chunks_missing_embeddings()
+            .expect("query missing")
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect()
+    }
+
+    /// Cold index: every `graph_rank` is the 0.0 default, so the embed queue is
+    /// ordered by `files.mtime DESC` (most-recently-modified file first) with
+    /// `chunks.id` breaking ties within a file — and this is deterministic
+    /// across repeated calls on the same data.
+    #[test]
+    fn chunks_missing_embeddings_cold_orders_by_mtime_desc_then_id() {
+        let db = open_db();
+        // Older file seeded first (smaller ids); newer file second.
+        let old = seed_file_chunks(&db, "old.rs", 100, &["a1", "a2"]);
+        let new = seed_file_chunks(&db, "new.rs", 200, &["b1", "b2"]);
+
+        let expected = vec![new[0], new[1], old[0], old[1]];
+        assert_eq!(
+            missing_ids(&db),
+            expected,
+            "recent file's chunks first (mtime DESC), id tiebreak within a file"
+        );
+        // Deterministic across a second identical call.
+        assert_eq!(
+            missing_ids(&db),
+            expected,
+            "queue order is deterministic across runs on the same fixture"
+        );
+    }
+
+    /// Warm re-index: the prior run's `graph_rank DESC` leads (hot code first);
+    /// chunks with no rank yet (`graph_rank = 0`, e.g. newly added) sort after,
+    /// ordered by `mtime DESC`.
+    #[test]
+    fn chunks_missing_embeddings_warm_orders_by_graph_rank_then_mtime() {
+        let db = open_db();
+        let a = seed_file_chunks(&db, "a.rs", 100, &["a1", "a2"]); // older file
+        let b = seed_file_chunks(&db, "b.rs", 200, &["b1", "b2"]); // newer file
+
+        // Prior run populated ranks for a2 and b1 only; a1 and b2 stay at 0.
+        db.update_graph_rank(a[1], 0.9).unwrap();
+        db.update_graph_rank(b[0], 0.5).unwrap();
+
+        // graph_rank DESC: a2(0.9), b1(0.5); then unranked by mtime DESC:
+        // b2 (mtime 200) before a1 (mtime 100).
+        let expected = vec![a[1], b[0], b[1], a[0]];
+        assert_eq!(
+            missing_ids(&db),
+            expected,
+            "graph_rank leads; unranked (rank 0) chunks follow by mtime DESC"
+        );
+    }
+
+    /// Legacy/pre-migration rows carry `mtime = 0` (or `modified()` was
+    /// unavailable). They must not error and must sort deterministically after
+    /// positive mtimes, `chunks.id` breaking ties.
+    #[test]
+    fn chunks_missing_embeddings_legacy_mtime_zero_sorts_last() {
+        let db = open_db();
+        let legacy = seed_file_chunks(&db, "legacy.rs", 0, &["l1", "l2"]);
+        let fresh = seed_file_chunks(&db, "fresh.rs", 200, &["f1", "f2"]);
+
+        let expected = vec![fresh[0], fresh[1], legacy[0], legacy[1]];
+        assert_eq!(
+            missing_ids(&db),
+            expected,
+            "mtime=0 rows sort after positive mtimes, id tiebreak, no error"
+        );
+    }
+
+    /// A bulk-copied file tree (e.g. `cp -r` or a fresh checkout) commonly
+    /// leaves every file with an *identical* mtime, and a cold index leaves
+    /// every chunk's `graph_rank` at the shared `0.0` default. With both
+    /// leading keys tied across many rows, the ordering must not fall through
+    /// to SQLite's unspecified tie-break: `c.id` must fully determine the
+    /// order, identically across repeated calls.
+    #[test]
+    fn chunks_missing_embeddings_many_ties_are_fully_determined_by_id() {
+        let db = open_db();
+        let mut expected = Vec::new();
+        // 6 files, identical mtime, 3 chunks each: 18 rows all tied on
+        // (graph_rank=0.0, mtime=500).
+        for i in 0..6 {
+            let names = ["x", "y", "z"];
+            let ids = seed_file_chunks(&db, &format!("f{i}.rs"), 500, &names);
+            expected.extend(ids);
+        }
+        // Ascending c.id is the only remaining discriminator once graph_rank
+        // and mtime are constant across every row.
+        let mut sorted_expected = expected.clone();
+        sorted_expected.sort();
+        assert_eq!(
+            expected, sorted_expected,
+            "sanity: ids were inserted in ascending order"
+        );
+
+        assert_eq!(
+            missing_ids(&db),
+            expected,
+            "fully-tied rows (graph_rank, mtime) must resolve to ascending c.id"
+        );
+        // Repeat: no run-to-run flake from an underspecified ORDER BY.
+        assert_eq!(
+            missing_ids(&db),
+            expected,
+            "tie-break must be stable across repeated calls, not left to SQLite's whim"
+        );
+    }
+
+    /// Many chunks can share the same *non-zero* `graph_rank` too (e.g. several
+    /// leaf functions PageRank scores to the same value). Ties within a shared
+    /// rank must fall through to `mtime DESC`, then `c.id`, not collapse to an
+    /// arbitrary order.
+    #[test]
+    fn chunks_missing_embeddings_tied_nonzero_rank_falls_back_to_mtime_then_id() {
+        let db = open_db();
+        let a = seed_file_chunks(&db, "a.rs", 100, &["a1", "a2"]);
+        let b = seed_file_chunks(&db, "b.rs", 300, &["b1", "b2"]);
+        let c = seed_file_chunks(&db, "c.rs", 300, &["c1", "c2"]);
+
+        // All six chunks share the same non-zero rank.
+        for id in a.iter().chain(&b).chain(&c) {
+            db.update_graph_rank(*id, 0.42).unwrap();
+        }
+
+        // Tied on rank: mtime DESC groups b/c (300) ahead of a (100); within
+        // the b/c tie (same rank AND same mtime), c.id is the final tiebreak.
+        let expected = vec![b[0], b[1], c[0], c[1], a[0], a[1]];
+        assert_eq!(
+            missing_ids(&db),
+            expected,
+            "a shared non-zero graph_rank must fall back to mtime DESC, then id"
+        );
+    }
+
+    /// A file with a modification time far in the future (clock skew, or a
+    /// deliberately touched file) must sort ahead of every normal-mtime row,
+    /// and the query must not error or panic on a large positive `i64`.
+    #[test]
+    fn chunks_missing_embeddings_future_mtime_sorts_first_no_panic() {
+        let db = open_db();
+        let normal = seed_file_chunks(&db, "normal.rs", 1_000, &["n1"]);
+        // Comfortably in the future (year ~2107) without approaching i64::MAX,
+        // matching what a skewed system clock could plausibly report.
+        let skewed = seed_file_chunks(&db, "skewed.rs", 4_300_000_000, &["s1"]);
+
+        let expected = vec![skewed[0], normal[0]];
+        assert_eq!(
+            missing_ids(&db),
+            expected,
+            "a future/skewed mtime must sort first, not error"
+        );
+    }
+
+    /// A negative mtime (not producible by `stat_mtime`'s own fallback, which
+    /// always yields 0 on failure, but defensive against any other write path)
+    /// must not error the ORDER BY and must sort after both positive and
+    /// zero/legacy mtimes.
+    #[test]
+    fn chunks_missing_embeddings_negative_mtime_sorts_last_no_error() {
+        let db = open_db();
+        let negative = seed_file_chunks(&db, "negative.rs", -100, &["neg"]);
+        let legacy = seed_file_chunks(&db, "legacy.rs", 0, &["leg"]);
+        let fresh = seed_file_chunks(&db, "fresh.rs", 200, &["fr"]);
+
+        let expected = vec![fresh[0], legacy[0], negative[0]];
+        assert_eq!(
+            missing_ids(&db),
+            expected,
+            "DESC ordering must place negative mtime after 0 and positive mtimes, without erroring"
+        );
     }
 
     /// A chunk with no matching `embeddings` row must surface via

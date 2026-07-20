@@ -12,7 +12,7 @@ pub struct Database {
 /// The runner in `Database::open` gates each migration on this via
 /// `PRAGMA user_version`; steps are numbered in the order they run (the field
 /// order), not filename order.
-pub(super) const CURRENT_SCHEMA_VERSION: i32 = 14;
+pub(super) const CURRENT_SCHEMA_VERSION: i32 = 15;
 
 /// One entry in the migration runner: (target version, migration body).
 type MigrationStep = (i32, fn(&Database) -> Result<()>);
@@ -74,6 +74,7 @@ impl Database {
             (12, Self::apply_dim_upgrade_migration),
             (13, Self::apply_drop_snapshots_migration),
             (14, Self::apply_index_meta_migration),
+            (15, Self::apply_file_mtime_migration),
         ];
         debug_assert_eq!(
             steps.last().map(|(v, _)| *v),
@@ -147,8 +148,18 @@ impl Database {
             }
             Ok(false)
         };
+        let files_has_column = |col: &str| -> Result<bool> {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(files)")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                if row.get::<_, String>(1)? == col {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
 
-        let ladder: [(i32, bool); 14] = [
+        let ladder: [(i32, bool); 15] = [
             (1, has_table("chunks")?),
             (2, has_table("embeddings")?),
             (3, has_table("graph_edges")?),
@@ -163,6 +174,7 @@ impl Database {
             (12, has_table("schema_int8_embeddings")?),
             (13, !has_table("snapshots")?),
             (14, has_table("index_meta")?),
+            (15, files_has_column("mtime")?),
         ];
         // Highest version whose predicate and all lower ones hold.
         let mut version = 0;
@@ -359,6 +371,21 @@ impl Database {
         Ok(())
     }
 
+    /// Add the `mtime` column to the files table (unix seconds; recency signal
+    /// for the embed queue). `ALTER TABLE` has no `IF NOT EXISTS`, so only the
+    /// already-applied error is tolerated; a genuine failure propagates.
+    pub fn apply_file_mtime_migration(&self) -> Result<()> {
+        match self
+            .conn
+            .execute_batch(include_str!("../../migrations/024_file_mtime.sql"))
+        {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e).context("running file mtime migration"),
+        }
+        Ok(())
+    }
+
     /// Create the index_meta KV table (embedding provenance). Idempotent.
     pub fn apply_index_meta_migration(&self) -> Result<()> {
         self.conn
@@ -410,21 +437,45 @@ impl Database {
     /// `embeddings` `int8[896]` column (see `embeddings::vec_to_int8_blob`).
     pub fn insert_embedding(&self, chunk_id: i64, vector: &[f32]) -> Result<()> {
         let blob = crate::embeddings::vec_to_int8_blob(vector);
+        // The `embeddings` table is a sqlite-vec `vec0` virtual table, which does
+        // not honour `INSERT OR REPLACE`/`ON CONFLICT`: a second insert for an
+        // existing `chunk_id` raises a hard UNIQUE-constraint error instead of
+        // overwriting. Emulate replace with an explicit delete-then-insert, kept
+        // atomic under one transaction so a repeated `chunk_id` is genuine
+        // last-write-wins (re-embed-on-change, `index --force`). When a caller
+        // already holds a transaction (batch flush) we join it rather than
+        // nesting a BEGIN, which vec0/SQLite would reject.
         // sqlite-vec treats a raw BLOB as float32; vec_int8() reinterprets the
         // bytes as the int8 vector the column expects.
-        self.conn.execute(
-            "INSERT OR REPLACE INTO embeddings (chunk_id, embedding) VALUES (?1, vec_int8(?2))",
-            rusqlite::params![chunk_id, blob],
-        )?;
+        let write = |conn: &Connection| -> rusqlite::Result<()> {
+            conn.execute(
+                "DELETE FROM embeddings WHERE chunk_id = ?1",
+                rusqlite::params![chunk_id],
+            )?;
+            conn.execute(
+                "INSERT INTO embeddings (chunk_id, embedding) VALUES (?1, vec_int8(?2))",
+                rusqlite::params![chunk_id, blob],
+            )?;
+            Ok(())
+        };
+        if self.conn.is_autocommit() {
+            let tx = self.conn.unchecked_transaction()?;
+            write(&tx)?;
+            tx.commit()?;
+        } else {
+            write(&self.conn)?;
+        }
         Ok(())
     }
 
     /// Insert or replace a whole batch of embeddings in a single transaction.
     ///
-    /// Same per-row statement as [`insert_embedding`], but one commit for the
-    /// batch instead of one implicit autocommit per row (mirrors the
-    /// `update_graph_ranks` batch pattern). The embed phase already holds the
-    /// whole batch's vectors in memory by the time it writes them, so the
+    /// Same per-row replace shape as [`insert_embedding`] (the `embeddings`
+    /// vec0 table doesn't honour `INSERT OR REPLACE`, so a repeated
+    /// `chunk_id` is emulated with delete-then-insert), but one commit for
+    /// the whole batch instead of one implicit autocommit per row (mirrors
+    /// the `update_graph_ranks` batch pattern). The embed phase already holds
+    /// the whole batch's vectors in memory by the time it writes them, so the
     /// commit boundary is the batch: on an untimely kill the transaction is
     /// rolled back atomically and `chunks_missing_embeddings` re-queues the
     /// entire batch, never a partial one.
@@ -433,7 +484,11 @@ impl Database {
         for (chunk_id, vector) in rows {
             let blob = crate::embeddings::vec_to_int8_blob(vector);
             tx.execute(
-                "INSERT OR REPLACE INTO embeddings (chunk_id, embedding) VALUES (?1, vec_int8(?2))",
+                "DELETE FROM embeddings WHERE chunk_id = ?1",
+                rusqlite::params![chunk_id],
+            )?;
+            tx.execute(
+                "INSERT INTO embeddings (chunk_id, embedding) VALUES (?1, vec_int8(?2))",
                 rusqlite::params![chunk_id, blob],
             )?;
         }
@@ -456,7 +511,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::{CURRENT_SCHEMA_VERSION, Database};
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OptionalExtension};
     use std::sync::OnceLock;
 
     fn register_sqlite_vec() {
@@ -571,6 +626,164 @@ mod tests {
         );
     }
 
+    /// The `files.mtime` migration is idempotent: applying it to a pre-existing
+    /// (pre-column) index adds the column with default 0 without error, and
+    /// applying it again on an already-migrated DB is a tolerated no-op.
+    #[test]
+    fn file_mtime_migration_is_idempotent() {
+        register_sqlite_vec();
+        let db = Database::open(std::path::Path::new(":memory:")).expect("open");
+
+        let has_mtime = |db: &Database| -> bool {
+            let mut stmt = db.conn.prepare("PRAGMA table_info(files)").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                if row.get::<_, String>(1).unwrap() == "mtime" {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // Fresh DB already has the column from the full migration run.
+        assert!(has_mtime(&db), "fresh DB has the mtime column");
+
+        // Simulate a pre-column index: drop the column, then re-run the migration.
+        db.conn
+            .execute_batch("ALTER TABLE files DROP COLUMN mtime")
+            .expect("drop mtime to simulate a pre-migration index");
+        assert!(!has_mtime(&db), "column dropped to model a legacy index");
+
+        db.apply_file_mtime_migration()
+            .expect("migration must add the column to a pre-column index without error");
+        assert!(has_mtime(&db), "migration re-added the mtime column");
+
+        // A legacy row inserted before the column existed reads back as 0.
+        db.conn
+            .execute(
+                "INSERT INTO files (path, language, hash, indexed_at) VALUES ('legacy.rs', 'rust', 'h', 1)",
+                [],
+            )
+            .unwrap();
+        let mtime: i64 = db
+            .conn
+            .query_row(
+                "SELECT mtime FROM files WHERE path = 'legacy.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mtime, 0, "a row lacking an explicit mtime defaults to 0");
+
+        // Re-applying on the already-migrated DB is a tolerated no-op.
+        db.apply_file_mtime_migration()
+            .expect("re-applying the migration on a migrated DB is a no-op");
+        assert!(has_mtime(&db));
+    }
+
+    /// Exercises the actual legacy-inference rung for this migration (ladder
+    /// entry `(15, files_has_column("mtime"))`), not just the direct
+    /// `apply_file_mtime_migration` idempotency check above. A DB frozen at v14
+    /// (every table/column through `index_meta` present, `files.mtime` not yet
+    /// added, `user_version` reset to 0 — the real shape of an index built by
+    /// the previous binary) must be inferred at exactly 14 through
+    /// `Database::open`'s normal migration runner, and only step 15 must run to
+    /// bring it current.
+    #[test]
+    fn legacy_db_frozen_at_v14_infers_14_and_applies_only_mtime_step() {
+        register_sqlite_vec();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let db = Database::open(tmp.path()).expect("build fully-migrated DB");
+            // Roll back to the pre-024 shape: drop only the mtime column,
+            // leaving every other v1..14 table/column intact, then reset the
+            // version stamp so `Database::open` must re-infer it from shape.
+            db.conn
+                .execute_batch("ALTER TABLE files DROP COLUMN mtime; PRAGMA user_version = 0;")
+                .expect("roll back to pre-mtime shape");
+            assert_eq!(
+                Database::infer_legacy_version(&db).unwrap(),
+                14,
+                "with every v1..14 predicate true and only the mtime rung false, \
+                 inference must land exactly at 14"
+            );
+            // A row inserted while at this legacy shape has no mtime column at
+            // all yet (pre-migration data).
+            db.conn
+                .execute(
+                    "INSERT INTO files (path, language, hash, indexed_at) VALUES ('old.rs', 'rust', 'h', 1)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Reopen through the normal runner (not calling apply_file_mtime_migration
+        // directly): this is the real "agent upgrades the binary" path.
+        let db = Database::open(tmp.path()).expect("reopen legacy v14 DB");
+        assert_eq!(user_version(&db.conn), CURRENT_SCHEMA_VERSION);
+
+        let mtime: i64 = db
+            .conn
+            .query_row("SELECT mtime FROM files WHERE path = 'old.rs'", [], |r| {
+                r.get(0)
+            })
+            .expect("mtime column must exist and be queryable after inferred upgrade");
+        assert_eq!(
+            mtime, 0,
+            "a pre-existing row defaults to mtime 0, not an error"
+        );
+    }
+
+    /// Defends the ladder's early-break behaviour against a hand-tampered /
+    /// corrupted DB where a *later* rung's predicate is true but an *earlier*
+    /// one is false — a state the normal forward-only migration path can never
+    /// produce, but one a manual `ALTER TABLE` (or a hand-restored backup)
+    /// could. `Database::open` must still complete without error or data
+    /// corruption: the ladder takes the lowest satisfied version (ignoring the
+    /// spuriously-true later rung), and every step from there re-applies
+    /// idempotently rather than double-erroring on the already-present column.
+    #[test]
+    fn migration_ladder_tolerates_out_of_order_manually_tampered_state() {
+        register_sqlite_vec();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let db = Database::open(tmp.path()).expect("build fully-migrated DB");
+            // Simulate tampering: drop the `usage` table (rung 9) while
+            // `files.mtime` (rung 15) is left present — a combination the real
+            // forward-only runner would never produce on its own.
+            db.conn
+                .execute_batch("DROP TABLE IF EXISTS usage; PRAGMA user_version = 0;")
+                .expect("tamper: drop usage, keep mtime");
+            assert_eq!(
+                Database::infer_legacy_version(&db).unwrap(),
+                8,
+                "the ladder must break at the first false predicate (rung 9, usage table) \
+                 and ignore the spuriously-true rung 15"
+            );
+        }
+
+        // Reopening must not error even though this replays step 15
+        // (files.mtime already exists) on top of a version-8 inference.
+        let db = Database::open(tmp.path())
+            .expect("reopening a tampered-but-recoverable DB must not error or corrupt state");
+        assert_eq!(user_version(&db.conn), CURRENT_SCHEMA_VERSION);
+
+        let has_usage: bool = db
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(
+            has_usage,
+            "the usage table must be recreated by the replayed step 9"
+        );
+    }
+
     /// Model provenance round-trips through index_meta, and a mismatch is a hard
     /// error while an absent model is backfilled.
     #[test]
@@ -669,28 +882,16 @@ mod tests {
         assert_eq!(embedding_count(&db), 1);
     }
 
-    /// BUG, pre-existing and NOT introduced by this story (found during
-    /// test-hardening; not fixed here — see the story's handback comment):
-    /// `insert_embedding`'s own doc-comment promises "insert or replace", but
-    /// `INSERT OR REPLACE` against the `embeddings` vec0 virtual table does
-    /// not actually replace anything — even here, across two separate,
-    /// fully-autocommitted calls with nothing else in flight, the second call
-    /// raises `UNIQUE constraint failed on embeddings primary key` instead of
-    /// overwriting the first row. sqlite-vec's vec0 module does not honour
-    /// `OR REPLACE` conflict resolution against an already-committed row
-    /// either. This has no observed production impact today only because
-    /// every real caller (`embed_phase.rs`, `parse_phase.rs`) inserts
-    /// exclusively for `chunk_id`s drawn from `chunks_missing_embeddings`
-    /// (never-yet-embedded) or after `delete_embeddings_for_file`, so a
-    /// same-key collision never actually reaches this call. It matters to
-    /// *this* story specifically because the run-level resume test's own
-    /// comment ("`INSERT OR REPLACE` keyed on chunk_id is what makes a
-    /// re-embed idempotent") and the batch engineer's handoff note both cite
-    /// OR-REPLACE idempotency as a safety property to lean on — it is not
-    /// actually true at the DB layer, so neither should keep relying on it as
-    /// stated. Left failing deliberately; do not weaken this assertion.
+    /// Was a bug (see `git blame`/ADR-070): `insert_embedding`'s doc-comment
+    /// promises "insert or replace", but plain `INSERT OR REPLACE` against the
+    /// `embeddings` vec0 virtual table does not honour the conflict clause —
+    /// a second call for the same `chunk_id` raised `UNIQUE constraint
+    /// failed` instead of overwriting. This mattered because the run-level
+    /// resume test's own comment and the batch engineer's handoff note both
+    /// cited OR-REPLACE idempotency as a safety property to lean on. Fixed by
+    /// emulating replace with an explicit delete-then-insert (see
+    /// `insert_embedding`); this test now pins the fixed, promised behaviour.
     #[test]
-    #[ignore = "known bug: INSERT OR REPLACE does not replace on the embeddings vec0 table, tracked separately"]
     fn insert_embedding_single_row_path_does_not_actually_replace_a_repeated_chunk_id() {
         register_sqlite_vec();
         let db = Database::open(std::path::Path::new(":memory:")).expect("open");
@@ -707,15 +908,13 @@ mod tests {
     /// Same underlying bug as the test above, exercised through the batch
     /// path this story added: a batch containing the same `chunk_id` twice
     /// (still legitimate input — nothing in `insert_embeddings`'s contract
-    /// forbids it) hits the identical `UNIQUE constraint failed` error,
-    /// because it is the same OR-REPLACE-against-vec0 gap, not something the
-    /// transaction wrapper introduced. Left failing deliberately; do not
-    /// weaken this assertion to match the buggy behaviour — the fix belongs
-    /// in `insert_embedding`/`insert_embeddings` (e.g. dedup a batch's rows
-    /// keeping the last write, or an explicit delete-then-insert), not in a
-    /// relaxed test.
+    /// forbids it) used to hit the identical `UNIQUE constraint failed`
+    /// error, because it was the same OR-REPLACE-against-vec0 gap, not
+    /// something the transaction wrapper introduced. `insert_embeddings` now
+    /// applies the same delete-then-insert-per-row fix inside its batch
+    /// transaction, so a repeated id within one batch collapses to a single
+    /// last-write-wins row instead of erroring.
     #[test]
-    #[ignore = "known bug: INSERT OR REPLACE does not replace on the embeddings vec0 table, tracked separately"]
     fn insert_embeddings_duplicate_chunk_id_within_one_batch_last_write_wins() {
         register_sqlite_vec();
         let db = Database::open(std::path::Path::new(":memory:")).expect("open");
@@ -940,6 +1139,287 @@ mod tests {
             0,
             "a batch abandoned by a hard process exit before commit must leave zero rows — the \
              literal 'kill mid-batch' scenario, not just an in-process Err short-circuit"
+        );
+    }
+
+    /// Two independent, fully-committed `insert_embedding` calls for the same
+    /// `chunk_id` must leave exactly one row holding the *second* vector — the
+    /// re-embed-on-content-change idempotency the resume/`index --force` paths
+    /// assume. On a `vec0` virtual table plain `INSERT OR REPLACE` silently
+    /// fails to do this (the conflict clause isn't honoured), so this pins the
+    /// delete-then-insert fix.
+    #[test]
+    fn insert_embedding_single_row_path_replaces_a_repeated_chunk_id() {
+        register_sqlite_vec();
+        let db = Database::open(std::path::Path::new(":memory:")).expect("open");
+        let dim = crate::embeddings::EMBEDDING_DIM;
+
+        let mut first = vec![0f32; dim];
+        first[0] = 1.0;
+        let mut second = vec![0f32; dim];
+        second[10] = 1.0;
+
+        db.insert_embedding(1, &first).expect("first insert");
+        db.insert_embedding(1, &second)
+            .expect("second insert (replace)");
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE chunk_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "a repeated chunk_id must leave exactly one row");
+
+        let stored: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT embedding FROM embeddings WHERE chunk_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            crate::embeddings::vec_to_int8_blob(&second),
+            "the second insert must overwrite the first (last-write-wins)"
+        );
+    }
+
+    /// The same duplicate-`chunk_id` sequence inside a single explicit
+    /// transaction (mirroring a batch embed that flushes many rows under one
+    /// `BEGIN`) must also collapse to one last-write-wins row.
+    #[test]
+    fn insert_embedding_duplicate_chunk_id_within_one_transaction_last_write_wins() {
+        register_sqlite_vec();
+        let db = Database::open(std::path::Path::new(":memory:")).expect("open");
+        let dim = crate::embeddings::EMBEDDING_DIM;
+
+        let mut a = vec![0f32; dim];
+        a[1] = 1.0;
+        let mut b = vec![0f32; dim];
+        b[2] = 1.0;
+        let mut c = vec![0f32; dim];
+        c[3] = 1.0;
+
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            db.insert_embedding(7, &a).unwrap();
+            db.insert_embedding(7, &b).unwrap();
+            db.insert_embedding(7, &c).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE chunk_id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "duplicate chunk_ids in one batch collapse to one row"
+        );
+
+        let stored: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT embedding FROM embeddings WHERE chunk_id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            crate::embeddings::vec_to_int8_blob(&c),
+            "the last write in the batch must win"
+        );
+    }
+
+    /// Replacing a `chunk_id` that has never been inserted must be a harmless
+    /// no-op DELETE followed by a normal INSERT — not an error. This is the
+    /// overwhelmingly common real-world call pattern (indexing a chunk for the
+    /// first time), so it must not regress under the delete-then-insert fix.
+    #[test]
+    fn insert_embedding_of_nonexistent_chunk_id_is_a_harmless_delete_no_op() {
+        register_sqlite_vec();
+        let db = Database::open(std::path::Path::new(":memory:")).expect("open");
+        let dim = crate::embeddings::EMBEDDING_DIM;
+
+        let mut vector = vec![0f32; dim];
+        vector[3] = 1.0;
+
+        db.insert_embedding(42, &vector)
+            .expect("inserting a never-before-seen chunk_id must succeed");
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE chunk_id = 42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "the first insert for a fresh id must land exactly once"
+        );
+
+        let stored: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT embedding FROM embeddings WHERE chunk_id = 42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, crate::embeddings::vec_to_int8_blob(&vector));
+    }
+
+    /// The strongest test of "joins the existing transaction" vs. "just happens
+    /// not to error": call `insert_embedding` for a repeated `chunk_id` from
+    /// WITHIN a transaction the caller already opened, then roll that outer
+    /// transaction back. If the delete+insert genuinely joined the caller's
+    /// transaction (rather than, say, silently nesting a SAVEPOINT that
+    /// commits independently), rolling back the outer transaction must undo
+    /// both the delete and the insert, restoring the pre-transaction row
+    /// exactly.
+    #[test]
+    fn insert_embedding_joins_callers_transaction_and_rolls_back_with_it() {
+        register_sqlite_vec();
+        let db = Database::open(std::path::Path::new(":memory:")).expect("open");
+        let dim = crate::embeddings::EMBEDDING_DIM;
+
+        let mut first = vec![0f32; dim];
+        first[0] = 1.0;
+        db.insert_embedding(1, &first)
+            .expect("seed row (autocommit)");
+
+        let mut second = vec![0f32; dim];
+        second[1] = 1.0;
+
+        {
+            let tx = db
+                .conn
+                .unchecked_transaction()
+                .expect("caller opens an outer transaction");
+            assert!(
+                !db.conn.is_autocommit(),
+                "precondition: connection must be mid-transaction, exercising the \
+                 is_autocommit() guard's join branch rather than its own-BEGIN branch"
+            );
+
+            // Must not attempt a nested BEGIN (vec0/SQLite would reject it) —
+            // simply not erroring here already covers that. The real test is
+            // below: did it join *this* transaction, or silently commit on its
+            // own?
+            db.insert_embedding(1, &second)
+                .expect("replacing inside the caller's open transaction must not nest a BEGIN");
+
+            tx.rollback().expect("roll back the outer transaction");
+        }
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE chunk_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "rollback must not leave the row deleted — the DELETE half of the \
+             replace was part of the outer transaction and must roll back with it"
+        );
+
+        let stored: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT embedding FROM embeddings WHERE chunk_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            crate::embeddings::vec_to_int8_blob(&first),
+            "rollback must restore the pre-transaction (first) vector — if the \
+             delete+insert had committed independently of the caller's \
+             transaction, the row would still hold `second` here"
+        );
+    }
+
+    /// The `embeddings` table runs in WAL mode (`Database::open`). A repeated
+    /// `chunk_id` replace is delete-then-insert; if those two statements were
+    /// not wrapped in one atomic transaction, a concurrent reader (e.g. a
+    /// search query racing an index refresh) could observe a window with zero
+    /// rows for that id between the DELETE committing and the INSERT
+    /// committing. Drive many replaces on one connection while a second,
+    /// independent connection continuously polls the row count, and assert
+    /// the reader never observes zero.
+    #[test]
+    fn insert_embedding_replace_has_no_zero_row_window_visible_to_a_concurrent_reader() {
+        register_sqlite_vec();
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path().to_path_buf();
+        let db = Database::open(&path).expect("open file-backed db (WAL mode)");
+        let dim = crate::embeddings::EMBEDDING_DIM;
+
+        let mut seed = vec![0f32; dim];
+        seed[0] = 1.0;
+        db.insert_embedding(1, &seed).expect("seed row");
+
+        let reader = Connection::open(&path).expect("independent reader connection");
+        reader
+            .execute_batch("PRAGMA busy_timeout = 5000;")
+            .expect("reader busy timeout");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_zero = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let iterations_observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop_reader = stop.clone();
+        let saw_zero_reader = saw_zero.clone();
+        let iterations_reader = iterations_observed.clone();
+
+        let reader_thread = std::thread::spawn(move || {
+            while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+                let count: i64 = reader
+                    .query_row(
+                        "SELECT COUNT(*) FROM embeddings WHERE chunk_id = 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect("reader query must not error under WAL");
+                iterations_reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count == 0 {
+                    saw_zero_reader.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+
+        let mut v = vec![0f32; dim];
+        for i in 0..500 {
+            v[i % dim] = 1.0;
+            db.insert_embedding(1, &v).expect("replace");
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader_thread.join().expect("reader thread must not panic");
+
+        assert!(
+            iterations_observed.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "sanity check: the reader must actually have raced the writer"
+        );
+        assert!(
+            !saw_zero.load(std::sync::atomic::Ordering::Relaxed),
+            "a concurrent WAL reader must never observe zero rows for chunk_id=1 \
+             mid-replace — the delete+insert must commit atomically as one \
+             transaction, not as two independently-visible statements"
         );
     }
 }

@@ -3,7 +3,7 @@
 **Status:** Proposed  
 **Date:** 2026-06-19  
 **Deciders:** Architect  
-**Trigger:** ADR-037 P1 implementer flag #2 — cloud-api routes all projects by `Uuid` in path
+**Trigger:** cloud-api routes all projects by `Uuid` in path
 params (`/v1/projects/{project_id}`), but the CLI config carries a human slug
 (`project_id = "my-project"` in `.spelunk/config.toml`). The Founder cannot
 dogfood against `api.spelunk.cloud` without either (a) hand-pasting the UUID

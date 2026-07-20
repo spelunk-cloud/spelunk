@@ -721,20 +721,6 @@ impl GitNotesBackend {
         )
     }
 
-    /// Permissively parse the spelunk records from a commit's note blob.
-    ///
-    /// Sees one commit's blob, so it cannot see a second machine's copy of an
-    /// entity: at differing HEADs the copies land on different commits' notes.
-    /// The entity fold therefore lives in [`Self::collect`], not here.
-    async fn read_records(&self, commit_sha: &str) -> Result<Vec<NoteRecord>> {
-        let blob = self.read_note_blob(commit_sha).await?;
-        let mut records = parse_records(&blob)?;
-        // `cat_sort_uniq` unions lines lexicographically, so after a merge blob
-        // order is not chronological (ADR-069 D2). Stable: ties keep blob order.
-        records.sort_by_key(|r| r.created_at);
-        Ok(records)
-    }
-
     /// Append `record` as a new JSON line to `object`'s note, preserving every
     /// existing line (spelunk records and foreign content) byte-for-byte.
     async fn append_record(&self, object: &str, record: &NoteRecord) -> Result<()> {
@@ -783,17 +769,17 @@ impl GitNotesBackend {
         Ok(changed)
     }
 
-    /// Every entry on the ref, folded to one record per entity, then filtered.
+    /// Every entry on the ref, folded to one record per entity, no filtering
+    /// or limit truncation — the shared basis for `collect()`'s filtered
+    /// listing and `get()`'s single-entity lookup, so both see the same
+    /// folded state (ADR-068 A6/E4): a record's `status`/
+    /// `superseded_by_entity_id` must reflect every state-update appended
+    /// for its entity (e.g. via `append_state_update`), not just whichever
+    /// raw line happens to carry its original numeric `id`.
     ///
     /// The only site that sees every commit's records, so the only site that
     /// can fold an entity's copies together.
-    async fn collect(
-        &self,
-        kind_filter: Option<&str>,
-        include_archived: bool,
-        as_of: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<Note>> {
+    async fn folded_records(&self) -> Result<Vec<NoteRecord>> {
         let blob_shas: Vec<String> = self
             .noted_commits()
             .await?
@@ -808,7 +794,17 @@ impl GitNotesBackend {
 
         // Fold before every filter below. Dropping an archived copy first would
         // leave a surviving active copy to resurrect the entity.
-        let mut folded = fold_records(records);
+        Ok(fold_records(records))
+    }
+
+    async fn collect(
+        &self,
+        kind_filter: Option<&str>,
+        include_archived: bool,
+        as_of: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<Note>> {
+        let mut folded = self.folded_records().await?;
 
         folded.retain(|record| {
             if kind_filter.is_some_and(|k| record.kind != k) {

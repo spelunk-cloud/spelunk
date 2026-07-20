@@ -1355,7 +1355,7 @@
       },
       "BatchNoteItem": {
         "type": "object",
-        "description": "One entry in a `POST /memory/batch` request. Field-for-field match of the\nCLI's `BatchPushItem` (`spelunk-core/src/storage/remote/sync.rs`): the CLI\nnever sends `embedding` today (its push is text-only, ADR-037 D3), but the\nfield is accepted when present for forward compatibility with a future\npushed-vector optimization (ADR-053 #4b): the server must not require it.",
+        "description": "One entry in a `POST /memory/batch` request. Field-for-field match of the\nCLI's `BatchPushItem` (`spelunk-core/src/storage/remote/sync.rs`): the CLI\nnever sends `embedding` today (its push is text-only), but the\nfield is accepted when present for forward compatibility with a possible\nfuture pushed-vector optimization: the server must not require it.",
         "required": [
           "kind",
           "title",

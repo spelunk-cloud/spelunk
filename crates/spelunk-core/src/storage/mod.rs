@@ -74,7 +74,7 @@ pub(super) fn escape_like(s: &str) -> String {
 
 /// Open the appropriate memory backend.
 ///
-/// Selection rule (ADR-004 — one canonical store per project; ADR-037 D1 — the
+/// Selection rule (ADR-004 — one canonical store per project; the
 /// resolved sync mode replaces the implicit "is `server_url` set" branch):
 /// 1. `backend_override = Some("git-notes")` → `GitNotesBackend`.
 /// 2. [`SyncMode::CloudFirst`](crate::config::SyncMode::CloudFirst) **and** an
@@ -85,7 +85,7 @@ pub(super) fn escape_like(s: &str) -> String {
 ///    [`SyncMode::Offline`] (provable no-cloud, even when `server_url` is set;
 ///    the `SPELUNK_NO_SERVER=1` kill-switch resolves here) and the default
 ///    [`SyncMode::LocalFirst`], where reads and writes stay local and the cloud
-///    replica is converged explicitly by `spelunk sync` (ADR-037 D2).
+///    replica is converged explicitly by `spelunk sync`.
 ///
 /// This function keys on the resolved mode plus `cfg.server_url`. An
 /// auto-discovered loopback server is inference-only and routes through
@@ -259,7 +259,7 @@ mod tests {
     }
 }
 
-// ── ADR-037 D1: backend selection honours the resolved sync mode ──────────────
+// ── Backend selection honours the resolved sync mode ──────────────────────────
 
 #[cfg(test)]
 mod backend_selection_tests {

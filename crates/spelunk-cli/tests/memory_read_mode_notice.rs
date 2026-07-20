@@ -1,4 +1,4 @@
-//! Read commands under a configured team `server_url` (ADR-037).
+//! Read commands under a configured team `server_url`.
 //!
 //! With `server_url` set, the default `local_first` mode serves reads from the
 //! local store. That is by design (offline-resilient; the background reconciler

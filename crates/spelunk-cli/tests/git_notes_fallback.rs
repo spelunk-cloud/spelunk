@@ -1189,3 +1189,199 @@ fn pre_init_add_supersedes_carries_edge_for_old_entry() {
         "OLD must gain an archived state-update record even pre-init; got: {lines:?}"
     );
 }
+
+// ── ADR-068 amendment E4: re-supersede of an already-archived OLD is rejected ──
+//
+// `add_note_superseding`'s archive-OLD UPDATE used to silently no-op when OLD
+// was already archived, and neither it nor `add.rs` inspected that outcome —
+// unlike `memory supersede`, which already rejects a stale OLD. These pin the
+// fix: `memory add --supersedes OLD` against an already-archived OLD must now
+// fail the whole command, before any write, on both storage paths.
+
+/// Post-`init` (SQLite primary + git-notes carrier): a second
+/// `--supersedes OLD` against an OLD already archived by a first
+/// `--supersedes OLD` call must fail loudly, write no new note, and leave the
+/// git-notes carrier exactly as the first (successful) call left it — no
+/// orphaned successor record, no second conflicting state-update for OLD.
+#[test]
+fn post_init_add_supersedes_rejects_already_archived_old() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_git_repo_with_commit(repo.path());
+    std::fs::create_dir_all(repo.path().join(".spelunk")).unwrap();
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "old-decision",
+            "--body",
+            "b1",
+        ])
+        .assert()
+        .success();
+    let old_lines = spelunk_note_lines(repo.path());
+    let old_id = record_field(&old_lines[0], "id");
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "successor-a",
+            "--body",
+            "b2",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .success();
+
+    let lines_after_first_supersede = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines_after_first_supersede.len(),
+        3,
+        "setup: OLD's original, successor A's record, OLD's state-update"
+    );
+
+    // Re-supersede the now-archived OLD with a second, different successor.
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "successor-b",
+            "--body",
+            "b3",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "No active memory entry with id {old_id} (old)"
+        )));
+
+    // No new SQLite row: `memory list --archived` still shows only the two
+    // entries from the first (successful) supersede.
+    let list_output = bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "list",
+            "--format",
+            "jsonl",
+            "--archived",
+            "--limit",
+            "100",
+        ])
+        .output()
+        .unwrap();
+    assert!(list_output.status.success());
+    let stdout = String::from_utf8_lossy(&list_output.stdout);
+    let entry_count = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(
+        entry_count, 2,
+        "a rejected --supersedes must not create an orphaned new note row; got: {stdout}"
+    );
+
+    // No new git-notes carrier record either: still exactly the 3 lines the
+    // first, successful supersede produced.
+    let lines_after_rejected_supersede = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines_after_rejected_supersede.len(),
+        3,
+        "a rejected --supersedes must write neither a new-entry record nor a \
+         second conflicting state-update for OLD; got: {lines_after_rejected_supersede:?}"
+    );
+}
+
+/// Pre-`init` (git-notes-only, no SQLite primary): the same rejection, and the
+/// same "write nothing" contract — critically, the new entry's *own*
+/// git-notes record must never be written either, since the pre-flight check
+/// runs before it.
+#[test]
+fn pre_init_add_supersedes_rejects_already_archived_old() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_git_repo_with_commit(repo.path());
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "pre-init-old",
+            "--body",
+            "b1",
+        ])
+        .assert()
+        .success();
+    let old_lines = spelunk_note_lines(repo.path());
+    let old_id = record_field(&old_lines[0], "id");
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "pre-init-successor-a",
+            "--body",
+            "b2",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .success();
+
+    let lines_after_first_supersede = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines_after_first_supersede.len(),
+        3,
+        "setup: OLD's original, successor A's record, OLD's state-update"
+    );
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "pre-init-successor-b",
+            "--body",
+            "b3",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "No active memory entry with id {old_id} (old)"
+        )));
+
+    let lines_after_rejected_supersede = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines_after_rejected_supersede.len(),
+        3,
+        "a rejected pre-init --supersedes must not write successor B's own \
+         record, nor a second state-update for OLD; got: {lines_after_rejected_supersede:?}"
+    );
+    assert!(
+        !lines_after_rejected_supersede
+            .iter()
+            .any(|l| l.contains("pre-init-successor-b")),
+        "successor B's record must never be written when the pre-flight check \
+         rejects the supersede; got: {lines_after_rejected_supersede:?}"
+    );
+}

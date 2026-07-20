@@ -11,4 +11,11 @@ pub enum EmbedError {
 
     #[error("inference failed: {0}")]
     Inference(String),
+
+    /// The caller's cancellation flag was observed set before or during the
+    /// batch. Nobody reads this (the caller already gave up), but a real
+    /// variant keeps the failure mode honest rather than silently discarding
+    /// it  -  see `embed_with_cancel`.
+    #[error("embed cancelled: {completed}/{total} chunks completed before abandonment")]
+    Cancelled { completed: usize, total: usize },
 }

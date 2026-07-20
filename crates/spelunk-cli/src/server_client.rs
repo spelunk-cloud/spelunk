@@ -134,7 +134,7 @@ struct BearerState {
 
 /// State needed to rotate an expired/rejected WorkOS access token.
 ///
-/// Refresh now goes DIRECTLY to WorkOS (ADR-047), so the WorkOS base URL and the
+/// Refresh now goes DIRECTLY to WorkOS, so the WorkOS base URL and the
 /// embedded public `client_id` are carried here alongside the rotating tokens.
 struct RefreshState {
     tokens: AuthTokens,
@@ -210,9 +210,9 @@ impl ServerInferenceClient {
         // Carry WorkOS refresh state only when the resolved bearer came from
         // `[auth]`, i.e. `base_url`'s origin is the cloud kind (ADR-071 D2).
         // A self-hosted server-key / env token is not refreshable here.
-        // Refresh targets WorkOS directly (ADR-047): the WorkOS base URL and
-        // the embedded public client_id (derived from the default cloud
-        // host) are captured here.
+        // Refresh targets WorkOS directly: the WorkOS base URL and the
+        // embedded public client_id (derived from the default cloud host)
+        // are captured here.
         let refresh = cfg
             .auth
             .as_ref()
@@ -302,7 +302,7 @@ impl ServerInferenceClient {
     }
 
     /// Rotate the WorkOS access token DIRECTLY via WorkOS `/authenticate`
-    /// (refresh grant, ADR-047), persist the rotated tokens, and update the
+    /// (refresh grant), persist the rotated tokens, and update the
     /// in-memory bearer.
     ///
     /// Returns `Ok(true)` when a refresh was performed, `Ok(false)` when there
@@ -755,7 +755,7 @@ mod tests {
             .mount(&inference)
             .await;
 
-        // The WorkOS refresh exchange rotates the tokens (ADR-047).
+        // The WorkOS refresh exchange rotates the tokens.
         Mock::given(method("POST"))
             .and(path("/user_management/authenticate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

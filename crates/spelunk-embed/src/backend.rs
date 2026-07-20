@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use anyhow::Result;
 
 /// Trait every embedding backend must implement.
@@ -10,6 +13,24 @@ use anyhow::Result;
 pub trait EmbeddingBackend: Send + Sync {
     /// Embed a batch of text strings. Returns one vector per input.
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+
+    /// Embed a batch, checking `cancel` cooperatively and stopping early
+    /// (returning an error) once it is set. Default delegates to [`Self::embed`]
+    /// and ignores `cancel`  -  correct for any backend whose own work already
+    /// cancels on future drop (e.g. a pure-async HTTP shim). The one backend
+    /// whose work does NOT stop on drop is [`NativeEmbedder`](crate::NativeEmbedder),
+    /// which moves its forward passes into a detached `spawn_blocking` task and
+    /// overrides this method to check the flag from inside that task (see
+    /// GH#631: without this, an abandoned request keeps
+    /// computing to completion).
+    async fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let _ = cancel;
+        self.embed(texts).await
+    }
 
     /// Dimensionality of the output vectors.
     fn dimension(&self) -> usize;

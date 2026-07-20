@@ -1,5 +1,5 @@
 //! `spelunk org switch <org>` — silently re-scope the session to another
-//! organisation without a new device login (ADR-047).
+//! organisation without a new device login.
 //!
 //! Resolves the org argument to its **WorkOS org id** (`org_…`) — that is what
 //! WorkOS's `/authenticate` refresh grant expects in `organization_id`, NOT the
@@ -234,7 +234,7 @@ mod tests {
         );
     }
 
-    // ── switch_org wire-level tests (WorkOS-direct, ADR-047) ──────────────────
+    // ── switch_org wire-level tests (WorkOS-direct) ────────────────────────────
     //
     // `switch_org` makes two calls: cloud-api `GET /v1/me` (slug → UUID) and
     // WorkOS `POST /user_management/authenticate` (refresh grant). Both are

@@ -146,7 +146,7 @@ pub struct Config {
     #[serde(default)]
     pub server_ca: Option<String>,
 
-    /// Sync mode (ADR-037 D1): `offline` / `local_first` / `cloud_first`.
+    /// Sync mode: `offline` / `local_first` / `cloud_first`.
     ///
     /// Stored as `Option` so the serde default can preserve today's behaviour:
     /// when absent, [`Config::resolve_mode`] derives the effective mode from
@@ -216,7 +216,7 @@ pub struct AuthTokens {
     /// Short-lived WorkOS access token, sent as `Authorization: Bearer`.
     pub access_token: String,
     /// Long-lived rotating refresh token. Exchanged directly at WorkOS
-    /// `/user_management/authenticate` (refresh grant, ADR-047) to rotate the
+    /// `/user_management/authenticate` (refresh grant) to rotate the
     /// access token or switch organisation.
     pub refresh_token: String,
     /// Absolute expiry of `access_token`, as a Unix timestamp (seconds).
@@ -406,7 +406,7 @@ impl Config {
         if let Ok(v) = std::env::var("SPELUNK_SERVER_CA") {
             cfg.server_ca = Some(v);
         }
-        // ADR-037 D1: SPELUNK_MODE overrides the configured sync mode. An
+        // SPELUNK_MODE overrides the configured sync mode. An
         // unrecognised value is a hard error — silently falling back to a
         // default would defeat the deterministic-mode guarantee the Founder
         // needs to separate OSS-local test runs from cloud dogfood runs.
@@ -529,7 +529,7 @@ impl Config {
         self.inference_url.as_deref().or(self.server_url.as_deref())
     }
 
-    /// Resolve the effective sync mode (ADR-037 D1).
+    /// Resolve the effective sync mode.
     ///
     /// Precedence (highest first):
     /// 1. `SPELUNK_NO_SERVER=1` (or `true`/`yes`) → [`SyncMode::Offline`] — a hard
@@ -549,7 +549,7 @@ impl Config {
         if let Some(mode) = self.mode {
             return mode;
         }
-        // Default mirrors the pre-ADR-037 implicit behaviour.
+        // Default mirrors the original implicit behaviour, from before the `mode` field existed.
         if self.server_url.is_some() {
             SyncMode::LocalFirst
         } else {
@@ -580,7 +580,7 @@ mod tests {
         }
     }
 
-    // ── resolve_mode defaults (ADR-037 D1) ───────────────────────────────────
+    // ── resolve_mode defaults ─────────────────────────────────────────────────
 
     #[test]
     #[serial_test::serial]
@@ -1083,7 +1083,7 @@ project_id = "team/proj"
         }
     }
 
-    // ── [auth] WorkOS tokens (ADR-045) ───────────────────────────────────────
+    // ── [auth] WorkOS tokens ───────────────────────────────────────────────────
 
     fn sample_tokens() -> AuthTokens {
         AuthTokens {

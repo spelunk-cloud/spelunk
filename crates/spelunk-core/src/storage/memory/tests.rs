@@ -91,6 +91,106 @@ fn supersede_idempotent() {
     );
 }
 
+// ── add_note_superseding() ──────────────────────────────────────────────────
+
+#[test]
+fn add_note_superseding_happy_path_archives_old_and_links_new() {
+    let store = open_store();
+
+    let (old_id, _) = store
+        .add_note("decision", "Old decision", "old body", &[], &[], None, None)
+        .unwrap();
+
+    let (new_id, created) = store
+        .add_note_superseding(
+            "decision",
+            "New decision",
+            "new body",
+            &[],
+            &[],
+            None,
+            old_id,
+        )
+        .unwrap();
+    assert!(
+        created,
+        "a fresh supersede insert must report created = true"
+    );
+
+    let old_note = store.get(old_id).unwrap().expect("old note must exist");
+    assert_eq!(old_note.status, "archived");
+    assert_eq!(old_note.superseded_by, Some(new_id));
+
+    assert_eq!(
+        count_edges(&store, new_id, old_id, "supersedes"),
+        1,
+        "expected exactly one supersedes edge"
+    );
+}
+
+/// ADR-068 amendment E4: re-superseding an already-archived OLD (via a second
+/// `add_note_superseding` call naming a different successor) must reject with
+/// an error and roll back the whole transaction — no orphaned new note, no
+/// second supersedes edge, OLD's existing successor link untouched.
+#[test]
+fn add_note_superseding_rejects_already_archived_old_and_writes_nothing() {
+    let store = open_store();
+
+    let (old_id, _) = store
+        .add_note("decision", "Old decision", "old body", &[], &[], None, None)
+        .unwrap();
+    let (successor_a, _) = store
+        .add_note_superseding("decision", "Successor A", "body a", &[], &[], None, old_id)
+        .unwrap();
+
+    let count_before = store.count().unwrap();
+
+    let result =
+        store.add_note_superseding("decision", "Successor B", "body b", &[], &[], None, old_id);
+    assert!(
+        result.is_err(),
+        "re-superseding an already-archived OLD must error, not silently succeed"
+    );
+
+    assert_eq!(
+        store.count().unwrap(),
+        count_before,
+        "a rejected supersede must not leave an orphaned new note row"
+    );
+
+    let old_note = store.get(old_id).unwrap().expect("old note must exist");
+    assert_eq!(
+        old_note.superseded_by,
+        Some(successor_a),
+        "OLD's successor link must still point at the first, not the rejected second, successor"
+    );
+
+    assert_eq!(
+        count_edges(&store, successor_a, old_id, "supersedes"),
+        1,
+        "the original supersedes edge must be untouched"
+    );
+}
+
+/// Superseding a nonexistent OLD id must also error, not silently create an
+/// unlinked new note (the archive-`OLD` `UPDATE` matches zero rows either way).
+#[test]
+fn add_note_superseding_rejects_nonexistent_old() {
+    let store = open_store();
+    let count_before = store.count().unwrap();
+
+    let result = store.add_note_superseding("decision", "New", "new body", &[], &[], None, 999_999);
+    assert!(
+        result.is_err(),
+        "superseding a nonexistent OLD id must error"
+    );
+    assert_eq!(
+        store.count().unwrap(),
+        count_before,
+        "no note must be created when OLD does not exist"
+    );
+}
+
 // ── add_edge() ───────────────────────────────────────────────────────────────
 
 #[test]
@@ -149,7 +249,7 @@ fn add_edge_duplicate_silently_ignored() {
     );
 }
 
-// ── ADR-037 D2: UUID identity + cursor + idempotent apply ────────────────────
+// ── UUID identity + cursor + idempotent apply ────────────────────────────────
 
 #[test]
 fn ensure_uuid_backfills_and_is_idempotent() {
@@ -185,7 +285,7 @@ fn rows_for_sync_assigns_uuids_and_is_text_only() {
     let rows = store.rows_for_sync(false).unwrap();
     assert_eq!(rows.len(), 2);
     // Every row carries a freshly-assigned UUID; SyncRow has no embedding field
-    // at all (text-only by construction — ADR-037 D3).
+    // at all (text-only by construction).
     for r in &rows {
         assert_eq!(r.uuid.len(), 36);
         assert!(r.remote_id.is_none());
@@ -500,4 +600,157 @@ fn entity_id_migration_backfills_but_does_not_collapse_duplicates() {
     // Idempotent: opening again is a no-op, not a duplicate-column error.
     drop(store);
     MemoryStore::open(&path).expect("re-open must be idempotent");
+}
+
+/// `note_embeddings` is a `vec0` virtual table, so like the code `embeddings`
+/// table it does not honour `INSERT OR REPLACE`: re-embedding an existing
+/// `note_id` must overwrite in place (one last-write-wins row), not error or
+/// duplicate.
+#[test]
+fn insert_embedding_replaces_a_repeated_note_id() {
+    let store = open_store();
+    let (id, _) = store
+        .add_note("note", "N", "b", &[], &[], None, None)
+        .unwrap();
+
+    let dim = crate::embeddings::EMBEDDING_DIM;
+    let mut first = vec![0f32; dim];
+    first[0] = 1.0;
+    let mut second = vec![0f32; dim];
+    second[5] = 1.0;
+
+    store
+        .insert_embedding(id, &crate::embeddings::vec_to_blob(&first))
+        .expect("first note embedding");
+    store
+        .insert_embedding(id, &crate::embeddings::vec_to_blob(&second))
+        .expect("second note embedding (replace)");
+
+    let count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM note_embeddings WHERE note_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "a repeated note_id must leave exactly one row");
+
+    let stored: Vec<u8> = store
+        .conn
+        .query_row(
+            "SELECT embedding FROM note_embeddings WHERE note_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored,
+        crate::embeddings::vec_to_blob(&second),
+        "the second embedding must overwrite the first"
+    );
+}
+
+/// Replacing a `note_id` that has never been embedded must be a harmless
+/// no-op DELETE followed by a normal INSERT, not an error — the common case
+/// of embedding a note for the first time.
+#[test]
+fn insert_embedding_of_nonexistent_note_id_is_a_harmless_delete_no_op() {
+    let store = open_store();
+    let (id, _) = store
+        .add_note("note", "N", "b", &[], &[], None, None)
+        .unwrap();
+
+    let dim = crate::embeddings::EMBEDDING_DIM;
+    let mut vector = vec![0f32; dim];
+    vector[7] = 1.0;
+
+    store
+        .insert_embedding(id, &crate::embeddings::vec_to_blob(&vector))
+        .expect("embedding a never-before-embedded note must succeed");
+
+    let count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM note_embeddings WHERE note_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "the first embed for a fresh note must land exactly once"
+    );
+}
+
+/// The strongest test of "joins the existing transaction" vs. "just happens
+/// not to error": call `insert_embedding` for a repeated `note_id` from
+/// WITHIN a transaction the caller already opened, then roll that outer
+/// transaction back. If the delete+insert genuinely joined the caller's
+/// transaction, rolling it back must undo both halves, restoring the
+/// pre-transaction row exactly.
+#[test]
+fn insert_embedding_joins_callers_transaction_and_rolls_back_with_it() {
+    let store = open_store();
+    let (id, _) = store
+        .add_note("note", "N", "b", &[], &[], None, None)
+        .unwrap();
+
+    let dim = crate::embeddings::EMBEDDING_DIM;
+    let mut first = vec![0f32; dim];
+    first[0] = 1.0;
+    store
+        .insert_embedding(id, &crate::embeddings::vec_to_blob(&first))
+        .expect("seed row (autocommit)");
+
+    let mut second = vec![0f32; dim];
+    second[1] = 1.0;
+
+    {
+        let tx = store
+            .conn
+            .unchecked_transaction()
+            .expect("caller opens an outer transaction");
+        assert!(
+            !store.conn.is_autocommit(),
+            "precondition: connection must be mid-transaction, exercising the \
+             is_autocommit() guard's join branch rather than its own-BEGIN branch"
+        );
+
+        store
+            .insert_embedding(id, &crate::embeddings::vec_to_blob(&second))
+            .expect("replacing inside the caller's open transaction must not nest a BEGIN");
+
+        tx.rollback().expect("roll back the outer transaction");
+    }
+
+    let count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM note_embeddings WHERE note_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "rollback must not leave the row deleted — the DELETE half of the \
+         replace was part of the outer transaction and must roll back with it"
+    );
+
+    let stored: Vec<u8> = store
+        .conn
+        .query_row(
+            "SELECT embedding FROM note_embeddings WHERE note_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored,
+        crate::embeddings::vec_to_blob(&first),
+        "rollback must restore the pre-transaction (first) vector — if the \
+         delete+insert had committed independently of the caller's \
+         transaction, the row would still hold `second` here"
+    );
 }

@@ -1,4 +1,4 @@
-//! Cloud two-way sync wire client (ADR-037 D2/D3).
+//! Cloud two-way sync wire client.
 //!
 //! Wires the CLI's `sync` / `memory pull` commands to cloud-api primitives that
 //! already exist server-side but were previously unreachable from the CLI:
@@ -16,15 +16,15 @@
 //! entries carry the cloud `id` (a UUID), which we record as the local
 //! `remote_id` and dedupe on, so a subsequent push of the same entry is a no-op.
 //!
-//! Embedding conformance (ADR-010/ADR-020, ADR-053): a push is **text-only by
-//! default** — the `vector` field is omitted and the server backfills the
-//! embedding with its configured model. As a compute/bandwidth optimization,
-//! when the destination advertises the `accepts_pushed_vectors` capability the
-//! CLI MAY attach the locally-computed full-precision (fp32/896) vector it
-//! already holds, tagged with the model and precision the accept side
-//! validates. A server without the capability (an older server, or the OSS team
-//! server) never receives a vector and re-embeds — so text-only remains the
-//! universal fallback.
+//! Embedding conformance: a push is **text-only by default** — the `vector`
+//! field is omitted and the server backfills the embedding with its
+//! configured model. As a compute/bandwidth optimization, when the
+//! destination advertises the `accepts_pushed_vectors` capability the CLI MAY
+//! attach the locally-computed full-precision (fp32/896) vector it already
+//! holds, tagged with the model and precision the accept side validates. A
+//! server without the capability (an older server, or the OSS team server)
+//! never receives a vector and re-embeds — so text-only remains the universal
+//! fallback.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -52,9 +52,9 @@ fn pushed_vector_model_tag() -> &'static str {
 ///
 /// `external_id` carries the local entry's stable UUID — the server's
 /// idempotency key. `vector`/`vector_model`/`vector_precision` are the optional
-/// client-pushed embedding fast path (ADR-053 #4b): omitted for a text-only
-/// push (the default), populated only for a server advertising
-/// `accepts_pushed_vectors` via [`BatchPushItem::maybe_attach_vector`].
+/// client-pushed embedding fast path: omitted for a text-only push (the
+/// default), populated only for a server advertising `accepts_pushed_vectors`
+/// via [`BatchPushItem::maybe_attach_vector`].
 #[derive(Debug, Serialize)]
 pub struct BatchPushItem {
     pub kind: String,
@@ -251,7 +251,7 @@ impl CloudSyncClient {
 
     /// Tombstone a cloud entry by its cloud-minted id (`DELETE /memory/{id}`).
     ///
-    /// Propagates a local archive to the cloud (ADR-037 D2). Already-archived or
+    /// Propagates a local archive to the cloud. Already-archived or
     /// missing entries return 404 server-side, which we treat as success (the
     /// desired end state — gone — already holds), keeping the call idempotent.
     pub async fn delete_remote(&self, remote_id: &str) -> Result<()> {
@@ -323,7 +323,7 @@ mod tests {
     }
 
     /// The push is text-only by default, and carries the fp32/896 vector + model
-    /// tag ONLY for a server advertising `accepts_pushed_vectors` (ADR-053 #4b).
+    /// tag ONLY for a server advertising `accepts_pushed_vectors`.
     #[tokio::test]
     async fn push_batch_is_text_only_no_vector() {
         let server = MockServer::start().await;

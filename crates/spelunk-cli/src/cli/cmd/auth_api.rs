@@ -1,6 +1,6 @@
-//! HTTP client for WorkOS-direct device-flow auth (ADR-047).
+//! HTTP client for WorkOS-direct device-flow auth.
 //!
-//! Supersedes the cloud-api `/v1/auth/*` proxy (ADR-045). A live multi-org
+//! Supersedes the cloud-api `/v1/auth/*` proxy. A live multi-org
 //! device login proved every token leg the CLI needs is a WorkOS PUBLIC-CLIENT
 //! exchange — `client_id` only, no secret — so the CLI talks to WorkOS directly
 //! and no longer routes auth through cloud-api.
@@ -403,7 +403,7 @@ pub async fn refresh_token(
 /// runs — every cloud-api call would then `401`. This guard refreshes proactively
 /// when the token is at/past expiry (with a small skew window, see
 /// [`AuthTokens::is_expired`]) using the stored refresh token directly against
-/// WorkOS (refresh grant, ADR-047), persists the rotated tokens to `[auth]`, and
+/// WorkOS (refresh grant), persists the rotated tokens to `[auth]`, and
 /// returns the tokens to use.
 ///
 /// The refresh re-sends `auth.org_id` as `organization_id` so a prior `org

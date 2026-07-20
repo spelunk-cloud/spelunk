@@ -1,5 +1,4 @@
-//! `spelunk sync` and `spelunk memory pull` — two-way local↔cloud memory sync
-//! (ADR-037 D2/D3).
+//! `spelunk sync` and `spelunk memory pull` — two-way local↔cloud memory sync.
 //!
 //! - `pull`: delta-pull from `GET /memory/since?since_id=<cursor>` and apply
 //!   locally. The cursor is the max cloud `remote_id` already synced
@@ -9,7 +8,7 @@
 //!   (batched, not N single POSTs), then pull everything after the cursor and
 //!   apply both.
 //!
-//! Properties (ADR-037 + ADR-005):
+//! Properties:
 //! - **Idempotent.** Identity is the stable UUID; pushes carry it as the cloud
 //!   `external_id` and pulls record the cloud UUID as the local `remote_id` and
 //!   dedupe on it, so re-running never duplicates. Same-millisecond boundary
@@ -20,8 +19,8 @@
 //! - **Lifecycle propagation.** `supersedes` and archive/tombstone state travel
 //!   in both directions (previously hard-coded `None`/dropped).
 //! - **Text-only by default; optional pushed vector.** A push ships no vector
-//!   and the server backfills the embedding (ADR-010/ADR-020) — unless the
-//!   server advertises `accepts_pushed_vectors` (ADR-053 #4b), in which case an
+//!   and the server backfills the embedding (embedding-model conformance) —
+//!   unless the server advertises `accepts_pushed_vectors`, in which case an
 //!   entry with a local fp32/896 embedding carries it so the server stores it
 //!   as-is instead of re-embedding.
 
@@ -207,7 +206,7 @@ pub(super) struct PushSummary {
 /// One-way push entry point reused by `spelunk memory push`.
 ///
 /// `accepts_pushed_vectors` mirrors the destination server's `/v1/health`
-/// capability (ADR-053 #4b): when true, each entry that has a local embedding
+/// capability: when true, each entry that has a local embedding
 /// carries its fp32/896 vector so the server stores it as-is; when false the
 /// push is text-only and the server re-embeds.
 pub(super) async fn push_local_oneway(
@@ -639,7 +638,7 @@ mod tests {
         assert_eq!(store.count().unwrap(), 2);
     }
 
-    // ── pushed-vector fast path (ADR-053 #4b) ──────────────────────────────
+    // ── pushed-vector fast path ─────────────────────────────────────────────
     // A note with a local fp32/896 embedding carries that vector (+ model tag
     // + precision "fp32") to a server advertising `accepts_pushed_vectors`, so
     // the server stores it as-is; against a server without the capability the

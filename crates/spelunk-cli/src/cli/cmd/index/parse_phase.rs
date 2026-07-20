@@ -34,6 +34,21 @@ const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Return `true` (and log a warning) if `path` is over `MAX_FILE_BYTES`,
 /// checked via a `metadata()` call — no file content is read either way.
 /// Callers must skip the file without reading it when this returns `true`.
+/// The file's filesystem modification time as unix seconds, or `0` when it is
+/// unavailable (platform without mtime support, or a stat/timestamp error).
+/// Persisted via `upsert_file` so the embed queue can order by file recency;
+/// `0` sorts last under the queue's `mtime DESC` order — deterministic, never
+/// an error. Only called for files being (re)parsed, so the stat is on
+/// new/changed files, not every walked file.
+fn stat_mtime(path: &std::path::Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn is_file_too_large(path: &std::path::Path, path_str: &str) -> bool {
     match std::fs::metadata(path) {
         Ok(meta) if meta.len() > MAX_FILE_BYTES => {
@@ -412,7 +427,7 @@ fn process_doc_file(
         return Ok(true);
     }
     let chunks = parse_doc(&bytes, path_str, doc_lang);
-    let file_id = db.upsert_file(path_str, Some(doc_lang), &hash)?;
+    let file_id = db.upsert_file(path_str, Some(doc_lang), &hash, stat_mtime(path))?;
     db.delete_embeddings_for_file(file_id)?;
     db.delete_chunks_for_file(file_id)?;
     store_chunks(&chunks, path_str, file_id, db, acc)?;
@@ -448,7 +463,7 @@ fn process_pdf_file(
     }
     match crate::indexer::pdf::extract_pdf_text(path) {
         Ok(pages) => {
-            let file_id = db.upsert_file(path_str, Some("pdf"), &hash)?;
+            let file_id = db.upsert_file(path_str, Some("pdf"), &hash, stat_mtime(path))?;
             db.delete_embeddings_for_file(file_id)?;
             db.delete_chunks_for_file(file_id)?;
             let chunks = pages_to_chunks(pages, path_str);
@@ -525,7 +540,7 @@ fn process_text_file(
         }
     };
 
-    let file_id = db.upsert_file(path_str, Some(language), &hash)?;
+    let file_id = db.upsert_file(path_str, Some(language), &hash, stat_mtime(path))?;
     db.delete_embeddings_for_file(file_id)?;
     db.delete_chunks_for_file(file_id)?;
 
@@ -906,7 +921,9 @@ mod tests {
         use crate::indexer::{Chunk, ChunkKind};
 
         let db = open_db();
-        let file_id = db.upsert_file("src/lib.rs", Some("rust"), "hash0").unwrap();
+        let file_id = db
+            .upsert_file("src/lib.rs", Some("rust"), "hash0", 0)
+            .unwrap();
 
         // Store three chunks the way `store_chunks` does (docstring lives in the
         // metadata JSON), so the reconstructed text is comparable to the
@@ -992,7 +1009,9 @@ mod tests {
     #[test]
     fn missing_embedding_texts_is_empty_when_all_embedded() {
         let db = open_db();
-        let file_id = db.upsert_file("src/lib.rs", Some("rust"), "hash0").unwrap();
+        let file_id = db
+            .upsert_file("src/lib.rs", Some("rust"), "hash0", 0)
+            .unwrap();
         let id = db
             .insert_chunk(file_id, "function", Some("f"), 1, 2, "fn f() {}", None, 1)
             .unwrap();
@@ -1002,6 +1021,182 @@ mod tests {
         assert!(
             missing_embedding_texts(&db).unwrap().is_empty(),
             "a fully-embedded index yields an empty detached embed queue"
+        );
+    }
+
+    // ── mtime capture + recency ordering (onboarding embed queue) ─────────────
+
+    /// Set a file's filesystem modification time to `unix_secs` past the epoch,
+    /// without touching its content (so its content hash is unchanged).
+    fn set_file_mtime(path: &std::path::Path, unix_secs: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    /// `stat_mtime` on a path that cannot be `stat()`'d (doesn't exist —
+    /// stands in for any metadata-read failure, e.g. a permission error or a
+    /// virtual/generated path with no real inode) must fall back to `0`
+    /// rather than panicking or erroring the whole parse phase. `0` is the
+    /// same sentinel a pre-migration row carries and sorts last,
+    /// deterministically, under the queue's `mtime DESC` order.
+    #[test]
+    fn stat_mtime_nonexistent_path_falls_back_to_zero() {
+        let missing = std::path::Path::new("/nonexistent/definitely-not-a-real-path.rs");
+        assert_eq!(
+            stat_mtime(missing),
+            0,
+            "an unstattable path must fall back to 0, not panic"
+        );
+    }
+
+    /// A file with a modification time before the Unix epoch (a corrupted
+    /// filesystem timestamp, or a container/VM with a badly-skewed clock) makes
+    /// `SystemTime::duration_since(UNIX_EPOCH)` return `Err`. `stat_mtime` must
+    /// still fall back to `0` rather than panicking on the `i64` conversion.
+    #[test]
+    fn stat_mtime_pre_epoch_time_falls_back_to_zero_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("ancient.rs");
+        std::fs::write(&f, "pub fn ancient() {}\n").unwrap();
+        let pre_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(100);
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(pre_epoch)
+            .unwrap();
+
+        assert_eq!(
+            stat_mtime(&f),
+            0,
+            "a pre-epoch mtime must fall back to 0, not panic on the i64 cast"
+        );
+    }
+
+    /// A file whose mtime is far in the future (clock skew, or a deliberately
+    /// forward-touched file) must be read back verbatim as a large positive
+    /// `i64`, without overflow or panic on the `u64 -> i64` cast.
+    #[test]
+    fn stat_mtime_far_future_time_returns_positive_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("future.rs");
+        std::fs::write(&f, "pub fn future() {}\n").unwrap();
+        // Year ~2107 — comfortably future without approaching u64/i64 bounds.
+        set_file_mtime(&f, 4_300_000_000);
+
+        assert_eq!(
+            stat_mtime(&f),
+            4_300_000_000,
+            "a far-future mtime must round-trip verbatim, not overflow or panic"
+        );
+    }
+
+    /// A parsed file stores its filesystem mtime in `files.mtime`, and the
+    /// DB-driven embed queue (the exact path the detached `--_embed-phases`
+    /// worker rebuilds from) orders the resulting chunks by that recency on a
+    /// cold index (all graph_rank still 0): the more-recently-modified file's
+    /// chunks come first. Drives the real production parse path end-to-end.
+    #[test]
+    fn parse_captures_mtime_and_queue_orders_by_recency() {
+        use indicatif::MultiProgress;
+
+        let db = open_db();
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("older.rs");
+        let newer = dir.path().join("newer.rs");
+        std::fs::write(&older, "pub fn older_fn() {}\n").unwrap();
+        std::fs::write(&newer, "pub fn newer_fn() {}\n").unwrap();
+        set_file_mtime(&older, 1_000);
+        set_file_mtime(&newer, 2_000);
+
+        let args = default_args(dir.path().to_path_buf());
+        let mp = MultiProgress::new();
+        let cfg = crate::config::Config::default();
+        run_parse_phase(dir.path(), &db, &args, &mp, &cfg).expect("parse phase");
+
+        // (a) mtime captured verbatim per file.
+        assert_eq!(db.file_mtime("older.rs").unwrap(), Some(1_000));
+        assert_eq!(db.file_mtime("newer.rs").unwrap(), Some(2_000));
+
+        // (b) the DB-driven queue emits every newer-file chunk before any
+        // older-file chunk — recency first.
+        let queue_ids: Vec<i64> = missing_embedding_texts(&db)
+            .expect("queue")
+            .iter()
+            .map(|(id, ..)| *id)
+            .collect();
+        let newer_ids: Vec<i64> = db
+            .chunks_for_file("newer.rs")
+            .unwrap()
+            .iter()
+            .map(|c| c.chunk_id)
+            .collect();
+        let older_ids: Vec<i64> = db
+            .chunks_for_file("older.rs")
+            .unwrap()
+            .iter()
+            .map(|c| c.chunk_id)
+            .collect();
+        assert!(
+            !newer_ids.is_empty() && !older_ids.is_empty(),
+            "both files chunked"
+        );
+        let last_newer = queue_ids
+            .iter()
+            .rposition(|id| newer_ids.contains(id))
+            .expect("newer chunks queued");
+        let first_older = queue_ids
+            .iter()
+            .position(|id| older_ids.contains(id))
+            .expect("older chunks queued");
+        assert!(
+            last_newer < first_older,
+            "all newer-file chunks must precede older-file chunks: {queue_ids:?}"
+        );
+    }
+
+    /// A hash-unchanged file is skipped on re-parse, so its stored mtime is NOT
+    /// refreshed even when the file's filesystem mtime changed (a plain touch).
+    /// Retention falls out of the skip path never calling `upsert_file`.
+    #[test]
+    fn unchanged_file_retains_stored_mtime_on_reindex() {
+        use indicatif::MultiProgress;
+
+        let db = open_db();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("keep.rs");
+        std::fs::write(&f, "pub fn keep() {}\n").unwrap();
+        set_file_mtime(&f, 1_000);
+
+        let args = default_args(dir.path().to_path_buf());
+        let mp = MultiProgress::new();
+        let cfg = crate::config::Config::default();
+
+        let r1 = run_parse_phase(dir.path(), &db, &args, &mp, &cfg).expect("run 1");
+        assert!(r1.indexed >= 1);
+        assert_eq!(
+            db.file_mtime("keep.rs").unwrap(),
+            Some(1_000),
+            "run 1 stores the file's filesystem mtime"
+        );
+
+        // Touch the file's mtime WITHOUT changing its content: the hash is
+        // identical, so the re-parse hash-skips it.
+        set_file_mtime(&f, 5_000);
+        let r2 = run_parse_phase(dir.path(), &db, &args, &mp, &cfg).expect("run 2");
+        assert_eq!(
+            r2.indexed, 0,
+            "unchanged content → the file is hash-skipped, not reparsed"
+        );
+        assert_eq!(
+            db.file_mtime("keep.rs").unwrap(),
+            Some(1_000),
+            "a skipped file's stored mtime is retained, not overwritten with the new FS mtime"
         );
     }
 

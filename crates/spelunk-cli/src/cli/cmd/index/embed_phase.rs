@@ -1239,7 +1239,9 @@ mod tests {
     fn seed_chunks(n: usize) -> (Database, Vec<i64>) {
         register_sqlite_vec();
         let db = Database::open(std::path::Path::new(":memory:")).expect("open in-memory DB");
-        let file_id = db.upsert_file("src/lib.rs", Some("rust"), "hash0").unwrap();
+        let file_id = db
+            .upsert_file("src/lib.rs", Some("rust"), "hash0", 0)
+            .unwrap();
         let ids = (0..n)
             .map(|i| {
                 db.insert_chunk(

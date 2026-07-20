@@ -332,10 +332,30 @@ impl MemoryStore {
     }
 
     pub fn insert_embedding(&self, note_id: i64, blob: &[u8]) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO note_embeddings (note_id, embedding) VALUES (?1, ?2)",
-            rusqlite::params![note_id, blob],
-        )?;
+        // `note_embeddings` is a sqlite-vec `vec0` virtual table, which does not
+        // honour `INSERT OR REPLACE`/`ON CONFLICT` — a repeated `note_id` raises
+        // a hard UNIQUE-constraint error instead of overwriting. Emulate replace
+        // with an atomic delete-then-insert so re-embedding a note is genuine
+        // last-write-wins. When a caller already holds a transaction we join it
+        // rather than nesting a BEGIN, which vec0/SQLite would reject.
+        let write = |conn: &rusqlite::Connection| -> rusqlite::Result<()> {
+            conn.execute(
+                "DELETE FROM note_embeddings WHERE note_id = ?1",
+                rusqlite::params![note_id],
+            )?;
+            conn.execute(
+                "INSERT INTO note_embeddings (note_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![note_id, blob],
+            )?;
+            Ok(())
+        };
+        if self.conn.is_autocommit() {
+            let tx = self.conn.unchecked_transaction()?;
+            write(&tx)?;
+            tx.commit()?;
+        } else {
+            write(&self.conn)?;
+        }
         Ok(())
     }
 

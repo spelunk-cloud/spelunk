@@ -81,7 +81,7 @@ pub fn remove_server_key_from(config_path: &Path) -> Result<()> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// `[auth]` table persistence (WorkOS device-flow tokens, ADR-045)
+// `[auth]` table persistence (WorkOS device-flow tokens)
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Persist WorkOS tokens to the `[auth]` table of `~/.config/spelunk/config.toml`.

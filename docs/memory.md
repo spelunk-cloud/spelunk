@@ -60,6 +60,14 @@ ref is fetched and merged. This works identically before and after `spelunk
 init`: a clone that never received the new entry still renders the old one as
 archived, just without a name for what replaced it.
 
+Both `--supersedes <old-id>` and `memory supersede` require OLD to currently
+be active: superseding an entry that is already archived (for example,
+running `--supersedes` a second time against the same OLD) fails with an
+error — "No active memory entry with id `<old-id>` (old)." — rather than
+silently succeeding, on both storage paths (pre- and post-`init`). This
+prevents two different, conflicting supersede records from being written for
+the same old entry.
+
 **Before `spelunk init`**, `memory add` and `memory list` still work when you are
 inside a git repository: with no `.spelunk/` project, `add` rides the same
 write-through carrier (there is no SQLite primary yet) and `list` reads entries

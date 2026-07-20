@@ -133,7 +133,7 @@ impl MemoryStore {
         self.conn
             .execute_batch(include_str!("../../../migrations/015_memory_edges.sql"))
             .context("running memory edges migration")?;
-        // Migration 020 (ADR-037): UUID identity columns (`uuid`, `remote_id`).
+        // Migration 020: UUID identity columns (`uuid`, `remote_id`) for cloud sync.
         // ALTER TABLE can't be IF NOT EXISTS; guard the duplicate-column case so
         // re-opening an already-migrated store is a no-op. The unique indexes are
         // CREATE … IF NOT EXISTS and safe to run unconditionally.
