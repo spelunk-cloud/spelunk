@@ -84,9 +84,9 @@ impl MemoryStore {
     /// Insert a note and return `(id, created)`. `created` is `true` when a
     /// genuinely new row was inserted, `false` when the insert collided with
     /// an existing row's `entity_id` (only possible once `idx_notes_entity_id`
-    /// has been promoted to UNIQUE — see `entity_id_migration.rs`) and that
+    /// has been promoted to UNIQUE, see `entity_id_migration.rs`) and that
     /// existing row was reused instead. Does not store an embedding on a fresh
-    /// insert — call `insert_embedding` afterwards if the embedder is available.
+    /// insert; call `insert_embedding` afterwards if the embedder is available.
     #[allow(clippy::too_many_arguments)]
     pub fn add_note(
         &self,
@@ -123,7 +123,7 @@ impl MemoryStore {
     /// from the source store. All other callers should use `add_note`, which
     /// defers to the SQLite `DEFAULT (unixepoch())`.
     ///
-    /// Returns `(id, created)` — see `add_note` for what `created` means.
+    /// Returns `(id, created)`, see `add_note` for what `created` means.
     #[allow(clippy::too_many_arguments)]
     pub fn add_note_with_created_at(
         &self,
@@ -165,7 +165,7 @@ impl MemoryStore {
     /// existing row, merging `tags` and `linked_files` into it (add-wins, via
     /// the existing `union_tags_and_files`), and returning its id with
     /// `created = false`. Does **not** touch `status` or `superseded_by` on
-    /// this path — mirrors `reconcile.rs`'s own handling of an existing-row
+    /// this path, mirrors `reconcile.rs`'s own handling of an existing-row
     /// collision, not `dedupe.rs`'s fuller merge (which collapses two rows
     /// that already diverged in the store, a different scenario from a single
     /// fresh insert colliding with one existing row).
