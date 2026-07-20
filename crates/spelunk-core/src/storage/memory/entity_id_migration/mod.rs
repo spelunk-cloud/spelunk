@@ -12,10 +12,10 @@
 //!   fail on a constraint (migration 023's index starts non-unique). But
 //!   Step A and Step B both run on **every** `MemoryStore::open`, not just
 //!   the first, so on a later open (index already promoted UNIQUE by a
-//!   prior Step B) a row that reaches Step A still `entity_id IS NULL` — from
-//!   any insert path that has its own identity gap, e.g. a pre-fix
-//!   `add_note_superseding` row or the still-open `apply_remote_note` gap
-//!   (ADR-068 fifth amendment E3) — can collide with an existing row's
+//!   prior Step B), a row that reaches Step A still `entity_id IS NULL`
+//!   (from any insert path with its own identity gap, e.g. a pre-fix
+//!   `add_note_superseding` row, or the still-open `apply_remote_note` gap,
+//!   ADR-068 fifth amendment E3) can collide with an existing row's
 //!   computed `entity_id`. ADR-068's fifth amendment (E2) hardens Step A's
 //!   per-row `UPDATE` to catch that collision and skip the row (leaving it
 //!   `NULL` for a future `dedupe`-then-retry) rather than hard-failing
@@ -45,12 +45,12 @@ impl MemoryStore {
     ///
     /// ADR-068 fifth amendment (E2): once a prior open has promoted
     /// `idx_notes_entity_id` to UNIQUE, this per-row `UPDATE` can collide with
-    /// an existing row's `entity_id` (see the module doc comment for how such
-    /// a row can exist). On that specific collision, skip the row — leave it
-    /// `NULL` and log one actionable warning naming it and pointing at
-    /// `spelunk memory dedupe` — rather than propagating the error and
-    /// hard-failing `MemoryStore::open`. Any other error from the `UPDATE`
-    /// still propagates unchanged.
+    /// an existing row's `entity_id` (see the module doc for how such a row
+    /// can exist). On that specific collision, skip the row, leave it `NULL`
+    /// and log one actionable warning naming it and pointing at `spelunk
+    /// memory dedupe`, rather than propagating the error and hard-failing
+    /// `MemoryStore::open`. Any other error from the `UPDATE` still
+    /// propagates unchanged.
     pub(super) fn backfill_entity_ids(&self) -> Result<()> {
         let rows: Vec<(i64, String, String, String)> = {
             let mut stmt = self

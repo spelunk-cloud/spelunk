@@ -15,23 +15,22 @@ impl MemoryStore {
     /// Insert a note in a transaction that also sets `invalid_at` on the
     /// superseded entry.
     ///
-    /// Returns `(id, created)` — see `MemoryStore::add_note` for what
+    /// Returns `(id, created)`, see `MemoryStore::add_note` for what
     /// `created` means. ADR-068's fifth amendment (E1): this INSERT
-    /// populates `entity_id` exactly like `add_note`/`add_note_with_created_at`,
+    /// populates `entity_id` just like `add_note`/`add_note_with_created_at`,
     /// so it is subject to the same UNIQUE constraint once
-    /// `idx_notes_entity_id` is promoted, and gets the same insert-then-recover
-    /// handling (reusing `recover_from_entity_id_collision` from `notes.rs`,
-    /// not reimplemented). On a collision, the *existing* row's id is what
-    /// the archive-`OLD` step below targets, not a fresh one.
+    /// `idx_notes_entity_id` is promoted, and reuses the same
+    /// `recover_from_entity_id_collision`. On a collision, the *existing*
+    /// row's id is what the archive-`OLD` step below targets, not a fresh one.
     ///
-    /// A collision can resolve to `supersedes_id` itself: a caller
+    /// A collision can resolve to `supersedes_id` itself (a caller
     /// superseding `old_id` with content byte-identical to `old_id`'s own
-    /// `{kind,title,body}`. When that happens there is nothing to archive
-    /// and no edge to add — the "new" entry already *is* that row — so both
-    /// steps are skipped and the row is returned unchanged (`created =
-    /// false`, tags/linked_files already merged by the recovery above); a
-    /// self-loop of exactly the shape `dedupe.rs`'s own self-edge guard
-    /// exists to prevent, reached via this path instead.
+    /// `{kind,title,body}`). Then there is nothing to archive and no edge to
+    /// add, since the "new" entry already is that row, so both steps are
+    /// skipped and the row is returned unchanged (`created = false`,
+    /// tags/linked_files already merged by the recovery above): a self-loop
+    /// of exactly the shape `dedupe.rs`'s own self-edge guard exists to
+    /// prevent, reached via this path instead.
     #[allow(clippy::too_many_arguments)]
     pub fn add_note_superseding(
         &self,
@@ -82,7 +81,7 @@ impl MemoryStore {
                 // OLD is absent or already archived (e.g. a prior --supersedes
                 // call already claimed it). Mirrors supersede()'s existing
                 // reject-on-stale-OLD contract (ADR-068 E4): bail so the outer
-                // match rolls the whole transaction back — the just-inserted
+                // match rolls the whole transaction back, so the just-inserted
                 // new note is never committed and no carrier write happens.
                 anyhow::bail!("No active memory entry with id {supersedes_id} (old).");
             }

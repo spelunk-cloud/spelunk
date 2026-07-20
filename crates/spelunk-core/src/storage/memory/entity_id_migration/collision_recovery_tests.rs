@@ -372,7 +372,7 @@ fn add_note_superseding_recovers_from_collision_and_archives_old_on_existing_row
         .unwrap();
     assert_eq!(
         total_rows, 2,
-        "no new row must have been created by the collision — still just \
+        "no new row must have been created by the collision, still just \
          `existing` and (now-archived) `old`"
     );
 
@@ -393,7 +393,7 @@ fn add_note_superseding_recovers_from_collision_and_archives_old_on_existing_row
 }
 
 // Criterion 4: pre-promotion, add_note_superseding must keep creating
-// distinct rows for identical content — mirrors add_note's own criterion
+// distinct rows for identical content, mirrors add_note's own criterion
 // 29 for this function.
 #[test]
 fn add_note_superseding_before_promotion_still_inserts_distinct_rows() {
@@ -423,7 +423,7 @@ fn add_note_superseding_before_promotion_still_inserts_distinct_rows() {
 }
 
 // Criterion 5: an error other than the specific notes.entity_id UNIQUE
-// violation must propagate unchanged — exercised here via a
+// violation must propagate unchanged, exercised here via a
 // `supersedes_id` that doesn't reference any row at all, which the
 // `memory_edges` foreign key rejects. This is a different SQLite error
 // entirely (FOREIGN KEY, not UNIQUE on notes.entity_id), so it must not
@@ -569,22 +569,18 @@ fn backfill_still_populates_non_colliding_rows_alongside_a_colliding_one() {
     );
 }
 
-// ── Test-engineer adversarial round: self-supersede collision ───────────
-//
-// `add_note_superseding`'s collision-recovery path (criterion 3) was only
-// ever exercised with the colliding "existing" row being a THIRD row,
-// distinct from both the freshly-superseded OLD row and the new content.
-// Nothing stops a caller from superseding `old_id` with content that is
-// byte-identical to `old_id`'s OWN `{kind,title,body}` — e.g. `spelunk
-// memory add --supersedes <id>` invoked with the same title/body as the
-// entry it names. Post-promotion, the INSERT then collides with `old_id`
-// itself: `recover_from_entity_id_collision` looks up the existing row by
-// `entity_id` and finds `old_id`, so `existing_id == supersedes_id`. The
-// archive-OLD UPDATE then runs `SET status='archived', superseded_by=?2
-// WHERE id=?1` with `?1 = ?2 = old_id`: a row would archive itself and
-// set its own `superseded_by` to its own `id`, a self-loop of exactly the
-// shape `dedupe.rs`'s own self-edge guard exists to prevent, but on the
-// supersede path rather than the collapse path.
+// Test-engineer adversarial: self-supersede collision. Criterion 3's
+// collision-recovery path was only ever exercised with the colliding
+// "existing" row being a THIRD row, distinct from both OLD and the new
+// content. Nothing stops a caller from superseding `old_id` with content
+// byte-identical to `old_id`'s OWN `{kind,title,body}` (e.g. `spelunk
+// memory add --supersedes <id>` with the same title/body as the entry it
+// names). Post-promotion, the INSERT then collides with `old_id` itself:
+// `recover_from_entity_id_collision` finds `old_id`, so `existing_id ==
+// supersedes_id`. The archive-OLD UPDATE then runs with `?1 = ?2 =
+// old_id`: a row would archive itself and point `superseded_by` at its
+// own id, a self-loop of exactly the shape `dedupe.rs`'s own self-edge
+// guard exists to prevent, but reached via the supersede path.
 #[test]
 fn add_note_superseding_self_collision_does_not_create_self_referential_archived_row() {
     let store = open_store();
@@ -621,7 +617,7 @@ fn add_note_superseding_self_collision_does_not_create_self_referential_archived
     let (returned_id, created) = result.unwrap();
     assert_eq!(
         returned_id, old_id,
-        "the collision resolves to old_id itself — there is only one row \
+        "the collision resolves to old_id itself, there is only one row \
          with this content"
     );
     assert!(!created, "a collision is never a fresh insert");
@@ -631,7 +627,7 @@ fn add_note_superseding_self_collision_does_not_create_self_referential_archived
         row.superseded_by,
         Some(old_id),
         "BUG: a self-supersede collision must not leave a row pointing \
-         superseded_by at its own id — this is a self-loop of the exact \
+         superseded_by at its own id, this is a self-loop of the exact \
          shape dedupe.rs's own self-edge guard exists to prevent, just \
          reached via the supersede path instead of the collapse path"
     );

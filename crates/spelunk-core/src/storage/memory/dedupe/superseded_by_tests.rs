@@ -943,19 +943,15 @@ fn duplicate_group_built_via_add_note_superseding_repoints_old_rows_to_survivor(
     );
 }
 
-// ── Test-engineer adversarial round: Step A's collision-skip
-// (entity_id_migration.rs) leaves a colliding row's
-// `entity_id` column NULL rather than erroring. `dedupe_entity_ids`
-// itself never reads that stored column — `note_entity_id` recomputes
-// fresh from `{kind,title,body}` on every call (see `entity_id.rs`) — so
-// a row Step A was forced to skip is still discoverable and collapsible
-// by `spelunk memory dedupe`, exactly the recovery path the fifth
-// amendment's warning message ("run `spelunk memory dedupe` to collapse
-// them") promises. This proves that promise end to end rather than
-// trusting the two mechanisms compose from reading each in isolation:
-// the skipped row is also, simultaneously, the target of an unrelated
-// row's `superseded_by` — the exact "a row that's simultaneously a
-// supersede target" scenario Step A's hardening was written to survive.
+// Test-engineer adversarial: Step A's collision-skip leaves a colliding
+// row's `entity_id` column NULL rather than erroring. `dedupe_entity_ids`
+// never reads that stored column, `note_entity_id` recomputes fresh from
+// `{kind,title,body}` on every call, so a row Step A was forced to skip
+// is still discoverable and collapsible by `spelunk memory dedupe`,
+// exactly the recovery path the fifth amendment's warning message
+// promises. Proves that end to end, with the skipped row simultaneously
+// the target of an unrelated row's `superseded_by`, the exact
+// "supersede target" scenario Step A's hardening was written to survive.
 #[test]
 fn step_a_skipped_row_that_is_a_supersede_target_is_still_collapsed_by_dedupe() {
     let store = open_store();
@@ -978,7 +974,7 @@ fn step_a_skipped_row_that_is_a_supersede_target_is_still_collapsed_by_dedupe() 
 
     // A stray NULL-entity_id row colliding with `existing_id` (simulating
     // a pre-E1 add_note_superseding row, or any other latent NULL-id
-    // insert path) — bypasses add_note's own recovery entirely.
+    // insert path): bypasses add_note's own recovery entirely.
     store
         .conn
         .execute(
@@ -1034,7 +1030,7 @@ fn step_a_skipped_row_that_is_a_supersede_target_is_still_collapsed_by_dedupe() 
         store.get(pointer_id).unwrap().unwrap().superseded_by,
         Some(existing_id),
         "pointer_id's edge to the now-deleted stray row must be \
-         repointed to the survivor — proving the promised \
+         repointed to the survivor, proving the promised \
          Step-A-skip-then-dedupe recovery path actually closes the loop"
     );
 }
