@@ -90,7 +90,7 @@ fn add_note_after_promotion_does_not_hard_crash_on_duplicate_content() {
         "criterion 30: the bool must be false for a reused row"
     );
 
-    // Only one row exists — no phantom second insert survived underneath
+    // Only one row exists: no phantom second insert survived underneath
     // the recovery path.
     assert_eq!(
         store.count().unwrap(),
@@ -145,7 +145,7 @@ fn add_note_after_promotion_merges_tags_and_linked_files_into_existing_row() {
 }
 
 // Criterion 27: the collision path must not touch status or superseded_by
-// on the existing row — mirrors reconcile.rs's own existing-row handling,
+// on the existing row, mirrors reconcile.rs's own existing-row handling,
 // not dedupe.rs's fuller merge (a different scenario: collapsing two rows
 // that already diverged, not a single fresh insert colliding with one).
 #[test]
