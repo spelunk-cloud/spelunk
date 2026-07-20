@@ -882,7 +882,7 @@ fn duplicate_group_built_via_add_note_superseding_repoints_old_rows_to_survivor(
         .add_note("decision", "old two", "old body two", &[], &[], None, None)
         .unwrap();
 
-    let (new1, _) = store
+    let (new1, created1) = store
         .add_note_superseding(
             "decision",
             "dup replacement",
@@ -893,7 +893,8 @@ fn duplicate_group_built_via_add_note_superseding_repoints_old_rows_to_survivor(
             old1,
         )
         .unwrap();
-    let (new2, _) = store
+    assert!(created1, "pre-promotion: fresh row");
+    let (new2, created2) = store
         .add_note_superseding(
             "decision",
             "dup replacement",
@@ -904,11 +905,12 @@ fn duplicate_group_built_via_add_note_superseding_repoints_old_rows_to_survivor(
             old2,
         )
         .unwrap();
-    assert_ne!(
-        new1, new2,
+    assert!(
+        created2,
         "pre-promotion: identical content still creates a second, \
          distinct row (the duplicate-group precondition for this test)"
     );
+    assert_ne!(new1, new2);
 
     // Precondition: each OLD row now points at its own distinct
     // successor — new1 and new2, which are themselves a duplicate group.
