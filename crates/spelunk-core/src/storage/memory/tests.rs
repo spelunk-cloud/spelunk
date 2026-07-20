@@ -101,7 +101,7 @@ fn add_note_superseding_happy_path_archives_old_and_links_new() {
         .add_note("decision", "Old decision", "old body", &[], &[], None, None)
         .unwrap();
 
-    let new_id = store
+    let (new_id, created) = store
         .add_note_superseding(
             "decision",
             "New decision",
@@ -112,6 +112,10 @@ fn add_note_superseding_happy_path_archives_old_and_links_new() {
             old_id,
         )
         .unwrap();
+    assert!(
+        created,
+        "a fresh supersede insert must report created = true"
+    );
 
     let old_note = store.get(old_id).unwrap().expect("old note must exist");
     assert_eq!(old_note.status, "archived");
@@ -135,7 +139,7 @@ fn add_note_superseding_rejects_already_archived_old_and_writes_nothing() {
     let (old_id, _) = store
         .add_note("decision", "Old decision", "old body", &[], &[], None, None)
         .unwrap();
-    let successor_a = store
+    let (successor_a, _) = store
         .add_note_superseding("decision", "Successor A", "body a", &[], &[], None, old_id)
         .unwrap();
 

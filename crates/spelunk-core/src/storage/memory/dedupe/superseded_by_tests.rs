@@ -882,7 +882,7 @@ fn duplicate_group_built_via_add_note_superseding_repoints_old_rows_to_survivor(
         .add_note("decision", "old two", "old body two", &[], &[], None, None)
         .unwrap();
 
-    let new1 = store
+    let (new1, _) = store
         .add_note_superseding(
             "decision",
             "dup replacement",
@@ -893,7 +893,7 @@ fn duplicate_group_built_via_add_note_superseding_repoints_old_rows_to_survivor(
             old1,
         )
         .unwrap();
-    let new2 = store
+    let (new2, _) = store
         .add_note_superseding(
             "decision",
             "dup replacement",
@@ -938,6 +938,102 @@ fn duplicate_group_built_via_add_note_superseding_repoints_old_rows_to_survivor(
         Some(new1),
         "old1's own edge already pointed at the survivor and must be \
          unaffected"
+    );
+}
+
+// ── Test-engineer adversarial round: Step A's collision-skip
+// (entity_id_migration.rs) leaves a colliding row's
+// `entity_id` column NULL rather than erroring. `dedupe_entity_ids`
+// itself never reads that stored column — `note_entity_id` recomputes
+// fresh from `{kind,title,body}` on every call (see `entity_id.rs`) — so
+// a row Step A was forced to skip is still discoverable and collapsible
+// by `spelunk memory dedupe`, exactly the recovery path the fifth
+// amendment's warning message ("run `spelunk memory dedupe` to collapse
+// them") promises. This proves that promise end to end rather than
+// trusting the two mechanisms compose from reading each in isolation:
+// the skipped row is also, simultaneously, the target of an unrelated
+// row's `superseded_by` — the exact "a row that's simultaneously a
+// supersede target" scenario Step A's hardening was written to survive.
+#[test]
+fn step_a_skipped_row_that_is_a_supersede_target_is_still_collapsed_by_dedupe() {
+    let store = open_store();
+    let (existing_id, _) = store
+        .add_note(
+            "decision",
+            "dup entry",
+            "same content",
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+    store.promote_entity_id_unique_index().unwrap();
+    assert!(
+        index_is_unique_for_test(&store),
+        "precondition: index promoted"
+    );
+
+    // A stray NULL-entity_id row colliding with `existing_id` (simulating
+    // a pre-E1 add_note_superseding row, or any other latent NULL-id
+    // insert path) — bypasses add_note's own recovery entirely.
+    store
+        .conn
+        .execute(
+            "INSERT INTO notes (kind, title, body) VALUES ('decision', 'dup entry', 'same content')",
+            [],
+        )
+        .unwrap();
+    let stray_id = store.conn.last_insert_rowid();
+
+    // A third, unrelated row whose superseded_by points AT the stray
+    // row: the stray is simultaneously a supersede target.
+    let (pointer_id, _) = store
+        .add_note("note", "points at stray", "b", &[], &[], None, None)
+        .unwrap();
+    store.set_superseded_by(pointer_id, stray_id).unwrap();
+
+    // Step A must skip the stray row without error.
+    store
+        .backfill_entity_ids()
+        .expect("Step A must not hard-fail on the collision");
+    let stray_eid: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT entity_id FROM notes WHERE id = ?1",
+            rusqlite::params![stray_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stray_eid, None,
+        "precondition: Step A left the colliding row's entity_id NULL"
+    );
+
+    // `spelunk memory dedupe` must still find and collapse it, even
+    // though the stored `entity_id` column never got populated: it
+    // recomputes entity_id from {kind,title,body}, not from the column.
+    let summary = store.dedupe_entity_ids(false).unwrap();
+    assert_eq!(
+        summary.duplicate_groups, 1,
+        "dedupe must discover the group despite the stray row's NULL \
+         stored entity_id column"
+    );
+    assert_eq!(summary.rows_collapsed, 1);
+    assert!(
+        store.get(existing_id).unwrap().is_some(),
+        "existing_id (earlier-created) survives"
+    );
+    assert!(
+        store.get(stray_id).unwrap().is_none(),
+        "the stray row is collapsed away"
+    );
+    assert_eq!(
+        store.get(pointer_id).unwrap().unwrap().superseded_by,
+        Some(existing_id),
+        "pointer_id's edge to the now-deleted stray row must be \
+         repointed to the survivor — proving the promised \
+         Step-A-skip-then-dedupe recovery path actually closes the loop"
     );
 }
 

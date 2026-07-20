@@ -128,11 +128,7 @@ impl MemoryBackend for LocalMemoryBackend {
         let tags: Vec<&str> = input.tags.iter().map(String::as_str).collect();
         let files: Vec<&str> = input.linked_files.iter().map(String::as_str).collect();
         let (id, created) = if let Some(supersedes_id) = input.supersedes {
-            // `add_note_superseding` doesn't populate `entity_id` at insert
-            // time today, so it cannot hit the UNIQUE-collision path
-            // `add_note` recovers from below; every call here is a fresh
-            // insert.
-            let id = store.add_note_superseding(
+            store.add_note_superseding(
                 &input.kind,
                 &input.title,
                 &input.body,
@@ -140,8 +136,7 @@ impl MemoryBackend for LocalMemoryBackend {
                 &files,
                 input.valid_at,
                 supersedes_id,
-            )?;
-            (id, true)
+            )?
         } else {
             store.add_note(
                 &input.kind,

@@ -1,5 +1,7 @@
-//! ADR-068 fourth amendment coverage: `add_note`'s insert-then-recover
-//! behavior once `idx_notes_entity_id` is promoted to UNIQUE.
+//! ADR-068 fourth and fifth amendment coverage: `add_note`/
+//! `add_note_superseding` insert-then-recover behavior once
+//! `idx_notes_entity_id` is promoted to UNIQUE, and Step A's own
+//! per-row collision skip.
 
 use super::test_support::*;
 
@@ -277,4 +279,415 @@ fn add_note_other_error_propagates_unchanged_not_swallowed_as_collision() {
         .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
         .unwrap();
     assert_eq!(total_rows, 0, "a failed insert must leave no row behind");
+}
+
+// ── ADR-068 fifth amendment E1: add_note_superseding gains entity_id ────
+
+// Criterion 1/2: a supersede-created row gets a non-NULL entity_id equal
+// to entity_id(kind, title, body), the INSERT succeeds normally when
+// there's no collision, and the archive-OLD UPDATE runs against the
+// freshly-inserted row.
+#[test]
+fn add_note_superseding_sets_entity_id_and_archives_old_on_fresh_insert() {
+    let store = open_store();
+    let (old_id, _) = store
+        .add_note("decision", "old", "old body", &[], &[], None, None)
+        .unwrap();
+
+    let (new_id, created) = store
+        .add_note_superseding("decision", "new", "new body", &[], &[], None, old_id)
+        .unwrap();
+    assert!(created, "criterion 2: a fresh row inserts normally");
+
+    let expected_eid = crate::storage::entity_id::entity_id("decision", "new", "new body");
+    let stored_eid: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT entity_id FROM notes WHERE id = ?1",
+            rusqlite::params![new_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_eid,
+        Some(expected_eid),
+        "criterion 1: entity_id must be entity_id(kind, title, body)"
+    );
+
+    let old = store.get(old_id).unwrap().expect("old row still exists");
+    assert_eq!(old.status, "archived");
+    assert_eq!(
+        old.superseded_by,
+        Some(new_id),
+        "archive-OLD must target the freshly-inserted row"
+    );
+}
+
+// Criterion 3: a collision with an existing row's entity_id (post-
+// promotion) must not error; tags/linked_files merge into the existing
+// row via union_tags_and_files, and archive-OLD targets the EXISTING row.
+#[test]
+fn add_note_superseding_recovers_from_collision_and_archives_old_on_existing_row() {
+    let store = open_store();
+    let (existing_id, _) = store
+        .add_note(
+            "decision",
+            "dup entry",
+            "same content",
+            &["alpha"],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+    store.promote_entity_id_unique_index().unwrap();
+    assert!(index_is_unique(&store), "precondition: index promoted");
+
+    let (old_id, _) = store
+        .add_note("decision", "to retire", "b", &[], &[], None, None)
+        .unwrap();
+
+    let (returned_id, created) = store
+        .add_note_superseding(
+            "decision",
+            "dup entry",
+            "same content",
+            &["beta"],
+            &[],
+            None,
+            old_id,
+        )
+        .unwrap();
+    assert!(
+        !created,
+        "criterion 3: a colliding insert must report created=false"
+    );
+    assert_eq!(
+        returned_id, existing_id,
+        "criterion 3: the EXISTING row's id must be returned, not a new one"
+    );
+    let total_rows: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        total_rows, 2,
+        "no new row must have been created by the collision — still just \
+         `existing` and (now-archived) `old`"
+    );
+
+    let existing = store.get(existing_id).unwrap().unwrap();
+    assert_eq!(
+        existing.tags,
+        vec!["alpha".to_string(), "beta".to_string()],
+        "tags must union via union_tags_and_files, add-wins"
+    );
+
+    let old = store.get(old_id).unwrap().expect("old row still exists");
+    assert_eq!(old.status, "archived");
+    assert_eq!(
+        old.superseded_by,
+        Some(existing_id),
+        "criterion 3: archive-OLD must target the EXISTING row, not a new one"
+    );
+}
+
+// Criterion 4: pre-promotion, add_note_superseding must keep creating
+// distinct rows for identical content — mirrors add_note's own criterion
+// 29 for this function.
+#[test]
+fn add_note_superseding_before_promotion_still_inserts_distinct_rows() {
+    let store = open_store();
+    assert!(!index_is_unique(&store), "precondition: not yet promoted");
+
+    let (old_id, _) = store
+        .add_note("decision", "old", "old body", &[], &[], None, None)
+        .unwrap();
+    let (first_id, first_created) = store
+        .add_note_superseding("decision", "dup", "body", &[], &[], None, old_id)
+        .unwrap();
+
+    let (old_id2, _) = store
+        .add_note("decision", "old2", "old body2", &[], &[], None, None)
+        .unwrap();
+    let (second_id, second_created) = store
+        .add_note_superseding("decision", "dup", "body", &[], &[], None, old_id2)
+        .unwrap();
+
+    assert!(first_created);
+    assert!(
+        second_created,
+        "pre-promotion, identical content must still create distinct rows"
+    );
+    assert_ne!(first_id, second_id);
+}
+
+// Criterion 5: an error other than the specific notes.entity_id UNIQUE
+// violation must propagate unchanged — exercised here via a
+// `supersedes_id` that doesn't reference any row at all, which the
+// `memory_edges` foreign key rejects. This is a different SQLite error
+// entirely (FOREIGN KEY, not UNIQUE on notes.entity_id), so it must not
+// be swallowed by the collision-recovery path: it must propagate as an
+// error, and the whole transaction must roll back (no orphaned note left
+// behind).
+#[test]
+fn add_note_superseding_other_errors_propagate_and_roll_back() {
+    let store = open_store();
+    let result = store.add_note_superseding("decision", "new", "body", &[], &[], None, 999_999);
+    assert!(
+        result.is_err(),
+        "criterion 5: a non-collision error must propagate, not be swallowed"
+    );
+    assert_eq!(
+        store.count().unwrap(),
+        0,
+        "the failed transaction must roll back; no orphaned note left behind"
+    );
+}
+
+// ── ADR-068 fifth amendment E2: Step A hardens against a collision ──────
+
+// Criterion 7: a NULL-entity_id row whose computed value collides with an
+// existing row's entity_id (only reachable once the index is already
+// UNIQUE from a prior open) is skipped (left NULL), and open succeeds.
+#[test]
+fn backfill_skips_a_row_whose_computed_entity_id_collides_and_open_succeeds() {
+    let store = open_store();
+    let (existing_id, _) = store
+        .add_note(
+            "decision",
+            "dup entry",
+            "same content",
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+    store.promote_entity_id_unique_index().unwrap();
+    assert!(index_is_unique(&store), "precondition: index promoted");
+
+    // Simulate a row left behind by some NULL-entity_id insert path
+    // (e.g. a pre-E1 add_note_superseding row): insert directly with
+    // entity_id NULL, bypassing add_note's own recovery entirely.
+    store
+        .conn
+        .execute(
+            "INSERT INTO notes (kind, title, body) VALUES ('decision', 'dup entry', 'same content')",
+            [],
+        )
+        .unwrap();
+    let stray_id = store.conn.last_insert_rowid();
+
+    // Step A must not error even though this row's computed entity_id
+    // collides with `existing_id`'s.
+    store
+        .backfill_entity_ids()
+        .expect("criterion 7: Step A must not hard-fail on a collision");
+
+    let stray_eid: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT entity_id FROM notes WHERE id = ?1",
+            rusqlite::params![stray_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stray_eid, None,
+        "criterion 7: the colliding row must be left NULL, not silently dropped"
+    );
+
+    let existing_eid: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT entity_id FROM notes WHERE id = ?1",
+            rusqlite::params![existing_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        existing_eid.is_some(),
+        "the pre-existing row's own entity_id must be untouched"
+    );
+}
+
+// Criterion 8: a NULL-entity_id row with no collision backfills exactly
+// as today (already covered by `backfill_populates_null_entity_ids`
+// above; this test pins the *mixed* case: one colliding row alongside one
+// clean row in the same Step A pass).
+#[test]
+fn backfill_still_populates_non_colliding_rows_alongside_a_colliding_one() {
+    let store = open_store();
+    store
+        .add_note(
+            "decision",
+            "dup entry",
+            "same content",
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+    store.promote_entity_id_unique_index().unwrap();
+
+    store
+        .conn
+        .execute(
+            "INSERT INTO notes (kind, title, body) VALUES ('decision', 'dup entry', 'same content')",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO notes (kind, title, body) VALUES ('note', 'clean row', 'clean body')",
+            [],
+        )
+        .unwrap();
+    let clean_id = store.conn.last_insert_rowid();
+
+    store.backfill_entity_ids().unwrap();
+
+    let clean_eid: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT entity_id FROM notes WHERE id = ?1",
+            rusqlite::params![clean_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        clean_eid,
+        Some(crate::storage::entity_id::entity_id(
+            "note",
+            "clean row",
+            "clean body"
+        )),
+        "criterion 8: a non-colliding NULL row must still backfill normally"
+    );
+}
+
+// ── Test-engineer adversarial round: self-supersede collision ───────────
+//
+// `add_note_superseding`'s collision-recovery path (criterion 3) was only
+// ever exercised with the colliding "existing" row being a THIRD row,
+// distinct from both the freshly-superseded OLD row and the new content.
+// Nothing stops a caller from superseding `old_id` with content that is
+// byte-identical to `old_id`'s OWN `{kind,title,body}` — e.g. `spelunk
+// memory add --supersedes <id>` invoked with the same title/body as the
+// entry it names. Post-promotion, the INSERT then collides with `old_id`
+// itself: `recover_from_entity_id_collision` looks up the existing row by
+// `entity_id` and finds `old_id`, so `existing_id == supersedes_id`. The
+// archive-OLD UPDATE then runs `SET status='archived', superseded_by=?2
+// WHERE id=?1` with `?1 = ?2 = old_id`: a row would archive itself and
+// set its own `superseded_by` to its own `id`, a self-loop of exactly the
+// shape `dedupe.rs`'s own self-edge guard exists to prevent, but on the
+// supersede path rather than the collapse path.
+#[test]
+fn add_note_superseding_self_collision_does_not_create_self_referential_archived_row() {
+    let store = open_store();
+    let (old_id, _) = store
+        .add_note(
+            "decision",
+            "same content",
+            "same body",
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+    store.promote_entity_id_unique_index().unwrap();
+    assert!(index_is_unique(&store), "precondition: index promoted");
+
+    // Supersede `old_id` with content identical to `old_id`'s own
+    // kind/title/body: the INSERT collides with `old_id` itself.
+    let result = store.add_note_superseding(
+        "decision",
+        "same content",
+        "same body",
+        &[],
+        &[],
+        None,
+        old_id,
+    );
+    assert!(
+        result.is_ok(),
+        "a self-collision must not error: {:?}",
+        result.err()
+    );
+    let (returned_id, created) = result.unwrap();
+    assert_eq!(
+        returned_id, old_id,
+        "the collision resolves to old_id itself — there is only one row \
+         with this content"
+    );
+    assert!(!created, "a collision is never a fresh insert");
+
+    let row = store.get(old_id).unwrap().expect("row still exists");
+    assert_ne!(
+        row.superseded_by,
+        Some(old_id),
+        "BUG: a self-supersede collision must not leave a row pointing \
+         superseded_by at its own id — this is a self-loop of the exact \
+         shape dedupe.rs's own self-edge guard exists to prevent, just \
+         reached via the supersede path instead of the collapse path"
+    );
+    let total_rows: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        total_rows, 1,
+        "no phantom second row must be created by the self-collision"
+    );
+}
+
+// ── Step A: any error other than a UNIQUE violation from the per-row
+// backfill UPDATE must propagate unchanged. Exercised via a synthetic
+// trigger on UPDATE, distinct from the UNIQUE-collision path already
+// covered above.
+#[test]
+fn backfill_other_error_from_update_propagates_unchanged() {
+    let store = open_store();
+    store
+        .conn
+        .execute(
+            "INSERT INTO notes (kind, title, body, entity_id) VALUES ('note', 'stray', 'body', NULL)",
+            [],
+        )
+        .unwrap();
+    let stray_id = store.conn.last_insert_rowid();
+    store
+        .conn
+        .execute_batch(&format!(
+            "CREATE TRIGGER reject_specific_update
+             BEFORE UPDATE ON notes
+             WHEN NEW.id = {stray_id}
+             BEGIN SELECT RAISE(ABORT, 'synthetic step a failure'); END;"
+        ))
+        .unwrap();
+
+    let result = store.backfill_entity_ids();
+    assert!(
+        result.is_err(),
+        "criterion 9: a non-UNIQUE error from the backfill UPDATE must propagate"
+    );
+    let err = result.unwrap_err();
+    // `.to_string()` on an anyhow::Error only shows the outermost
+    // `.with_context(...)` layer ("backfilling entity_id for note #1");
+    // the synthetic trigger message is a wrapped source, so it must be
+    // checked via the full chain, not the top-level Display.
+    let full_chain: String = err
+        .chain()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        full_chain.contains("synthetic step a failure"),
+        "expected the synthetic trigger error to propagate somewhere in \
+         the error chain, got: {full_chain}"
+    );
 }
