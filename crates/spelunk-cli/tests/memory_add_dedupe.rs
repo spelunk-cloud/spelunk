@@ -4,7 +4,7 @@
 //!
 //! Every existing test proving this behavior (`entity_id_migration.rs`'s
 //! `add_note_after_promotion_*` tests) drives `MemoryStore::add_note`
-//! directly — the storage layer, one level below the actual regression QA
+//! directly, the storage layer, one level below the actual regression QA
 //! reproduced: "`spelunk memory add` for a second time with identical
 //! kind/title/body prints 'Error: UNIQUE constraint failed: notes.entity_id'
 //! and exits 1", run against the *built CLI binary*. Nothing in the existing
@@ -117,7 +117,7 @@ fn second_identical_add_reuses_the_row_and_prints_already_recorded() {
 
     // Second add: byte-identical kind/title/body. Pre-fix this hard-crashed
     // with a raw "UNIQUE constraint failed: notes.entity_id" SQLite error and
-    // a non-zero exit — reproduced live against the built binary during the
+    // a non-zero exit, reproduced live against the built binary during the
     // original QA review this story fixes.
     memory_add_cmd(tmp.path(), &cfg, &mem_db)
         .arg("--title")
@@ -177,7 +177,7 @@ fn second_identical_add_merges_tags_into_the_existing_row() {
     );
 }
 
-// ── Criterion 34: the git-notes write-through carrier is unconditional —
+// ── Criterion 34: the git-notes write-through carrier is unconditional:
 // it appends on a reused row exactly as on a fresh one, using the SAME id ───
 
 #[test]
@@ -208,13 +208,13 @@ fn second_identical_add_still_writes_through_to_git_notes_with_the_same_id() {
     assert_eq!(
         ids.len(),
         2,
-        "criterion 34: the carrier must write on BOTH calls, reuse or not — \
+        "criterion 34: the carrier must write on BOTH calls, reuse or not, \
          got records: {ids:?}"
     );
     assert_eq!(
         ids[0], ids[1],
-        "criterion 34: both records must carry the SAME id — the reused \
-         row's, not a fresh one — so a later reader can't see two different \
+        "criterion 34: both records must carry the SAME id, the reused \
+         row's, not a fresh one, so a later reader can't see two different \
          ids for what SQLite considers a single entry"
     );
 

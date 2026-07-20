@@ -5,38 +5,30 @@
 
 use super::test_support::*;
 
-// ── Adversarial (QA final review): the public `add_note` API, not the
-// raw SQL layer, hitting the promoted index with duplicate content.
+// Adversarial (QA final review): the public `add_note` API, not the raw
+// SQL layer, hitting the promoted index with duplicate content.
 //
-// The previous test intentionally documents that a raw duplicate INSERT
-// *should* be rejected at the SQL level once the index is promoted —
-// that's the index doing its job. This test is about a level up: does
-// anything in the codebase catch that rejection before it reaches a
-// real caller? Nothing does. `MemoryStore::add_note` (used directly by
-// `spelunk memory add`, the most common write path in the CLI, per
-// CLAUDE.md's own agent-workflow guidance to run it "as you make
-// decisions") performs a bare `INSERT` with no pre-check and no error
-// handling for a UNIQUE-constraint rejection.
+// A raw duplicate INSERT should be rejected at the SQL level once the
+// index is promoted (the previous test proves that; that's the index
+// doing its job). But nothing in the codebase catches that rejection
+// before it reaches a real caller: `MemoryStore::add_note` (used
+// directly by `spelunk memory add`, the most common write path) performs
+// a bare INSERT with no pre-check and no error handling for it.
 //
-// Once Step B has promoted `idx_notes_entity_id` to UNIQUE — which, per
-// AC5, happens on the very next `MemoryStore::open` of *any* store with
-// zero duplicate groups, the overwhelmingly common steady state for a
-// real project — the very next `spelunk memory add` (or a harvest/reconcile
-// retry) that happens to submit byte-identical `kind`/`title`/`body`
-// content to something already stored no longer succeeds. It hard-fails
-// with a raw, low-level SQLite error surfaced straight to the user
+// Once Step B promotes `idx_notes_entity_id` to UNIQUE (per AC5, on the
+// very next open of any store with zero duplicate groups, the
+// overwhelmingly common steady state), the next `spelunk memory add` (or
+// a harvest/reconcile retry) submitting byte-identical kind/title/body
+// content hard-fails with a raw SQLite error surfaced to the user
 // ("Error: UNIQUE constraint failed: notes.entity_id"), reproduced
-// directly against a real built binary during this review.
+// directly against a real built binary.
 //
-// This directly contradicts this story's own ADR-068 third-amendment
-// decision text: "Excluding `created_at` from identity is settled... The
-// consequence, recording byte-identical `kind`/`title`/`body` twice now
-// yields one entry, is accepted." "Yields one entry" describes a graceful,
-// idempotent-ish outcome, not an unhandled crash. None of this story's
-// 24 acceptance criteria or five rounds of adversarial testing exercised
-// this interaction: every round was scoped to `dedupe.rs`'s own collapse
-// logic (the DELETE path), never to the ordinary INSERT path colliding
-// with the index `entity_id_migration.rs` newly promotes.
+// This contradicts the third amendment's own decision text: recording
+// byte-identical kind/title/body twice "yields one entry" and "is
+// accepted". None of the 24 acceptance criteria or five rounds of
+// adversarial testing exercised this: every round was scoped to
+// `dedupe.rs`'s own collapse (DELETE) path, never the ordinary INSERT
+// colliding with the index `entity_id_migration.rs` newly promotes.
 #[test]
 fn add_note_after_promotion_does_not_hard_crash_on_duplicate_content() {
     let store = open_store();
@@ -206,8 +198,8 @@ fn add_note_after_promotion_does_not_touch_status_or_superseded_by() {
 }
 
 // Criterion 29: before promotion (the common case while duplicate groups
-// still exist), identical content must keep inserting distinct rows —
-// this is the very mechanism dedupe.rs's own fixtures rely on to build
+// still exist), identical content must keep inserting distinct rows:
+// the very mechanism dedupe.rs's own fixtures rely on to build
 // duplicate-group scenarios in the first place.
 #[test]
 fn add_note_before_promotion_still_inserts_distinct_rows_for_identical_content() {

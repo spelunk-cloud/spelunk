@@ -84,9 +84,9 @@ impl MemoryStore {
     /// Insert a note and return `(id, created)`. `created` is `true` when a
     /// genuinely new row was inserted, `false` when the insert collided with
     /// an existing row's `entity_id` (only possible once `idx_notes_entity_id`
-    /// has been promoted to UNIQUE — see `entity_id_migration.rs`) and that
+    /// has been promoted to UNIQUE, see `entity_id_migration.rs`) and that
     /// existing row was reused instead. Does not store an embedding on a fresh
-    /// insert — call `insert_embedding` afterwards if the embedder is available.
+    /// insert; call `insert_embedding` afterwards if the embedder is available.
     #[allow(clippy::too_many_arguments)]
     pub fn add_note(
         &self,
@@ -123,7 +123,7 @@ impl MemoryStore {
     /// from the source store. All other callers should use `add_note`, which
     /// defers to the SQLite `DEFAULT (unixepoch())`.
     ///
-    /// Returns `(id, created)` — see `add_note` for what `created` means.
+    /// Returns `(id, created)`, see `add_note` for what `created` means.
     #[allow(clippy::too_many_arguments)]
     pub fn add_note_with_created_at(
         &self,
@@ -165,7 +165,7 @@ impl MemoryStore {
     /// existing row, merging `tags` and `linked_files` into it (add-wins, via
     /// the existing `union_tags_and_files`), and returning its id with
     /// `created = false`. Does **not** touch `status` or `superseded_by` on
-    /// this path — mirrors `reconcile.rs`'s own handling of an existing-row
+    /// this path, mirrors `reconcile.rs`'s own handling of an existing-row
     /// collision, not `dedupe.rs`'s fuller merge (which collapses two rows
     /// that already diverged in the store, a different scenario from a single
     /// fresh insert colliding with one existing row).
@@ -198,19 +198,17 @@ impl MemoryStore {
         }
     }
 
-    /// Return all notes for a project ordered by created_at ASC, id ASC (used
-    /// by reconcile to compute the memory.db content-hash set, and by
-    /// `dedupe_entity_ids` to pick each duplicate group's survivor).
+    /// Return all notes ordered by created_at ASC, id ASC (used by reconcile
+    /// for the content-hash set, and by `dedupe_entity_ids` to pick each
+    /// group's survivor).
     ///
-    /// Returns all notes regardless of status so that archived entries also
-    /// participate in dedup (we must not re-import a note that was already
-    /// imported and then archived in memory.db).
+    /// Includes every status, including archived, so dedup doesn't re-import
+    /// a note that was already imported and then archived.
     ///
-    /// The `id ASC` secondary key is a deliberate tie-break: two rows can
-    /// share the same `created_at` (e.g. a batch import), and `id` is
-    /// monotonically increasing with insertion order, so this pins
-    /// "earliest created, and among ties, first inserted" as the actual
-    /// definition of "earliest" every caller relies on.
+    /// `id ASC` is a deliberate tie-break: created_at can collide (e.g. a
+    /// batch import), and id increases with insertion order, so this pins
+    /// "earliest created, ties broken by first inserted" as the definition
+    /// every caller relies on.
     pub fn all_notes_for_dedup(&self) -> Result<Vec<Note>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, title, body, tags, linked_files, created_at, status, \
@@ -291,9 +289,9 @@ impl MemoryStore {
         Ok(ids)
     }
 
-    /// Delete a note row outright. Used only by `memory dedupe` to remove a
-    /// duplicate-group loser after its tags/linked_files/superseded_by have
-    /// been folded into the survivor and any edges pointing at it rewritten.
+    /// Used only by `memory dedupe`, after a duplicate-group loser's
+    /// tags/linked_files/superseded_by have been folded into the survivor
+    /// and any edges pointing at it rewritten.
     pub fn delete_note(&self, note_id: i64) -> Result<()> {
         self.conn.execute(
             "DELETE FROM notes WHERE id = ?1",
@@ -302,10 +300,10 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Delete a note's embedding row, if present. A no-op when absent. Used by
-    /// `memory dedupe` when deleting a duplicate-group loser: two vectors have
-    /// no meaningful union, so the loser's embedding is dropped rather than
-    /// merged (the survivor's own embedding, if any, is untouched).
+    /// No-op if absent. Used by `memory dedupe` when deleting a
+    /// duplicate-group loser: two vectors have no meaningful union, so the
+    /// embedding is dropped rather than merged; the survivor's own
+    /// embedding is untouched.
     pub fn delete_note_embedding(&self, note_id: i64) -> Result<()> {
         self.conn.execute(
             "DELETE FROM note_embeddings WHERE note_id = ?1",

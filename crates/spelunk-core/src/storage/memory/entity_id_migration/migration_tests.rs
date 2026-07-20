@@ -249,13 +249,10 @@ fn promote_after_manual_collapse_to_zero_duplicates_succeeds() {
     assert!(marker_exists(&store));
 }
 
-// ── Adversarial (AC5/item 8): the promoted index must genuinely reject a
-// duplicate INSERT at the SQL level, not merely report itself as "UNIQUE"
-// in `sqlite_master`'s stored SQL text (index_is_unique() above proves
-// only the latter). A CREATE UNIQUE INDEX statement can be issued against
-// a table that already violates it in edge cases (e.g. NULLs, or a
-// logic bug in the WHERE-partial-index clause); the only real proof is a
-// rejected write. ────────────────────────────────────────────────────────
+// Adversarial (AC5/item 8): the promoted index must genuinely reject a
+// duplicate INSERT at the SQL level, not merely report "UNIQUE" in
+// sqlite_master's stored SQL text (index_is_unique() above only proves
+// that). The only real proof is a rejected write.
 #[test]
 fn promoted_unique_index_genuinely_rejects_a_duplicate_insert() {
     let store = open_store();

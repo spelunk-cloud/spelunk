@@ -29,7 +29,7 @@ pub trait MemoryBackend: Send {
     /// Returns `(id, created)`. `created` is `true` for a genuinely new entry,
     /// `false` when the write collided with an existing entry's `entity_id`
     /// and that entry was reused instead (only possible on a local SQLite
-    /// backend whose `idx_notes_entity_id` has been promoted to UNIQUE — see
+    /// backend whose `idx_notes_entity_id` has been promoted to UNIQUE, see
     /// `MemoryStore::add_note`). Backends that cannot detect this (git notes,
     /// remote) always return `true`.
     async fn add(&self, input: NoteInput) -> Result<(i64, bool)>;
@@ -46,7 +46,7 @@ pub trait MemoryBackend: Send {
     ) -> Result<Vec<Note>>;
     /// Semantic (vector KNN) search.
     ///
-    /// `query`: the raw query text — see `search_timeline` for why both
+    /// `query`: the raw query text, see `search_timeline` for why both
     /// `query_blob` and `query` are passed to every backend.
     /// `as_of`: if set, only entries valid at that Unix timestamp are returned.
     async fn search(

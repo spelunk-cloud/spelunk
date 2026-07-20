@@ -303,7 +303,7 @@ impl MemoryBackend for RemoteMemoryBackend {
                 }
             }
             // `server.db` doesn't enforce this amendment's promoted index, so
-            // there is nothing for this backend to detect as a reuse — report
+            // there is nothing for this backend to detect as a reuse: report
             // the conflict-handling outcome as a fresh insert.
             return Ok((resp.id, true));
         }
