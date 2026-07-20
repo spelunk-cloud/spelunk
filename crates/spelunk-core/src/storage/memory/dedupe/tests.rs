@@ -329,13 +329,10 @@ fn injected_fault_partway_rolls_back_whole_run() {
     );
 }
 
-// ── Adversarial: fault mid-group (after a loser is fully deleted, before
-// the next loser in the *same* group is touched), with a byte-for-byte
-// full-table comparison rather than just a row count. AC21's own test
-// only proves rollback at a *group* boundary; this proves it holds at a
-// finer grain too, and that every column of every table dedupe can touch
-// (notes, memory_edges, note_embeddings) is provably restored, not just
-// the row count. ─────────────────────────────────────────────────────
+// Adversarial: fault mid-group (after a loser is deleted, before the
+// next loser in the same group is touched), checked byte-for-byte across
+// every table dedupe can touch, not just a row count. AC21's own test
+// only proves rollback at a group boundary; this proves it holds mid-group.
 #[test]
 fn injected_fault_mid_group_after_partial_loser_deletion_rolls_back_byte_for_byte() {
     let store = open_store();
@@ -549,13 +546,11 @@ fn loser_deletion_removes_memory_edges_in_both_directions_no_orphan() {
     let _ = survivor;
 }
 
-// ── Adversarial: relates_to/contradicts edges to a loser are dropped
-// outright by `delete_edges_for_note`, not repointed to the survivor.
-// This differs from tags/linked_files/superseded_by, which are carefully
-// merged. ADR-068's third amendment only specifies a merge rule for
-// `superseded_by`, not for the `memory_edges` relationship graph, so this
-// pins the current (lossy) behavior as a known, flagged gap rather than a
-// spec violation, catching any silent further regression. ──────────────
+// Adversarial: relates_to/contradicts edges to a loser are dropped by
+// delete_edges_for_note, not repointed, unlike tags/linked_files/
+// superseded_by. ADR-068's third amendment only specifies a merge rule
+// for superseded_by, not the memory_edges graph, so this pins the
+// current (lossy) behavior as a known gap rather than a spec violation.
 #[test]
 fn relates_to_edge_to_external_note_is_dropped_not_repointed_known_gap() {
     let store = open_store();
