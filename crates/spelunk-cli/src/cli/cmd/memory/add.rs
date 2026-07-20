@@ -135,7 +135,9 @@ pub(super) async fn memory_add(
     // Primary store (ADR-004): the local SQLite `memory.db`, an explicit team
     // server, or (with `--backend git-notes`) git notes itself. Pre-init there
     // is no primary; the write-through carrier below is the sole writer, so mint
-    // an id the same way the backends do (`now_millis`).
+    // an id the same way the backends do (`now_millis`). Reuses the backend
+    // opened above for the E4 pre-flight read (`backend_for_add`) instead of
+    // opening it twice.
     let (id, created) = if pre_init_notes {
         (now_millis(), true)
     } else {
