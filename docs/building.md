@@ -17,6 +17,19 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 Rust 1.80 or later is required (spelunk uses the 2024 edition).
 
+### Git hooks
+
+The repo ships a pre-commit hook (`cargo fmt --check` + `cargo clippy`) under
+`.githooks/`. Git does not run hooks from a tracked directory on its own, so
+point it there once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This also applies to any `git worktree add` checkout of this repo, since
+worktrees share the parent repo's hooks path.
+
 ### No external inference server required
 
 From v0.9.0, `spelunk-server` bundles a native embedder

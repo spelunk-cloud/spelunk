@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -e
+
+# Linked worktrees (code/worktrees/*) share this repo's common git dir, so a
+# bare `cargo fmt`/`cargo clippy` here would default to a target/ dir inside
+# whichever worktree is committing. On a disk that runs close to full, that is
+# a multi-GB stray per commit. Default CARGO_TARGET_DIR to the main checkout's
+# already-warm target/ so every worktree's commit reuses it instead.
+# `git rev-parse --path-format=absolute --git-common-dir` resolves to the main
+# checkout's .git dir from any worktree (main or linked), so this works no
+# matter which one is committing.
+GIT_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${GIT_COMMON_DIR%/.git}/target}"
+
+echo "→ cargo fmt --check"
+cargo fmt -- --check || {
+    echo ""
+    echo "  Formatting errors found. Run: cargo fmt"
+    exit 1
+}
+
+echo "→ cargo clippy"
+cargo clippy --all-targets -- -D warnings || {
+    echo ""
+    echo "  Clippy errors found. Fix the warnings above before committing."
+    exit 1
+}
