@@ -26,6 +26,17 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   `init` or `memory add` perform for you. See [ADR-068's third
   amendment](docs/adr/068-zero-setup-onboarding-git-notes-memory-fallback.md).
 
+### Fixed
+
+- **`spelunk memory add` no longer crashes on a byte-identical duplicate once
+  a project's `entity_id` index has been promoted to UNIQUE.** Previously a
+  second `memory add` with the same `kind`/`title`/`body` as an existing
+  entry hit `Error: UNIQUE constraint failed: notes.entity_id`. It now reuses
+  the existing entry instead, merging the new call's `tags` and
+  `linked_files` into it, and prints `Already recorded as [kind] #id: title`
+  in place of `Stored [kind] #id: title`. See [ADR-068's fourth
+  amendment](docs/adr/068-zero-setup-onboarding-git-notes-memory-fallback.md).
+
 ### Changed
 
 - **Chunk re-windowing is now token-aware, and windowed chunks keep their identity.**

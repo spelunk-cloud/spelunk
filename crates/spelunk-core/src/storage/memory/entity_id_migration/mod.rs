@@ -116,6 +116,8 @@ impl MemoryStore {
 }
 
 #[cfg(test)]
+mod collision_recovery_tests;
+#[cfg(test)]
 mod migration_tests;
 #[cfg(test)]
 mod test_support;

@@ -425,7 +425,7 @@ pub(super) async fn harvest_claude_code(
                 })
                 .await
             {
-                Ok(id) => id,
+                Ok((id, _created)) => id,
                 Err(e) => {
                     eprintln!(
                         "  warning: failed to store entry '{title}' (session {session_id}), skipping: {e:#}"

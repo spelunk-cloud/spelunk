@@ -100,7 +100,7 @@ async fn git_notes_add_and_list_round_trip() {
     let dir = make_temp_git_repo();
     let backend = GitNotesBackend::with_root(dir.path().to_path_buf());
 
-    let id = backend
+    let (id, _) = backend
         .add(note_input("decision", "use sqlcipher"))
         .await
         .expect("add");
@@ -240,7 +240,7 @@ async fn git_notes_archive_hides_entry() {
     let dir = make_temp_git_repo();
     let backend = GitNotesBackend::with_root(dir.path().to_path_buf());
 
-    let id = backend
+    let (id, _) = backend
         .add(note_input("decision", "archive me"))
         .await
         .expect("add");
@@ -541,7 +541,7 @@ async fn git_notes_backend_add_with_option_like_body_round_trips() {
     let mut input = note_input("decision", "--amend");
     input.body = "-f --force --output=/tmp/should-not-exist-oss61".to_string();
 
-    let id = backend.add(input).await.expect("add");
+    let (id, _) = backend.add(input).await.expect("add");
 
     let notes = backend
         .list(Some("decision"), 10, false, None)
@@ -1239,7 +1239,7 @@ async fn git_notes_backend_add_and_archive_fail_when_the_lock_is_contended() {
     let root = dir.path();
     let backend = GitNotesBackend::with_root(root.to_path_buf());
 
-    let id = backend
+    let (id, _) = backend
         .add(note_input("decision", "the sibling entry at stake"))
         .await
         .expect("seed");
@@ -1377,7 +1377,7 @@ async fn git_notes_backend_add_and_archive_fail_when_the_note_cannot_be_read() {
     let root = dir.path();
     let backend = GitNotesBackend::with_root(root.to_path_buf());
 
-    let id = backend
+    let (id, _) = backend
         .add(note_input("decision", "the sibling entry at stake"))
         .await
         .expect("seed");
@@ -1772,12 +1772,11 @@ async fn git_notes_backend_concurrent_archives_land_or_fail_visibly() {
     // collision here would archive the wrong record.
     let mut ids = Vec::new();
     for n in 1..=ENTRIES {
-        ids.push(
-            backend
-                .add(note_input("decision", &format!("archive target {n}")))
-                .await
-                .expect("add"),
-        );
+        let (id, _) = backend
+            .add(note_input("decision", &format!("archive target {n}")))
+            .await
+            .expect("add");
+        ids.push(id);
     }
     let distinct: std::collections::HashSet<i64> = ids.iter().copied().collect();
     assert_eq!(distinct.len(), ENTRIES, "setup: the ids must be distinct");
@@ -1856,7 +1855,7 @@ async fn git_notes_backend_uncontended_add_and_archive_never_reach_the_wait_budg
     let backend = GitNotesBackend::with_root(dir.path().to_path_buf());
 
     let started = std::time::Instant::now();
-    let id = backend
+    let (id, _) = backend
         .add(note_input("decision", "no nested acquisition"))
         .await
         .expect("add");

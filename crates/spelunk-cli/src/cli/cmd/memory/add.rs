@@ -136,8 +136,8 @@ pub(super) async fn memory_add(
     // server, or (with `--backend git-notes`) git notes itself. Pre-init there
     // is no primary; the write-through carrier below is the sole writer, so mint
     // an id the same way the backends do (`now_millis`).
-    let id = if pre_init_notes {
-        now_millis()
+    let (id, created) = if pre_init_notes {
+        (now_millis(), true)
     } else {
         let backend = match backend_for_add.take() {
             Some(backend) => backend,
@@ -258,7 +258,14 @@ pub(super) async fn memory_add(
         }
     }
 
-    println!("Stored [{kind}] #{id}: {title}", kind = args.kind);
+    if created {
+        println!("Stored [{kind}] #{id}: {title}", kind = args.kind);
+    } else {
+        println!(
+            "Already recorded as [{kind}] #{id}: {title}",
+            kind = args.kind
+        );
+    }
     if let Some(line) = notes_rewrite_note {
         println!("{line}");
     }

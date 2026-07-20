@@ -800,6 +800,10 @@ row number, not this identity. See [Entry identity](memory.md#project-memory).
 Existing duplicate rows already resident in `memory.db` are never collapsed
 automatically; use `spelunk memory dedupe` to do that explicitly (see
 [Collapsing duplicate entries already in memory.db](memory.md#collapsing-duplicate-entries-already-in-memorydb)).
+Once a store's duplicates are cleared and its `entity_id` index is promoted to
+UNIQUE, a plain `memory add` for byte-identical content no longer errors: it
+reuses the existing entry and prints `Already recorded as ...` instead of
+`Stored ...`.
 
 ---
 

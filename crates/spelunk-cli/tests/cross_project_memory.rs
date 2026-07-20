@@ -1335,7 +1335,7 @@ fn memory_store_list_excludes_archived_by_default() {
     store
         .add_note("decision", "Active note", "body", &[], &[], None, None)
         .expect("add active note");
-    let archived_id = store
+    let (archived_id, _) = store
         .add_note("decision", "Archived note", "body", &[], &[], None, None)
         .expect("add to-be-archived note");
     store.archive(archived_id).expect("archive note");

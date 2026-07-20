@@ -26,7 +26,13 @@ pub struct NoteInput {
 /// Abstraction over local SQLite and remote HTTP memory stores.
 #[async_trait]
 pub trait MemoryBackend: Send {
-    async fn add(&self, input: NoteInput) -> Result<i64>;
+    /// Returns `(id, created)`. `created` is `true` for a genuinely new entry,
+    /// `false` when the write collided with an existing entry's `entity_id`
+    /// and that entry was reused instead (only possible on a local SQLite
+    /// backend whose `idx_notes_entity_id` has been promoted to UNIQUE — see
+    /// `MemoryStore::add_note`). Backends that cannot detect this (git notes,
+    /// remote) always return `true`.
+    async fn add(&self, input: NoteInput) -> Result<(i64, bool)>;
     /// Semantic search over ALL notes (incl. archived), ordered by valid_at/created_at ASC.
     ///
     /// `query`: the raw query text. Local backends search by `query_blob` (a
@@ -117,12 +123,16 @@ impl LocalMemoryBackend {
 
 #[async_trait]
 impl MemoryBackend for LocalMemoryBackend {
-    async fn add(&self, input: NoteInput) -> Result<i64> {
+    async fn add(&self, input: NoteInput) -> Result<(i64, bool)> {
         let store = self.store.lock().await;
         let tags: Vec<&str> = input.tags.iter().map(String::as_str).collect();
         let files: Vec<&str> = input.linked_files.iter().map(String::as_str).collect();
-        let id = if let Some(supersedes_id) = input.supersedes {
-            store.add_note_superseding(
+        let (id, created) = if let Some(supersedes_id) = input.supersedes {
+            // `add_note_superseding` doesn't populate `entity_id` at insert
+            // time today, so it cannot hit the UNIQUE-collision path
+            // `add_note` recovers from below; every call here is a fresh
+            // insert.
+            let id = store.add_note_superseding(
                 &input.kind,
                 &input.title,
                 &input.body,
@@ -130,7 +140,8 @@ impl MemoryBackend for LocalMemoryBackend {
                 &files,
                 input.valid_at,
                 supersedes_id,
-            )?
+            )?;
+            (id, true)
         } else {
             store.add_note(
                 &input.kind,
@@ -145,7 +156,7 @@ impl MemoryBackend for LocalMemoryBackend {
         if let Some(blob) = &input.embedding {
             store.insert_embedding(id, blob)?;
         }
-        Ok(id)
+        Ok((id, created))
     }
 
     async fn search_timeline(
