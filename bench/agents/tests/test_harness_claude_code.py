@@ -8,6 +8,10 @@ Network-free, no DEEPSEEK_API_KEY, no claude binary required.
 
 import json
 import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from harness_claude_code import (
@@ -21,6 +25,8 @@ from spelunk_mcp_server import mcp_tool_names_for_condition
 CONDITIONS = ["baseline", "spelunk_search", "spelunk_full"]
 SPELUNK_CONDITIONS = ["spelunk_search", "spelunk_full"]
 
+HARNESS_CLAUDE_CODE = Path(__file__).resolve().parents[1] / "harness_claude_code.py"
+
 
 class TestDeepseekAnthropicEnv:
     """_deepseek_anthropic_env is the function responsible for redirecting
@@ -32,50 +38,82 @@ class TestDeepseekAnthropicEnv:
     shim that ignores env entirely (as the --no-deepseek provenance-contract
     test does)."""
 
-    def test_sets_auth_token_not_just_api_key(self):
+    def test_sets_auth_token_not_just_api_key(self, tmp_path):
         # The var name DeepSeek's docs actually specify (see module
         # docstring/README citation) -- this is the one that must be right.
         env = _deepseek_anthropic_env(
             api_key="sk-test-key",
             model="deepseek-v4-flash",
             base_url="https://api.deepseek.com/anthropic",
+            claude_config_dir=tmp_path / "cfg",
         )
         assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-test-key"
 
-    def test_sets_belt_and_braces_api_key_alias_too(self):
+    def test_sets_belt_and_braces_api_key_alias_too(self, tmp_path):
         env = _deepseek_anthropic_env(
             api_key="sk-test-key",
             model="deepseek-v4-flash",
             base_url="https://api.deepseek.com/anthropic",
+            claude_config_dir=tmp_path / "cfg",
         )
         assert env["ANTHROPIC_API_KEY"] == "sk-test-key"
 
-    def test_sets_base_url_and_model(self):
+    def test_sets_base_url_and_model(self, tmp_path):
         env = _deepseek_anthropic_env(
             api_key="sk-test-key",
             model="deepseek-v4-flash",
             base_url="http://127.0.0.1:4000",
+            claude_config_dir=tmp_path / "cfg",
         )
         assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
         assert env["ANTHROPIC_MODEL"] == "deepseek-v4-flash"
 
-    def test_does_not_mutate_real_process_environment(self, monkeypatch):
+    def test_does_not_mutate_real_process_environment(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
         _deepseek_anthropic_env(
             api_key="sk-test-key",
             model="deepseek-v4-flash",
             base_url="https://api.deepseek.com/anthropic",
+            claude_config_dir=tmp_path / "cfg",
         )
         assert "ANTHROPIC_BASE_URL" not in os.environ
 
-    def test_preserves_unrelated_ambient_env_vars(self, monkeypatch):
+    def test_preserves_unrelated_ambient_env_vars(self, monkeypatch, tmp_path):
         monkeypatch.setenv("SOME_UNRELATED_VAR", "keep-me")
         env = _deepseek_anthropic_env(
             api_key="sk-test-key",
             model="deepseek-v4-flash",
             base_url="https://api.deepseek.com/anthropic",
+            claude_config_dir=tmp_path / "cfg",
         )
         assert env["SOME_UNRELATED_VAR"] == "keep-me"
+
+    def test_sets_claude_config_dir_to_the_isolated_path(self, tmp_path):
+        isolated = tmp_path / "isolated-claude-config"
+        env = _deepseek_anthropic_env(
+            api_key="sk-test-key",
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com/anthropic",
+            claude_config_dir=isolated,
+        )
+        assert env["CLAUDE_CONFIG_DIR"] == str(isolated)
+
+    def test_overrides_any_ambient_claude_config_dir(self, monkeypatch, tmp_path):
+        # A host machine with its own stored login sets CLAUDE_CONFIG_DIR
+        # (or defaults to ~/.claude) -- that ambient value is exactly what
+        # let `claude` fall through to the wrong credential and 401 against
+        # DeepSeek (reproduced directly on a host with a Claude Code login).
+        # The isolated path must win, not merge with or defer to it.
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/some/host/login/dir")
+        isolated = tmp_path / "isolated-claude-config"
+        env = _deepseek_anthropic_env(
+            api_key="sk-test-key",
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com/anthropic",
+            claude_config_dir=isolated,
+        )
+        assert env["CLAUDE_CONFIG_DIR"] == str(isolated)
+        assert env["CLAUDE_CONFIG_DIR"] != "/some/host/login/dir"
 
 
 def _cmd(condition, mcp_config_path=None):
@@ -172,3 +210,192 @@ class TestWriteMcpConfig:
         scratch.mkdir()
         path = write_mcp_config(scratch, "spelunk_search", repo, None)
         assert repo not in path.parents
+
+
+FAKE_CLAUDE_CAPTURE_CONFIG_DIR_SHIM = """#!/usr/bin/env bash
+# Fake `claude` binary for offline testing of main()'s subprocess env: records
+# CLAUDE_CONFIG_DIR to a file outside the config dir itself (the harness
+# rmtree's the config dir on exit, so the test can't inspect it in place
+# afterward) before emitting a minimal --output-format json result.
+echo "$CLAUDE_CONFIG_DIR" > "$CLAUDE_CONFIG_DIR_CAPTURE_FILE"
+echo '{"num_turns": 1, "usage": {"input_tokens": 1, "output_tokens": 1}, "is_error": false, "modelUsage": {}}'
+"""
+
+
+@pytest.fixture()
+def fake_claude_capturing_config_dir(tmp_path):
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    claude_path = bin_dir / "claude"
+    claude_path.write_text(FAKE_CLAUDE_CAPTURE_CONFIG_DIR_SHIM)
+    claude_path.chmod(
+        claude_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+    )
+
+    capture_file = tmp_path / "captured-config-dir.txt"
+    # Simulate a host machine that already has its own config dir (with a
+    # stored login) set via the ambient environment -- the isolation fix
+    # must override this on the DeepSeek path, not inherit it.
+    ambient_config_dir = tmp_path / "ambient-host-claude-config"
+    ambient_config_dir.mkdir()
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+    env["CLAUDE_CONFIG_DIR_CAPTURE_FILE"] = str(capture_file)
+    env["CLAUDE_CONFIG_DIR"] = str(ambient_config_dir)
+    return env, capture_file, ambient_config_dir
+
+
+@pytest.fixture()
+def throwaway_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    return repo
+
+
+class TestClaudeConfigDirIsolation:
+    """End-to-end regression coverage for the auth bug: on this exact host,
+    `claude -p` sends an ambient stored login credential instead of the
+    injected ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY, and DeepSeek 401s.
+    Driven through main() as a real subprocess (like
+    test_provenance_contract.py) with a fake `claude` that records which
+    CLAUDE_CONFIG_DIR it actually received, since that's the mechanism the
+    fix relies on and unit-testing _deepseek_anthropic_env alone wouldn't
+    prove main() actually wires it through and cleans it up."""
+
+    def test_deepseek_path_overrides_the_ambient_config_dir(
+        self, fake_claude_capturing_config_dir, throwaway_repo, tmp_path
+    ):
+        env, capture_file, ambient_config_dir = fake_claude_capturing_config_dir
+        issue_file = tmp_path / "ISSUE.txt"
+        issue_file.write_text("Fix the bug.")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS_CLAUDE_CODE),
+                "--task-id",
+                "fake__cfgdir-1",
+                "--repo-path",
+                str(throwaway_repo),
+                "--issue",
+                str(issue_file),
+                "--model",
+                "deepseek-v4-flash",
+                "--api-key",
+                "sk-fake-not-a-real-key",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        used_config_dir = capture_file.read_text().strip()
+        assert used_config_dir, "claude subprocess never saw CLAUDE_CONFIG_DIR"
+        assert used_config_dir != str(ambient_config_dir)
+
+    def test_isolated_config_dir_is_removed_after_the_run(
+        self, fake_claude_capturing_config_dir, throwaway_repo, tmp_path
+    ):
+        env, capture_file, _ambient_config_dir = fake_claude_capturing_config_dir
+        issue_file = tmp_path / "ISSUE.txt"
+        issue_file.write_text("Fix the bug.")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS_CLAUDE_CODE),
+                "--task-id",
+                "fake__cfgdir-2",
+                "--repo-path",
+                str(throwaway_repo),
+                "--issue",
+                str(issue_file),
+                "--model",
+                "deepseek-v4-flash",
+                "--api-key",
+                "sk-fake-not-a-real-key",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        used_config_dir = Path(capture_file.read_text().strip())
+        # Cleaned up in the same finally block as the MCP scratch dir --
+        # a bench host running many cells shouldn't accumulate one throwaway
+        # config dir per task.
+        assert not used_config_dir.exists()
+
+    def test_no_deepseek_path_keeps_the_ambient_config_dir(
+        self, fake_claude_capturing_config_dir, throwaway_repo, tmp_path
+    ):
+        # --no-deepseek is documented as "uses Claude Code's own default
+        # Anthropic credentials/model unchanged" -- isolation must NOT kick
+        # in here, or a future native-Claude-model cell would lose its real
+        # login along with the ambient credential it's supposed to use.
+        env, capture_file, ambient_config_dir = fake_claude_capturing_config_dir
+        issue_file = tmp_path / "ISSUE.txt"
+        issue_file.write_text("Fix the bug.")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS_CLAUDE_CODE),
+                "--task-id",
+                "fake__cfgdir-3",
+                "--repo-path",
+                str(throwaway_repo),
+                "--issue",
+                str(issue_file),
+                "--no-deepseek",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        used_config_dir = capture_file.read_text().strip()
+        assert used_config_dir == str(ambient_config_dir)
+
+
+class TestMaxTurnsNotEnforced:
+    """Secondary bug from the same story: max_turns was recorded in
+    provenance but never wired into the actual `claude` invocation. The
+    installed CLI has no turn-cap flag (checked `claude --help`), so the fix
+    is documenting that explicitly rather than fabricating a flag that
+    doesn't exist -- mirrors harness_opencode.py's identical
+    accepted-but-not-enforced pattern (see README 'Adapter notes')."""
+
+    def test_never_passed_to_the_claude_cli(self):
+        cmd = build_claude_cmd(
+            prompt="fix it",
+            effort="high",
+            thinking=False,
+            condition="baseline",
+            mcp_config_path=None,
+        )
+        assert "--max-turns" not in cmd
+
+    def test_help_documents_it_is_not_enforced(self):
+        result = subprocess.run(
+            [sys.executable, str(HARNESS_CLAUDE_CODE), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0
+        help_text = " ".join(result.stdout.split()).lower()
+        assert "not enforced" in help_text

@@ -257,6 +257,14 @@ without a separate schema change.
   provenance for CLI-contract parity across harnesses, but is **not
   enforced** — it is never passed to the `claude -p` subprocess. Don't read
   it as an enforced ceiling for this harness either.
+- On the DeepSeek path (anthropic-compat and shim, not `--no-deepseek`), the
+  `claude -p` subprocess runs with `CLAUDE_CONFIG_DIR` pointed at a fresh,
+  empty scratch directory instead of the host's default config dir. Without
+  this, a `claude` binary that is already logged in on the host sends its
+  stored OAuth credential instead of the injected
+  `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY`, and DeepSeek returns 401 with
+  no indication the token was ignored. The scratch dir is deleted once the
+  run finishes, same lifecycle as the MCP scratch dir above.
 
 ## swebench_run.sh — Batch orchestrator
 
