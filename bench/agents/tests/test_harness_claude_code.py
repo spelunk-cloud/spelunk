@@ -370,6 +370,100 @@ class TestClaudeConfigDirIsolation:
         used_config_dir = capture_file.read_text().strip()
         assert used_config_dir == str(ambient_config_dir)
 
+    def test_shim_endpoint_kind_gets_the_same_isolation_as_anthropic_compat(
+        self, fake_claude_capturing_config_dir, throwaway_repo, tmp_path
+    ):
+        # _deepseek_anthropic_env is called from the same branch (guarded
+        # only on args.no_deepseek) for both endpoint kinds, but nothing
+        # above proves the shim path specifically -- an --endpoint-kind
+        # check added later that special-cased "anthropic-compat" would
+        # silently leave the shim arm on ambient auth again.
+        env, capture_file, ambient_config_dir = fake_claude_capturing_config_dir
+        issue_file = tmp_path / "ISSUE.txt"
+        issue_file.write_text("Fix the bug.")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS_CLAUDE_CODE),
+                "--task-id",
+                "fake__cfgdir-4",
+                "--repo-path",
+                str(throwaway_repo),
+                "--issue",
+                str(issue_file),
+                "--model",
+                "deepseek-v4-flash",
+                "--api-key",
+                "sk-fake-not-a-real-key",
+                "--endpoint-kind",
+                "shim",
+                "--shim-base-url",
+                "http://127.0.0.1:4000",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        used_config_dir = capture_file.read_text().strip()
+        assert used_config_dir, "claude subprocess never saw CLAUDE_CONFIG_DIR"
+        assert used_config_dir != str(ambient_config_dir)
+
+
+class TestClaudeConfigDirCleanupOnFailure:
+    """The isolation fix creates claude_config_dir before the try/finally
+    that cleans it up, same lifecycle as the pre-existing MCP scratch_dir.
+    The happy-path tests above only prove cleanup when `claude` exits 0 --
+    this proves it also happens when run_claude_code's subprocess.run call
+    itself raises (e.g. `claude` genuinely missing from PATH), which
+    propagates past the point cleanup was expected to run rather than being
+    caught anywhere."""
+
+    def test_temp_dirs_are_not_leaked_when_the_claude_binary_is_missing(
+        self, throwaway_repo, tmp_path
+    ):
+        tmp_root = tmp_path / "tmproot"
+        tmp_root.mkdir()
+        empty_bin_dir = tmp_path / "empty-bin"
+        empty_bin_dir.mkdir()
+        issue_file = tmp_path / "ISSUE.txt"
+        issue_file.write_text("Fix the bug.")
+
+        env = dict(os.environ)
+        env["PATH"] = str(empty_bin_dir)  # no `claude` resolvable anywhere
+        env["TMPDIR"] = str(tmp_root)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS_CLAUDE_CODE),
+                "--task-id",
+                "fake__cleanup-1",
+                "--repo-path",
+                str(throwaway_repo),
+                "--issue",
+                str(issue_file),
+                "--model",
+                "deepseek-v4-flash",
+                "--api-key",
+                "sk-fake-not-a-real-key",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        # FileNotFoundError from subprocess.run propagates uncaught -- this
+        # must fail loudly, not silently succeed with a fabricated result.
+        assert result.returncode != 0
+        assert "FileNotFoundError" in result.stderr
+        leaked = list(tmp_root.iterdir())
+        assert leaked == [], f"temp dirs leaked on the exception path: {leaked}"
+
 
 class TestMaxTurnsNotEnforced:
     """Secondary bug from the same story: max_turns was recorded in
