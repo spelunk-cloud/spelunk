@@ -51,7 +51,7 @@ tree-sitter = "0.26"
 # python, ruby, rust, scala, solidity, swift, tsx, typescript, yaml). One crate
 # to bump instead of 13 hand-pinned grammars; kept ABI-aligned to the same
 # tree-sitter 0.26 runtime by the ast-grep team. See ts_walker::ts_language.
-ast-grep-language = "0.44"
+ast-grep-language = "0.45"
 # In-process structural search fallback (replaces the external `ast-grep` binary).
 ast-grep-core = "0.44"
 # proto + sql grammars are not shipped by ast-grep-language — kept standalone.
