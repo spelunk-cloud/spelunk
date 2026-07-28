@@ -29,6 +29,8 @@ pub enum PlumbingCommand {
     GraphEdges(PlumbingGraphEdgesArgs),
     /// Emit memory entries as JSONL
     ReadMemory(PlumbingReadMemoryArgs),
+    /// Publish memory notes (refs/notes/spelunk) to a remote
+    PublishNotes(PlumbingPublishNotesArgs),
 }
 
 #[derive(Args, Debug)]
@@ -112,6 +114,20 @@ pub struct PlumbingReadMemoryArgs {
     pub limit: usize,
 }
 
+#[derive(Args, Debug)]
+pub struct PlumbingPublishNotesArgs {
+    /// Remote to publish to (default: origin)
+    pub remote: Option<String>,
+
+    /// Remote URL. Accepted and ignored: git passes it to a pre-push hook as $2.
+    #[arg(hide = true)]
+    pub url: Option<String>,
+
+    /// Warn on stderr and exit 0 when publishing fails, rather than reporting it
+    #[arg(long)]
+    pub best_effort: bool,
+}
+
 use crate::config::Config;
 
 mod cat_chunks;
@@ -121,6 +137,7 @@ mod hash_file;
 mod knn;
 mod ls_files;
 mod parse_file;
+mod publish_notes;
 mod read_memory;
 
 pub async fn plumbing(args: PlumbingArgs, cfg: Config) -> Result<()> {
@@ -135,6 +152,9 @@ pub async fn plumbing(args: PlumbingArgs, cfg: Config) -> Result<()> {
     match args.command {
         PlumbingCommand::ParseFile(a) => return parse_file::parse_file(a),
         PlumbingCommand::Embed(a) => return embed_cmd::embed_cmd(&cfg, a.query).await,
+        // Notes are the pre-`init` store (ADR-068), so publishing must not
+        // require an index.
+        PlumbingCommand::PublishNotes(a) => return publish_notes::publish_notes(a).await,
         _ => {}
     }
 
@@ -158,6 +178,8 @@ pub async fn plumbing(args: PlumbingArgs, cfg: Config) -> Result<()> {
             read_memory::read_memory(a, &mem_path, &cfg).await
         }
         // Already handled above but Rust requires exhaustive match.
-        PlumbingCommand::ParseFile(_) | PlumbingCommand::Embed(_) => unreachable!(),
+        PlumbingCommand::ParseFile(_)
+        | PlumbingCommand::Embed(_)
+        | PlumbingCommand::PublishNotes(_) => unreachable!(),
     }
 }

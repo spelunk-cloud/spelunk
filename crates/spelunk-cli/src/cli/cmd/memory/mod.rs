@@ -1,3 +1,4 @@
+use super::color::cprintln;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -50,6 +51,10 @@ pub enum MemoryCommand {
     Failures(MemoryFailuresArgs),
     /// Import unique notes from server.db into the local memory.db (recovery / migration tool)
     Reconcile(MemoryReconcileArgs),
+    /// Backfill missing local embeddings so semantic search can find notes left unembedded (recovery tool)
+    Reindex(MemoryReindexArgs),
+    /// Collapse duplicate-entity_id groups already resident in local memory.db (recovery tool)
+    Dedupe(MemoryDedupeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -350,18 +355,51 @@ pub struct MemoryReconcileArgs {
     pub format: String,
 }
 
+#[derive(Args, Debug)]
+pub struct MemoryReindexArgs {
+    /// Re-embed every active note, replacing existing vectors (e.g. after a model or dimension change)
+    #[arg(long)]
+    pub force: bool,
+
+    /// Also re-embed archived notes (default: active notes only)
+    #[arg(long)]
+    pub include_archived: bool,
+
+    /// Report how many notes would be embedded, then exit without writing anything
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format: text or json
+    #[arg(long, default_value = "text")]
+    pub format: String,
+}
+
+#[derive(Args, Debug)]
+pub struct MemoryDedupeArgs {
+    /// Detect and report duplicate entity_id groups without collapsing anything
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format: text or json (NDJSON summary object)
+    #[arg(long, default_value = "text")]
+    pub format: String,
+}
+
 use super::status::format_age;
 
 mod add;
 mod archive;
 pub(crate) mod cross_project;
+mod dedupe;
 mod failures;
 mod graph_cmd;
 mod harvest;
 mod harvest_claude;
 mod list;
+pub(crate) mod outbox;
 pub mod push;
 pub(crate) mod reconcile;
+mod reindex;
 mod search;
 mod show;
 mod since;
@@ -380,6 +418,7 @@ pub async fn memory(args: MemoryArgs, cfg: crate::config::Config) -> Result<()> 
     // carrier mode downstream (add skips the absent SQLite primary; list reads
     // from `refs/notes/spelunk`). Store priority is otherwise unchanged (ADR-004).
     let (mem_path, pre_init_notes) = resolve_memory_store(&args, &cfg, be).await?;
+    maybe_emit_reembed_notice(&mem_path, pre_init_notes, be);
     match args.command {
         MemoryCommand::Add(a) => add::memory_add(a, &mem_path, &cfg, be, pre_init_notes).await,
         MemoryCommand::Search(a) => search::memory_search(a, &mem_path, &cfg, be).await,
@@ -397,6 +436,34 @@ pub async fn memory(args: MemoryArgs, cfg: crate::config::Config) -> Result<()> 
         MemoryCommand::Watch(a) => watch::memory_watch(a, &cfg).await,
         MemoryCommand::Failures(a) => failures::memory_failures(a, &mem_path, &cfg, be).await,
         MemoryCommand::Reconcile(a) => reconcile::memory_reconcile(a, &mem_path, &cfg).await,
+        MemoryCommand::Reindex(a) => reindex::memory_reindex(a, &mem_path, &cfg, be).await,
+        MemoryCommand::Dedupe(a) => dedupe::memory_dedupe(a, &mem_path).await,
+    }
+}
+
+/// One-line, `RUST_LOG`-free notice pointing the user at `memory reindex` when
+/// the 768→896 store upgrade just dropped their prior note vectors (D5(b)).
+///
+/// `MemoryStore::open` sets `reembed_needed` only on the single open where that
+/// drop ran, so this fires once, not on every command. Skipped for the
+/// git-notes carrier / `--backend git-notes` paths (no local sqlite store) and
+/// for a path that does not yet exist, so we never create a store just to check
+/// (the CloudFirst placeholder path never has a local store to open here).
+fn maybe_emit_reembed_notice(
+    mem_path: &std::path::Path,
+    pre_init_notes: bool,
+    be: Option<&'static str>,
+) {
+    if pre_init_notes || be == Some("git-notes") || !mem_path.exists() {
+        return;
+    }
+    if let Ok(store) = crate::storage::MemoryStore::open(mem_path)
+        && let Some(n) = store.reembed_needed
+    {
+        eprintln!(
+            "[spelunk] {n} note(s) need re-embedding for semantic search; \
+             run 'spelunk memory reindex'."
+        );
     }
 }
 
@@ -501,7 +568,7 @@ pub(super) fn print_note_summary(n: &crate::storage::memory::Note) {
         .as_deref()
         .map(|p| format!("  \x1b[36m[from: {p}]\x1b[0m"))
         .unwrap_or_default();
-    println!(
+    cprintln!(
         "\x1b[1m#{id}\x1b[0m  \x1b[33m[{kind}]\x1b[0m  {title}{archived}{dist_fmt}{source}",
         id = n.id,
         kind = n.kind,
@@ -514,9 +581,9 @@ pub(super) fn print_note_summary(n: &crate::storage::memory::Note) {
         },
         source = source_badge,
     );
-    println!("     \x1b[2m{}\x1b[0m", format_age(n.created_at));
+    cprintln!("     \x1b[2m{}\x1b[0m", format_age(n.created_at));
     if let Some(valid_at) = n.valid_at {
-        println!("     \x1b[2mvalid_at: {}\x1b[0m", format_age(valid_at));
+        cprintln!("     \x1b[2mvalid_at: {}\x1b[0m", format_age(valid_at));
     }
     if !n.tags.is_empty() {
         println!("     tags: {}", n.tags.join(", "));
@@ -525,18 +592,18 @@ pub(super) fn print_note_summary(n: &crate::storage::memory::Note) {
         println!("     files: {}", n.linked_files.join(", "));
     }
     if let Some(sup) = n.superseded_by {
-        println!("     \x1b[2msuperseded by #{sup}\x1b[0m");
+        cprintln!("     \x1b[2msuperseded by #{sup}\x1b[0m");
     }
     if !matches!(n.kind.as_str(), "question" | "answer") {
         let preview: Vec<&str> = n.body.lines().take(2).collect();
         for line in &preview {
-            println!("     \x1b[2m{line}\x1b[0m");
+            cprintln!("     \x1b[2m{line}\x1b[0m");
         }
         if n.body.lines().count() > 2 {
-            println!("     \x1b[2m…\x1b[0m");
+            cprintln!("     \x1b[2m…\x1b[0m");
         }
     } else {
-        println!(
+        cprintln!(
             "     \x1b[2m(use `spelunk memory show {}` to read body)\x1b[0m",
             n.id
         );

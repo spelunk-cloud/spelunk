@@ -21,10 +21,14 @@ used; the binary is the same in both tiers.
 | **Memory search** | Not available | Server encodes query, does KNN over server-side memory DB |
 | **Memory harvest** | Not available | LLM extraction via server |
 | **Explore** | Not available | CLI pre-fetches context chunks locally, sends to server LLM loop |
-| **Plan** | Not available | LLM planning via server |
 
 **The CLI never calls embedding or LLM APIs directly, regardless of
 configuration.** All inference routes through `spelunk-server`.
+
+> **Reserved: Plan.** `/plan` is reserved as a server-owned route per ADR-002,
+> but nothing ships today: there is no `spelunk plan` subcommand and no `/plan`
+> server route. The CLI parses a `plan` capability from the server health
+> response but deliberately keeps it out of all output, so it never surfaces.
 
 **Tier 0 requires no external tools.** Uses `ast-grep` structural search.
 
@@ -51,8 +55,7 @@ server_url = "https://spelunk.internal.example.com"   # key via SPELUNK_SERVER_K
 > (`127.0.0.1` / `::1` / `localhost`); a non-loopback `http://` value is
 > rejected at config-load time with no override, since the bearer token is
 > attached to every server-mediated request. See
-> [Server setup → Trust model](../server.md#trust-model) and
-> [Self-hosting](../self-hosting.md).
+> [Server setup → Trust model](../server-setup.md#trust-model).
 
 Environment variable overrides:
 
@@ -104,8 +107,8 @@ newer endpoints.
 
 In v0.8.0 the common case is no `server_url` at all: the CLI discovers (or
 starts) a **local** server on the loopback address. This is what makes Tier 1
-the default for a fresh single-user install — semantic search, `explore`, and
-`plan` work out of the box without the user configuring or managing a server.
+the default for a fresh single-user install — semantic search and `explore`
+work out of the box without the user configuring or managing a server.
 
 Discovery runs before the configured-`server_url` probe and only on loopback:
 
@@ -149,16 +152,15 @@ Key points:
   `spelunk-server` as a background child owned by the current user, then waits
   for its health endpoint before proceeding.
 - **`SPELUNK_NO_SERVER`.** When set, discovery is skipped entirely: no probe, no
-  autostart. The CLI runs in Tier 0 and inference-only commands exit 2 with the
+  autostart. The CLI runs in Tier 0 and inference-only commands exit 1 with the
   locked-feature message.
 
 <!-- The discovery timeout (250 ms) and autostart/handshake UX are confirmed
-     against capability.rs. `instance_id` and `started_by` are implemented
+     against capability/probe.rs. `instance_id` and `started_by` are implemented
      (PRs #329/#333). -->
 
 User-facing behaviour for these tiers is documented in
-[getting-started.md → Capability tiers](../getting-started.md#capability-tiers-where-inference-and-memory-live)
-and [server.md → Local server](../server.md#local-server-automatic--no-setup).
+[getting-started.md → Capability tiers](../getting-started.md#capability-tiers-where-inference-and-memory-live).
 
 ---
 
@@ -170,10 +172,9 @@ and [server.md → Local server](../server.md#local-server-automatic--no-setup).
 
 ```
 Capability tier:  Offline
-  search          ast-grep + text
+  search          ast-grep + text  [set server_url to enable semantic search]
   memory          sqlite (local)
   explore         unavailable  [set server_url to enable]
-  plan            unavailable  [set server_url to enable]
 ```
 
 The `memory` line reflects the resolved backend (`sqlite` / `git-notes` /
@@ -184,28 +185,31 @@ project, `spelunk status` reports `No spelunk project here` instead (see
 **Text output (Tier 1 — server connected):**
 
 ```
-Capability tier:  Server  (http://spelunk.internal:7777)
+Capability tier:  Server  (https://spelunk.internal.example.com)
   search          ast-grep + text + semantic
+  embedder        ready
   memory          sqlite (local)
   explore         available
-  plan            available
 ```
 
-**JSON output** (`spelunk status --format json`) adds a `capabilities` object:
+The `embedder` line reports the server's `embedder.state` from `/v1/health`; it
+is omitted when the server does not report that field.
+
+**JSON output** (`spelunk status --format json`) adds a `capabilities` object
+(other fields omitted):
 
 ```json
 {
   "tier": "server",
-  "server_url": "http://spelunk.internal:7777",
+  "server_url": "https://spelunk.internal.example.com",
   "capabilities": {
-    "search_semantic": true,
-    "index_embed": true,
-    "memory_push": true,
-    "memory_pull": true,
-    "memory_search": true,
-    "memory_harvest": true,
     "explore": true,
-    "plan": true
+    "index_embed": true,
+    "memory_harvest": true,
+    "memory_pull": true,
+    "memory_push": true,
+    "memory_search": true,
+    "search_semantic": true
   }
 }
 ```
@@ -219,37 +223,48 @@ Capability tier:  Server  (http://spelunk.internal:7777)
 
 ```
 Index is up to date. (412 files indexed)
-Server:  http://spelunk.internal:7777  ✓  (semantic search, explore, plan available)
+Server:  https://spelunk.internal.example.com  ✓  (semantic search, explore available)
 ```
 
 Or on failure:
 
 ```
 Index is up to date. (412 files indexed)
-Server:  http://spelunk.internal:7777  ✗  unreachable — offline mode
+Server:  https://spelunk.internal.example.com  ✗  unreachable — offline mode
 ```
 
 ---
 
 ## Error messages for locked features
 
-When a Tier 1 feature is invoked but no server is reachable, exit 2 with a
-consistent message format:
+When a Tier 1 feature is invoked but no server is reachable, the command exits
+1. Two deliberate message formats are used, selected by which command was run;
+both are written to stderr with `eprintln!` (never a panic).
+
+The `require_tier1` commands (`explore`, `memory push`, `memory pull`, `sync`,
+`memory watch`) point the user at `server_url`:
 
 ```
-error: 'spelunk explore' requires spelunk-server.
-       Set server_url in ~/.config/spelunk/config.toml to enable this feature.
-       (Tried: http://spelunk.internal:7777 — connection refused)
+Error: 'spelunk explore' requires spelunk-server.
+Set server_url in ~/.config/spelunk/config.toml to enable this feature.
+       (Tried: https://spelunk.internal.example.com — connection refused)
 ```
 
-If `server_url` is not set at all:
+The `(Tried: ...)` line is appended only when a `server_url` is configured but
+unreachable. If `server_url` is not set at all it is omitted:
 
 ```
-error: 'spelunk explore' requires spelunk-server.
-       Set server_url in ~/.config/spelunk/config.toml to enable this feature.
+Error: 'spelunk explore' requires spelunk-server.
+Set server_url in ~/.config/spelunk/config.toml to enable this feature.
 ```
 
-Use `eprintln!` to stderr. Do not panic.
+The inference-only commands (`memory search`, `memory harvest`) point the user
+at the local server instead, and also exit 1:
+
+```
+Error: 'spelunk memory search' requires spelunk-server.
+Run `spelunk server start` to enable this feature.
+```
 
 ---
 
@@ -276,6 +291,20 @@ is safe: chunks without embeddings remain in the DB and will be embedded on
 the next `spelunk index` run. Phase 1 is never re-run for unchanged files
 (blake3 hash check is unaffected).
 
+Phase 1 itself is also crash-safe. The content-hash write and the chunk
+writes are not spanned by one transaction, so a kill between them can leave a
+file recorded as hash-current with zero chunks. `Database::file_has_chunks`
+(`storage/files.rs`) makes the skip check require actual stored chunks, not
+just a matching hash, so the next plain run detects that half-indexed state
+and reprocesses the file instead of skipping it forever.
+
+The whole `spelunk index` process, both phases, is serialized per project by
+a cross-process advisory lock (`cli/cmd/index/run_lock.rs`), taken as the
+first thing a run does and released on process exit. Two concurrent runs
+against the same project previously could interleave writes and corrupt
+`index.db`; a second run that finds the lock held now exits immediately with
+a clean error instead of racing the first run's writes.
+
 Progress output during Phase 2:
 
 ```
@@ -293,9 +322,9 @@ updated `SearchRequest` schema.
 
 ---
 
-## Explore and Plan — context assembly
+## Explore — context assembly
 
-For `spelunk explore` and `spelunk plan`, the CLI is responsible for context
+For `spelunk explore`, the CLI is responsible for context
 retrieval from the local index before calling the server. This preserves data
 ownership: chunk content is never pushed to the server for storage.
 
@@ -304,21 +333,9 @@ Flow:
 1. CLI runs local text + (if available) semantic search to assemble
    `context_chunks`.
 2. CLI sends `{query, context_chunks}` to `POST /v1/projects/{id}/explore`
-   (SSE) or `POST /v1/projects/{id}/plan`.
+   (SSE).
 3. Server runs LLM reasoning loop over the provided context.
 4. Server does not store the context chunks.
 
 `context_chunks` are ephemeral — they exist only for the duration of the
 request.
-
----
-
-## Definition of done
-
-- [ ] `Config` gains `server_url` / `server_key` fields
-- [ ] Capability probe implemented and cached per-process
-- [ ] `spelunk status` shows capability tier section
-- [ ] `spelunk check` shows server reachability line when `server_url` is set
-- [ ] Error messages follow the format above for all locked features
-- [ ] `spelunk index` Phase 2 implemented (embedding via server)
-- [ ] All existing `cargo test` suites pass; `cargo fmt` + `cargo clippy` clean

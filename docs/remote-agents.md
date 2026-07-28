@@ -18,11 +18,11 @@ The shapes we distinguish:
 | Local (R0) | Your workstation | `http://127.0.0.1:7777` (auto) |
 | **Local Docker (R1)** | A container on your machine | `https://spelunk.your-domain` (portable) |
 | Cloud-managed (R2) | A cloud workspace (e.g. Background Agents) | `https://api.spelunk.cloud` |
-| Self-hosted remote (R3) | Your own VM / pod | `https://spelunk.your-domain` — see [Self-hosting](self-hosting.md) |
+| Self-hosted remote (R3) | Your own VM / pod | `https://spelunk.your-domain`: see [Server setup](server-setup.md) |
 
 This page covers **R1 (local Docker)**. R2 (cloud-managed) is on the roadmap and
 documented separately when it ships. R3 (self-hosted over the network) is
-[Self-hosting](self-hosting.md).
+[Server setup](server-setup.md).
 
 ## R1 — an agent in a local Docker container
 
@@ -39,7 +39,7 @@ address.
 
 ### Recommended: point at the server's HTTPS endpoint (portable)
 
-Stand up the team server the [Self-hosting](self-hosting.md) way (a routable
+Stand up the team server the [Server setup](server-setup.md) way (a routable
 bind with `--tls-cert`/`--tls-key` and a key, where the server terminates HTTPS
 itself) and point the container at its `https://` hostname. This works
 identically on Docker Desktop and native Linux, because it's a routable HTTPS
@@ -58,7 +58,7 @@ docker run --rm -it \
 - `SPELUNK_SERVER_URL` points the in-container CLI at the team server's own
   HTTPS endpoint, which the server serves directly.
 - `SPELUNK_SERVER_KEY` is the shared API key (required — a networked server is
-  always keyed; see [Self-hosting](self-hosting.md)).
+  always keyed; see [Server setup](server-setup.md)).
 - `-v "$PWD":/work` bind-mounts the repository so file paths recorded in memory
   entries mean the same thing inside the container and on the host.
 - `-v "$HOME/.config/spelunk":/root/.config/spelunk` bind-mounts your spelunk
@@ -88,7 +88,7 @@ The bundle is added as a trust anchor on top of the built-in roots, and
 certificate verification stays on. It must contain the issuing **CA**
 certificate, not the server's leaf. `SPELUNK_SERVER_CA` overrides the
 `server_ca` config key; see
-[Trusting the server's certificate](self-hosting.md#trusting-the-servers-certificate-on-the-client)
+[Trusting the server's certificate](server-setup.md#trusting-the-servers-certificate-on-the-client)
 for how to generate the CA and issue the server a leaf from it.
 
 Inside the container, the CLI behaves exactly as it would on the host:
@@ -99,7 +99,7 @@ spelunk search "auth tokens"  # semantic search via the server
 ```
 
 The **server side** of this (the routable TLS bind and the systemd unit) is the
-bare-metal path in [Self-hosting](self-hosting.md).
+bare-metal path in [Server setup](server-setup.md).
 
 ### No bridge shortcut, on any platform
 
@@ -136,7 +136,7 @@ the server side, which refuses a non-loopback plaintext bind unconditionally; a
 routable bind is only allowed with `--tls-cert`/`--tls-key` and a key.
 
 Use the recommended HTTPS-endpoint path above. The server's own routable TLS
-listener (per [Self-hosting](self-hosting.md)) is what makes it reachable from a
+listener (per [Server setup](server-setup.md)) is what makes it reachable from a
 container, and it does so the same way on every platform.
 
 ### Notes

@@ -641,7 +641,7 @@ def main() -> None:
             )
 
     api_key = args.api_key or os.environ.get("DEEPSEEK_API_KEY", "local")
-    api_key_source = (
+    provenance_label = (
         "flag:--api-key"
         if args.api_key
         else (
@@ -673,7 +673,7 @@ def main() -> None:
         "model": args.model,
         "model_source": "api",
         "api_base_url": args.api_base_url,
-        "api_key_source": api_key_source,
+        "api_key_source": provenance_label,
         "spelunk_version": get_spelunk_version(),
         "scaffold_hash": args.scaffold_hash or scaffold_hash(),
         "repo_filter": args.repo_filter,

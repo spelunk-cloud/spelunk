@@ -3,8 +3,8 @@
 **Date:** 2026-07-11
 **Deciders:** founder (Johan); architect
 **Relationship to prior ADRs:** completes the product-direction decision that
-[ADR-067](067-fail-closed-no-local-project.md) explicitly deferred to
-spelunk-oss^134 ("Broader UX direction is out of scope … a separate product
+[ADR-067](067-fail-closed-no-local-project.md) explicitly deferred
+("Broader UX direction is out of scope … a separate product
 decision"). Builds on ADR-067's isolation floor but **narrows** its
 "fail-closed for memory" posture: where ADR-067 refused all memory operations
 without a local `.spelunk/` project, this ADR routes `memory add` / `memory
@@ -32,9 +32,9 @@ docs at the commands that genuinely work with no `init`, and to make `memory
 add` / `memory list` honour the "stored in git notes — travels with the repo"
 claim before `init` as well.
 
-### What actually runs before `init` (on `main`, after oss^147)
+### What actually runs before `init` (on `main`, after the global-store fix)
 
-`oss^147` (merged) closed the ADR-067 global-store residual: `graph`, `chunks`,
+A merged fix closed the ADR-067 global-store residual: `graph`, `chunks`,
 `check`, and `explore` now route through `require_project_db` and no longer fall
 back to the machine-global `~/.config/spelunk/index.db`. Nothing reads that
 global store implicitly any more. Current behaviour in an un-`init`'d, populated
@@ -44,8 +44,8 @@ repo:
 |---|---|
 | `spelunk search "…"` (**auto**, no `--mode`) | Degrades to `search_live` (ast-grep structural scan) when no index is present. This is the genuine zero-setup search surface; the doc never showed it. |
 | `spelunk search "…" --mode text` | Explicit FTS-over-index mode. Fails closed via `require_project_db` with *"no spelunk project here. Run 'spelunk init' first"*. Correct for an index-only mode — the doc simply led with the wrong invocation. |
-| `spelunk graph <symbol>` | Falls to the ast-grep `symbol($$$)` live call-site scan (exact, unranked) when no index opens; no longer reads any global store (oss^147). Zero results print `No scannable source files under this directory` (empty/umbrella dir) or `No callers found for '<symbol>' (live scan)` (source present, no match); the live scan never suggests `init` (oss^127). |
-| `spelunk graph <file-path>` / `chunks` / `check` / `explore` | Index-backed. Refuse with *"no spelunk project here. Run 'spelunk init' first"* (post-^147). |
+| `spelunk graph <symbol>` | Falls to the ast-grep `symbol($$$)` live call-site scan (exact, unranked) when no index opens; no longer reads any global store (the global-store fix). Zero results print `No scannable source files under this directory` (empty/umbrella dir, no `init` hint) or `No call-site invocations of '<symbol>' found (live structural scan matches '<symbol>(...)' calls only)` plus a `spelunk init` hint (source present, no match). The empty/umbrella-dir branch still has no `init` hint; the source-present branch gained one in the follow-up fix below. |
+| `spelunk graph <file-path>` / `chunks` / `check` / `explore` | Index-backed. Refuse with *"no spelunk project here. Run 'spelunk init' first"* (after the global-store fix). |
 | `spelunk memory add` / `list` / `search` | **Currently** all fail closed pre-`init`: `memory/mod.rs:377–380` calls `require_project_db(&cfg.db_path, false)` and bails without a `.spelunk/` dir. This ADR changes `add` / `list` (see D3). |
 
 ### The architectural fault line
@@ -55,7 +55,7 @@ The code already draws the line the product decision needs:
 - **Working-tree-only, index-free, global-store-free** commands: `search "…"`
   (auto→ast-grep), `search --mode ast-grep`, `graph --live` / `graph <symbol>`'s
   ast-grep fallback. ADR-067 D1 exempts ast-grep because it "touches no index and
-  no global store," and oss^147 removed the residual global read. These are the
+  no global store," and the global-store fix removed the residual global read. These are the
   real zero-setup surface and are safe to run anywhere.
 - **Index-backed** commands: `search --mode text` (FTS), `graph <file>`,
   `chunks`, `check`, `explore`. These need `spelunk index` and correctly refuse
@@ -111,7 +111,7 @@ The docs must showcase the invocations that work as written — bare `search "�
 not `--mode text`; `graph <symbol>` / `--live`, not `graph <file>` — and frame
 the code-search/graph pieces as a *live structural scan*, not the full indexed
 graph/search. Working-tree-only is a hard constraint: none of these may read a
-machine-global store (oss^147 already guarantees this for `graph`).
+machine-global store (the global-store fix already guarantees this for `graph`).
 
 ### D3 — git-notes memory fallback for `add` / `list` before `init` (new feature)
 
@@ -128,7 +128,7 @@ and via `list` visibility into what is stored, without indexing the project.
 > priority for no reason. The corrected model below does not touch store
 > priority: it leans on the universal `store_in_git_notes` write-through that
 > already runs on every `memory add`, and only stops `add` / `list` from failing
-> closed before `init`. #580 (^154) implemented the superseded framing and is
+> closed before `init`. #580 implemented the superseded framing and is
 > re-scoped to this model.
 
 **The carrier already exists.** `memory add` already appends every new entry as
@@ -145,7 +145,7 @@ before `add` ever runs.
 notes (`refs/notes/spelunk`) are the durable carrier that travels with the repo;
 the local SQLite `memory.db` is the queryable index over that carrier. It holds
 the embeddings semantic `memory search` needs and is hydrated from the notes
-(the `init`-time git-notes import, ^155, is exactly that hydration step). This
+(the `init`-time git-notes import is exactly that hydration step). This
 does **not** contradict ADR-004. ADR-004 resolved a *local-vs-server*
 split-brain: it makes `memory.db` canonical *relative to a shared team server*
 and holds that memory stays local unless an explicit team `server_url` relocates
@@ -168,7 +168,7 @@ single change is at the pre-dispatch `require_project_db` bail:
   **one write path** pre- and post-`init`, so every note in `refs/notes/spelunk`
   carries an identical record shape (`schema_version`, timestamps, `remote_id`).
   That uniformity is the robustness win over a separate `GitNotesBackend.add`
-  path: it keeps the `init`-time import (^155) and plain
+  path: it keeps the `init`-time import and plain
   `git notes --ref=spelunk …` inspection consistent.
 - **`memory list`:** with no `memory.db`, read the entries back from
   `refs/notes/spelunk`.
@@ -214,18 +214,18 @@ returns a clear message pointing at the right next step — `spelunk init`,
 `spelunk server start`, or `--mode text` — rather than implying a **team**
 `server_url` is required (the current message misleads a solo user).
 
-## Per-ticket disposition
+## Per-item disposition
 
-| Ticket | Disposition under keep-zero-setup + git-notes fallback |
+| Item | Disposition under keep-zero-setup + git-notes fallback |
 |---|---|
-| **^127 / ^128** — `graph` exact-match only, no signal on zero results | **Survives, rescoped to a zero-result affordance.** When `graph <symbol>` finds nothing, guide the user to `spelunk graph --live` (structural scan) or `spelunk init` (full graph), optionally a did-you-mean. No global-store risk remains (oss^147 merged). Drop any "fuzzy graph before init" goal. |
-| **^129** — `search --mode text` hard-errors, demands `index` | **Mooted as a code bug; becomes a doc fix (marketing-site^33).** The hard error is correct for an explicit index-only mode. The zero-setup example must use bare `search "…"` (auto→ast-grep); `--mode text` is shown as a post-`init` example. No spelunk-oss change. |
-| **^130** — ast-grep fallback has no substring/fuzzy | **Optional enhancement, not a blocker.** Ship a clear "no matches (live structural scan) — run `spelunk init` for full search" hint now; treat fuzzy/substring as a later nice-to-have. |
-| **^131 / ^132** — memory scoping (silent global DB; git-notes not the default backend / no sync consumer) | **Direction changes from fail-closed-refuse to git-notes fallback (D3).** ADR-067 already closed the silent-global-DB leak. This ADR now makes git-notes the **pre-`init` memory path** for `add` / `list` — which reverses ^132's "git-notes is not the default backend" premise for the pre-`init` case. Follow-up: ^132's "no sync consumer" and ^126's "notes don't travel via push/fetch/clone by default" become **material** to the "travels with the repo" promise — see Open questions. |
-| **^133** — `memory search` misleadingly suggests team `server_url` | **Messaging fix (D4).** Point at `spelunk init` / `spelunk server start` / `--mode text`, not a team server. Consider defaulting to `--mode text` when no embedder is available. |
-| **^126** — git notes don't travel via push/fetch/clone by default | **Elevated by this decision.** Once git-notes is the pre-`init` "memory that travels with the repo," the promise only fully holds if `refs/notes/spelunk` is push/fetch-visible. Decide whether the fallback (or `init`, or a documented one-time git config) should configure the notes refspec — see Open questions. |
-| **^140** — manual git-notes inspection docs | **Elevated.** More users will now have notes written via the fallback; the inspection docs (`git notes --ref=spelunk …`, and `spelunk memory list`) are the transparency surface. Keep them current. |
-| **marketing-site ^32 / ^33** — getting-started rewrite | **Primary doc deliverable.** Keep the zero-setup framing (D1). Fix the broken examples to use commands that actually work with no `init` (D2): bare `search "…"`, `graph <symbol>` / `--live`, and `memory add` / `list` via the git-notes fallback (D3). Move `--mode text`, indexed graph, and semantic examples into a clearly-marked "after `spelunk init`" section without displacing the zero-setup headline. |
+| **`graph` exact-match only, no signal on zero results** | **Survives, rescoped to a zero-result affordance.** When `graph <symbol>` finds nothing, guide the user to `spelunk graph --live` (structural scan) or `spelunk init` (full graph), optionally a did-you-mean. No global-store risk remains (the global-store fix is merged). Drop any "fuzzy graph before init" goal. **Landed:** the source-present branch now prints the reworded message plus an `init` hint; the empty/umbrella-dir branch was left without one on purpose. |
+| **`search --mode text` hard-errors, demands `index`** | **Mooted as a code bug; becomes a getting-started doc fix.** The hard error is correct for an explicit index-only mode. The zero-setup example must use bare `search "…"` (auto→ast-grep); `--mode text` is shown as a post-`init` example. No spelunk-oss change. |
+| **ast-grep fallback has no substring/fuzzy** | **Optional enhancement, not a blocker.** Ship a clear "no matches (live structural scan); run `spelunk init` for full search" hint now; treat fuzzy/substring as a later nice-to-have. |
+| **Memory scoping** (silent global DB; git-notes not the default backend / no sync consumer) | **Direction changes from fail-closed-refuse to git-notes fallback (D3).** ADR-067 already closed the silent-global-DB leak. This ADR now makes git-notes the **pre-`init` memory path** for `add` / `list`, which reverses the "git-notes is not the default backend" premise for the pre-`init` case. Follow-up: the absent sync consumer and the fact that notes don't travel via push/fetch/clone by default become **material** to the "travels with the repo" promise; see Open questions. |
+| **`memory search` misleadingly suggests team `server_url`** | **Messaging fix (D4).** Point at `spelunk init` / `spelunk server start` / `--mode text`, not a team server. Consider defaulting to `--mode text` when no embedder is available. |
+| **Git notes don't travel via push/fetch/clone by default** | **Elevated by this decision.** Once git-notes is the pre-`init` "memory that travels with the repo," the promise only fully holds if `refs/notes/spelunk` is push/fetch-visible. Decide whether the fallback (or `init`, or a documented one-time git config) should configure the notes refspec (see Open questions). |
+| **Manual git-notes inspection docs** | **Elevated.** More users will now have notes written via the fallback; the inspection docs (`git notes --ref=spelunk …`, and `spelunk memory list`) are the transparency surface. Keep them current. |
+| **getting-started rewrite** (marketing site) | **Primary doc deliverable.** Keep the zero-setup framing (D1). Fix the broken examples to use commands that actually work with no `init` (D2): bare `search "…"`, `graph <symbol>` / `--live`, and `memory add` / `list` via the git-notes fallback (D3). Move `--mode text`, indexed graph, and semantic examples into a clearly-marked "after `spelunk init`" section without displacing the zero-setup headline. |
 | **New work item — git-notes memory fallback** | **Implement D3** in spelunk-cli: before `init` (no `.spelunk/` project) but inside a git repo, stop `memory add` / `list` failing at the `require_project_db` bail. `add` skips the absent SQLite primary and lets the existing `store_in_git_notes` write-through carry the entry to `refs/notes/spelunk`; `list` reads it back from the notes; explicit `--backend git-notes` suppresses the write-through so an entry is not written twice. Fail only when there is neither a DB nor a git repo. File under spelunk-oss. |
 
 ## Non-goals
@@ -256,13 +256,15 @@ returns a clear message pointing at the right next step — `spelunk init`,
   behaviour and a partial reversal of ADR-067's
   fail-closed-for-memory posture: fail-closed now means "fall back to git notes
   if a repo exists, else refuse," not "always refuse without `.spelunk/`."
-- **git-notes visibility becomes a promise-load-bearing concern.** ^126 (notes
-  don't push/fetch/clone by default) and ^132 (no sync consumer) move from
-  cleanup to "does the 'travels with the repo' claim actually hold?" — resolved
-  in Open questions / follow-up, not silently assumed.
-- **The ticket set shrinks to messaging + docs + one new feature.** ^129 is a doc
-  fix; ^131/^132 reframe to the git-notes fallback; ^127/^128/^133 are small
-  affordance/messaging fixes; ^130 is optional; ^126/^140 are elevated; plus the
+- **git-notes visibility becomes a promise-load-bearing concern.** Notes not
+  pushing/fetching/cloning by default, and the absence of a sync consumer, move
+  from cleanup to "does the 'travels with the repo' claim actually hold?", a
+  question resolved in Open questions / follow-up rather than silently assumed.
+- **The work shrinks to messaging + docs + one new feature.** The `--mode text`
+  hard error is a doc fix; memory scoping reframes to the git-notes fallback; the
+  `graph` zero-result affordance and the `memory search` message are small
+  affordance/messaging fixes; ast-grep fuzzy matching is optional; notes
+  visibility and the git-notes inspection docs are elevated; plus the
   one new implementation item (D3).
 - **Revisit if:** the "travels with the repo" promise cannot be honoured without
   surprising git config changes (see Open questions), in which case the doc claim
@@ -279,13 +281,13 @@ returns a clear message pointing at the right next step — `spelunk init`,
   body, run **before** any persistence) applies unchanged on the git-notes path,
   so no credential reaches the note.
 - D2's working-tree-only constraint on the index-free surface is preserved by
-  oss^147 (no machine-global read from `graph`).
+  the global-store fix (no machine-global read from `graph`).
 
 ## Open questions
 
 - **Does "travels with the repo" require configuring the notes refspec?**
   `git notes` under `refs/notes/spelunk` are **not** pushed, fetched, or cloned
-  by default (^126). Because D3 makes those notes the durable carrier for
+  by default. Because D3 makes those notes the durable carrier for
   pre-`init` memory (not a second copy of a SQLite store of record), the
   "travels with the repo" claim now rests entirely on that ref being visible
   across clones. For the promise to hold across machines / teammates, either
@@ -295,7 +297,8 @@ returns a clear message pointing at the right next step — `spelunk init`,
   direction: have `init` offer to configure the refspec, and until then keep the
   doc claim accurate ("stored in git notes; run
   `spelunk memory list` to inspect") rather than over-promising cross-machine
-  sync. Track under ^126; do not block D3's local `add` / `list` on it.
+  sync. Track the notes-refspec question separately; do not block D3's local
+  `add` / `list` on it.
 
 ## Amendment (2026-07-13): canonical content-addressed identity for memory entries
 
@@ -723,3 +726,584 @@ replaced:
   accidental id clash between two genuinely different entries negligible. The
   existing pre-persistence secret scan is unaffected; identity is computed from
   the same fields that scan already gates.
+
+## Amendment (2026-07-18): entity_id backfill and uniqueness promotion for existing local stores
+
+**Date:** 2026-07-18
+**Deciders:** founder (Johan); architect
+
+A6's retrofit shipped with `entity_id` populated only on new rows: migration
+`023_memory_entity_id.sql` adds the column plus a **non-unique** index by
+explicit design, and its own comment names the reason: "the backfill rule is a
+separate open decision" and "a UNIQUE index would abort the migration." A6
+flagged the same gap directly: "Populating the column on existing rows and
+resolving those collisions is being decided separately, is a precondition of
+this retrofit, and is deliberately not designed here." This amendment is that
+decision.
+
+`reconcile.rs` already implements the collapse mechanics this backfill needs
+(`collapse_candidates`, `MergedNote::absorb`, `MemoryStore::union_tags_and_files`,
+`MemoryStore::set_superseded_by`), but only for *incoming* `server.db`
+candidates, before they are ever written to `memory.db`. Rows already resident
+in `memory.db` are, by that module's own design, left untouched: duplicates are
+folded into `entity_to_local` via `.entry().or_insert()` over rows ordered
+`created_at ASC`, so the oldest local row silently becomes the edge target and
+nothing merges or is deleted. This amendment applies the same merge rule
+intra-table, to rows already sitting in `memory.db`.
+
+### B1 – Collapse existing duplicates, not keep-both under a relaxed constraint
+
+Rows sharing an `entity_id` are merged, not left in place indefinitely under a
+non-unique index. Keeping both would key local dedup on something other than
+`entity_id`, reopening the cross-machine convergence problem A2 closes and
+leaving `memory.db` permanently out of step with the "entity_id is the key"
+contract that reconcile, init-import, and server sync already code against.
+
+For each group of `notes` rows sharing an `entity_id`:
+
+- **Survivor**: the row with the earliest `created_at` in the group, matching
+  the first-seen convention `all_notes_for_dedup` already uses (rows ordered
+  `created_at ASC`, folded via `entity_to_local.entry().or_insert()`).
+- **`tags` / `linked_files`**: union, add-wins, order of first appearance, the
+  same rule `union_tags_and_files` and A6 use for the incoming-candidate case.
+- **`status`**: archived sticks. If any row in the group is archived, the
+  survivor becomes archived; if none are, the survivor's own status is
+  unchanged.
+- **Survivor's own `superseded_by`**: if it is `NULL` and another row in the
+  group carries a non-null value, the survivor adopts it. If two rows in the
+  group carry conflicting non-null values, the earliest-created one wins
+  deterministically and the run logs a warning; it does not error (rows share
+  content by construction, so this is expected to be rare).
+- **`superseded_by` edges elsewhere in `notes` pointing at a loser**: every row
+  whose `superseded_by` targets a loser is rewritten to the survivor's id
+  before the loser is deleted, mirroring `set_superseded_by`.
+- **Self-edge guard**: a rewrite that would set a row's `superseded_by` to its
+  own id is dropped to `NULL` instead, mirroring reconcile's existing
+  `if succ_local_id == *local_id { continue; }` guard.
+- **Losers are deleted**, along with their `note_embeddings` row if present
+  (the `vec0` virtual table carries no foreign key, so this is an explicit
+  delete). No embedding merge: two vectors have no meaningful union, and
+  embeddings sit outside A6's merge scope.
+- The survivor's own `id` (rowid), `remote_id`, and sync bookkeeping are
+  untouched; per A4 the rowid is process-local, not identity, so which specific
+  row happens to survive does not matter downstream.
+
+### B2 – `spelunk memory dedupe`: explicit, not folded into a silent migration
+
+The collapse in B1 is the first operation in this codebase that deletes rows
+already resident in `memory.db`, so it ships as its own command rather than
+running invisibly inside routine `Database::open`. This is stricter than
+`memory reconcile`'s own posture, not merely consistent with it: reconcile's
+collapse only ever touches candidate rows before their first write to
+`memory.db`; it never deletes a row already stored there.
+
+A new `spelunk memory dedupe` subcommand, sibling to `reconcile`, with the same
+flag and summary shape as `MemoryReconcileArgs`:
+
+- `--dry-run` (bool, default false): detect and report duplicate groups, write
+  nothing.
+- `--format text|json`, the same convention `reconcile` uses.
+- Summary fields: `total_notes`, `duplicate_groups`, `rows_collapsed`,
+  `tags_merged`, `linked_files_merged`, `supersede_edges_repointed`,
+  `supersede_self_edges_dropped`.
+- One `BEGIN IMMEDIATE` / `COMMIT` transaction per run, mirroring
+  `import_batch`. Any error mid-run rolls back: `memory.db` is left exactly as
+  it was, and the command reports the error rather than a partial summary.
+- Never invoked automatically. `spelunk init`, `spelunk memory add`, and every
+  other automatic path continue to leave existing duplicate rows alone, exactly
+  as migration 023's own comment already documents ("those duplicates are
+  harmless and are left in place").
+
+### B3 – Migration shape: two independently-safe steps, no hard-abort
+
+Split into a step that is always safe to run automatically and a step that is
+conditional on the first having fully resolved duplicates. Reuses the
+`apply_dim_upgrade_migration` idiom already in `db.rs` (the 768-to-896
+embedding-dimension upgrade): a Rust-side, marker-guarded, conditional step
+that runs at `Database::open` and never issues a blind SQL `ALTER` /
+`CREATE UNIQUE INDEX` that can hard-fail the whole open.
+
+**Step A, populate `entity_id` (unconditional, no decision risk).** At
+`Database::open`, after existing migrations: select rows where `entity_id IS
+NULL`, compute `entity_id()` in Rust (`sha256` is unavailable to raw SQL, so
+this cannot be a plain `.sql` migration file), `UPDATE notes SET entity_id =
+?1 WHERE id = ?2`. Idempotent: an interrupted run simply leaves the remaining
+rows `NULL` for the next open to pick up. Cannot fail on a constraint, because
+migration 023's index stays non-unique for this step.
+
+**Step B, promote the index to UNIQUE (conditional).** After Step A, at
+`Database::open`: scan for any `entity_id` shared by more than one row.
+
+- **Zero duplicate groups**: `DROP INDEX idx_notes_entity_id; CREATE UNIQUE
+  INDEX idx_notes_entity_id ON notes(entity_id) WHERE entity_id IS NOT NULL;`,
+  then record a marker (mirroring the `schema_int8_embeddings` marker table) so
+  later opens skip the scan.
+- **One or more duplicate groups**: no-op. The existing non-unique index stays
+  in place (no regression versus today), and one actionable line is logged
+  naming `spelunk memory dedupe` as the next step. This is what satisfies "must
+  not hard-abort and brick an existing `memory.db`": the store stays fully
+  functional indefinitely until the user opts into `dedupe`.
+- Both checks re-run on every open until promotion succeeds; the row-scan cost
+  is bounded, and Step A already makes the steady-state case a fast no-op
+  query.
+
+### B4 – Non-goals, consequences, security
+
+- **Non-goal:** an automatic backfill-and-delete inside routine `Database::open`
+  with no explicit user action. B2 makes the deletion deliberate and
+  user-invoked.
+- **Non-goal:** merging or deduplicating embeddings. Losing a loser's embedding
+  on collapse is accepted; the survivor's own embedding, if it has one, is
+  untouched.
+- **Consequence:** a store with duplicate `entity_id` groups keeps its
+  non-unique index and keeps working exactly as it does today; every command
+  that does not call `dedupe` is unaffected by this amendment. Uniqueness is
+  opt-in, not forced on an existing store.
+- **Consequence:** once `dedupe` collapses a store to zero duplicate groups and
+  the store is reopened, `idx_notes_entity_id` promotes to UNIQUE and stays
+  enforced from then on; a later insert that would collide is a constraint
+  violation, not a silent duplicate.
+- **Security:** `dedupe` deletes rows the user already owns locally; there is
+  no new trust boundary and no data leaves the machine. The transaction posture
+  (a single `BEGIN IMMEDIATE` / `COMMIT`, no partial summary on error) is the
+  control against a partially-applied merge corrupting `memory.db`; no further
+  mitigation is needed because the operation is local, explicit, and confined
+  to a single all-or-nothing write.
+
+## Amendment (2026-07-18): `add_note` collision handling once `entity_id` is UNIQUE
+
+**Date:** 2026-07-18
+**Deciders:** founder (Johan); architect
+
+The previous amendment promotes `idx_notes_entity_id` to UNIQUE once a store
+reaches zero duplicate `entity_id` groups, and accepts as a consequence that
+"a later insert that would collide is a constraint violation, not a silent
+duplicate." It fully specified the collapse of existing duplicates
+(`spelunk memory dedupe`), but left one path unspecified: an ordinary
+`MemoryStore::add_note` or `add_note_with_created_at` call for content whose
+`kind`/`title`/`body` already matches a stored row, submitted after the index
+has promoted. Review of the implementation found that this path hits the bare
+SQL error directly: `spelunk memory add` for byte-identical content returns
+`Error: UNIQUE constraint failed: notes.entity_id` and exits 1, contradicting
+this ADR's own framing that recording identical content twice "yields one
+entry."
+
+### C1 - Reuse the existing row instead of erroring
+
+`add_note` and `add_note_with_created_at` catch a UNIQUE-constraint failure on
+`notes.entity_id` specifically (matched by the SQLite error message; no other
+column either function populates carries a colliding UNIQUE index, since
+`uuid` and `remote_id` are both left `NULL` on these insert paths and their own
+partial UNIQUE indexes exclude `NULL`), and recover rather than propagate:
+
+- Look up the existing row's id by `entity_id`.
+- Merge the call's `tags` and `linked_files` into that row via the existing
+  `union_tags_and_files` (add-wins, order of first appearance), the same rule
+  this ADR already uses for reconcile's incoming-candidate collisions and for
+  B1's intra-table collapse.
+- Return the existing row's id instead of inserting a new row.
+- Do not touch the existing row's `status` or `superseded_by`. A plain `add`
+  call carries neither as an update target the way B1's intra-table collapse
+  does for two independently-created rows already resident in the store, so
+  there is nothing to reconcile there beyond tags and linked_files.
+
+This is an insert-then-recover design, not a lookup-then-skip one: the
+function still attempts the INSERT first and falls back to the merge path
+only if SQLite actually rejects it. A proactive lookup before every insert
+would also silently change behavior before the index is promoted, when a
+store can legitimately hold several rows sharing one `entity_id` (the exact
+condition `dedupe` exists to resolve). The test suite for B1-B3 builds such
+rows directly via `add_note`/`add_note_with_created_at` against a
+not-yet-promoted index and must keep doing so unchanged; an insert-then-recover
+design only ever activates once SQLite's own UNIQUE index actually rejects a
+write, so it cannot fire before promotion regardless of how many rows already
+share an `entity_id`.
+
+`add_note_superseding` (the `--supersedes` path) is out of scope here: its
+INSERT statement does not populate `entity_id` at all, so it cannot violate
+this index today. That is a related gap in the identity model, not a
+consequence of this decision, and is tracked as a separate follow-up.
+
+### C2 - CLI output distinguishes the two outcomes
+
+`MemoryBackend::add`, and the underlying `add_note`/`add_note_with_created_at`,
+report whether the call inserted a new row or reused an existing one, so
+`spelunk memory add` can tell the user which happened:
+
+- New row: unchanged, `Stored [{kind}] #{id}: {title}`.
+- Reused row: `Already recorded as [{kind}] #{id}: {title}`, using the
+  existing row's id.
+
+The git-notes write-through carrier is unaffected: it appends unconditionally
+regardless of whether the SQLite store deduped, matching its existing role as
+an append-only audit trail that `reconcile` already knows how to collapse on
+import.
+
+### C3 - Consequences
+
+- A `memory add` call is idempotent on content identity once a store's index
+  has promoted: repeating the same `kind`/`title`/`body` never errors,
+  extending this ADR's "yields one entry" framing to every insert path, not
+  only to `dedupe`'s collapse of rows already resident in the store.
+- Before promotion, behavior is unchanged: a store may still accumulate
+  duplicate rows exactly as it does today, resolved later by an explicit
+  `spelunk memory dedupe` run.
+- `add_note_superseding` colliding with the promoted index remains possible in
+  principle once its own identity gap (not setting `entity_id` on insert) is
+  closed; that gap is not closed by this amendment.
+
+## Amendment (2026-07-19): `add_note_superseding` identity gap, Step A hardening, and double-supersede carrier consistency
+
+**Date:** 2026-07-19
+**Deciders:** founder (Johan); architect
+
+Three related gaps in the supersede path, all found on the identity-model
+surface these amendments already cover: the `add_note_superseding` identity
+gap and the Step A hardening it exposes (E1-E2), a flagged-not-fixed second
+insert path (E3), and a double-supersede carrier-consistency bug (E4-E5).
+
+**Provenance check (2026-07-19).** At the time of this amendment, the third
+amendment's Step A/B (`entity_id_migration.rs`) and `spelunk memory dedupe`
+exist only on an in-progress branch, not yet on `main`. The fourth
+amendment's C1 (`add_note`/`add_note_with_created_at` insert-then-recover) is
+speced but has no Rust implementation anywhere yet; it is landing on that
+same branch. E1-E3 below are therefore corrections to land **in the same
+implementation pass** as that work, not patches against already-shipped code.
+
+### E1 – `add_note_superseding` gains `entity_id` and the same insert-then-recover as `add_note`
+
+The fourth amendment's C1 explicitly scoped `add_note_superseding` out:
+"its INSERT statement does not populate `entity_id` at all, so it cannot
+violate this index today... tracked as a separate follow-up." This is that
+follow-up.
+
+`add_note_superseding` (`crates/spelunk-core/src/storage/memory/edges.rs`)
+computes `entity_id` at insert time exactly like `add_note` /
+`add_note_with_created_at`:
+
+```rust
+crate::storage::entity_id::entity_id(kind, title, body)
+```
+
+added to its `INSERT INTO notes` column list. This closes the root cause: no
+future `--supersedes`-created row is ever `entity_id = NULL`.
+
+Once this INSERT populates `entity_id`, it is subject to the same UNIQUE
+constraint C1 gave `add_note`, so it needs the same insert-then-recover
+handling, not a bare `INSERT` that can now fail: attempt the insert; on a
+UNIQUE-constraint failure on `notes.entity_id` specifically, look up the
+existing row by `entity_id` and merge `tags`/`linked_files` into it via the
+existing `union_tags_and_files`, exactly as C1 specifies, **and use that
+existing row's id as the successor** for the archive-`OLD` step that follows
+(the transaction's second statement, `UPDATE notes SET status='archived',
+superseded_by=?2, ... WHERE id=?1 AND status='active'`, must run against
+whichever id is authoritative: the freshly inserted row, or the reused
+existing one). Return type changes to expose both the id and whether a fresh
+row was created, mirroring the fourth amendment's C2 (so the CLI can
+distinguish "created" from "reused" here too). `add_note_superseding`'s own
+archive-`OLD` UPDATE must also report whether it actually changed a row: a
+signal the separate follow-up work on re-superseding an already-archived
+entry will also need.
+
+### E2 – Step A backfill hardens against a collision it can now hit
+
+The third amendment's B3 states Step A "cannot fail on a constraint, because
+migration 023's index stays non-unique for this step." That is true only for
+a store's *first* pass through Step A, before Step B has ever promoted the
+index. It is not true in general: Step A and Step B both run, unconditionally,
+on **every** `MemoryStore::open`, not just the first. Once a store has
+already been promoted to UNIQUE by an earlier open, any row that reaches Step
+A still `entity_id IS NULL` (a row inserted by *some* path that predates E1's
+fix, or by any future path that has the same gap) hits Step A's bare
+`UPDATE notes SET entity_id = ?1 WHERE id = ?2` on a now-UNIQUE index. If the
+computed value collides with an existing row's `entity_id`, that `UPDATE`
+raises a UNIQUE-constraint error with no handler, which propagates out of
+`backfill_entity_ids` via `?` and hard-fails `MemoryStore::open` itself,
+bricking every `spelunk` command against that store.
+
+Step A's per-row `UPDATE` catches a UNIQUE-constraint violation on
+`notes.entity_id` specifically and, on that error only, skips the row
+(leaving it `NULL` for a future `dedupe`-then-retry) and logs one actionable
+warning naming the affected row id and pointing at `spelunk memory dedupe`,
+reusing Step B's existing message shape. Any other error from the `UPDATE`
+still propagates unchanged. Step A must never hard-abort `open`, matching the
+third amendment's own stated invariant for Step B; this closes the one case
+where Step A did not yet live up to it.
+
+### E3 – A second latent NULL-`entity_id` insert path found: `apply_remote_note`, flagged, not fixed here
+
+Grepping every `INSERT INTO notes` in `spelunk-core`/`spelunk-cli` found a
+second path that never populates `entity_id`:
+`MemoryStore::apply_remote_note` (`crates/spelunk-core/src/storage/memory/sync.rs`),
+the cloud-pull idempotency path for an explicit team `server_url`. Unlike
+`add_note_superseding`, this one is not a same-shape fix: its own doc comment
+states an **Add-Wins/keep-both** posture ("pulled entries are added, never
+overwriting local ones"), which predates `entity_id` and may not compose
+cleanly with C1's merge-on-collision behavior, a pulled row and a locally
+authored row can legitimately share content but arrive by different paths,
+and which posture is correct there is its own question, not a mechanical
+copy of E1. **Not decided or fixed by this amendment.** Filed as its own
+follow-up task, scoped to: (a) whether `apply_remote_note` should set
+`entity_id` at insert time, and (b) whether a collision there should merge
+(C1-style), keep-both (status quo, requiring the index to stay non-unique for
+this path, which conflicts with E2's premise), or something else. Until that
+is decided, E2's Step A hardening is what keeps this path from being able to
+hard-fail `open` in the meantime, this is additional justification for
+shipping E2 regardless of E1.
+
+### E4 — Re-superseding an already-archived entry: reject, don't silently fork the carrier
+
+**Correction to the reported bug's framing.** Its "Problem" section
+describes both `memory add --supersedes` and `memory supersede` as
+unconditional carrier-appenders. Re-reading both CLI commands: **only `memory
+add --supersedes` has this bug.** `memory supersede`
+(`crates/spelunk-cli/src/cli/cmd/memory/supersede.rs`) already gates its
+carrier-append on `backend.supersede(...)`'s returned `bool` (`changed > 0`
+from the SQL layer) and `anyhow::bail!`s with "No active memory entry with id
+{old} (old)" when it is `false` — i.e., re-superseding an already-archived
+`OLD` via `memory supersede` already errors today and never double-writes the
+carrier. The task's own repro section confirms this by construction: both
+repro steps use `memory add --supersedes`, never `memory supersede`.
+
+The actual gap is narrower: `add_note_superseding`'s archive-`OLD` `UPDATE`
+(`WHERE id = ?1 AND status = 'active'`) silently no-ops when `OLD` is already
+archived, and neither `add_note_superseding` nor `add.rs`'s CLI handler
+inspect that outcome — unlike `supersede()`, which already returns whether it
+changed a row, `add_note_superseding` currently discards that information
+entirely.
+
+**Decision: `memory add --supersedes` adopts the same reject-with-error
+semantics `memory supersede` already has, on both storage paths.** This was
+chosen over silent-no-op (would leave the CLI's two supersede entry points
+behaviorally inconsistent, which is what created this bug's asymmetry in the
+first place) and over chained-supersede-by-recency (a real feature nobody has
+asked for; introducing it here would be scope creep against the existing
+"reject" precedent that already ships in `supersede.rs`).
+
+- **`add_note_superseding`** reports whether its archive-`OLD` `UPDATE`
+  actually changed a row (mirrors `supersede()`'s existing `Result<bool>`
+  return). When it did not (OLD absent or already archived), the whole
+  transaction rolls back and the function returns an error — **no new note is
+  created and nothing is written**, the same fail-fast contract `memory
+  supersede` already has. This is a deliberate behavior change from today,
+  where `add --supersedes` against an already-archived `OLD` currently
+  *succeeds*, creating an orphaned new note plus the conflicting carrier
+  write described above.
+- **`crates/spelunk-cli/src/cli/cmd/memory/add.rs`** (post-`init`, SQLite
+  primary): when `args.supersedes` is `Some`, read `OLD`'s current status
+  *before* calling `backend.add(...)` (the CLI already reads `OLD` later, to
+  build the `append_state_update` call — move that read earlier and reuse it,
+  rather than reading twice). If `OLD` is not `status == "active"`, fail the
+  whole command with an error before any write (SQLite or git-notes) happens,
+  mirroring `supersede.rs`'s message shape ("No active memory entry with id
+  {old} (old)."). This is a control-flow change to `add.rs`: today the
+  `--supersedes` validity check happens implicitly and too late (inside the
+  SQL `UPDATE`'s `WHERE` clause, whose result is discarded); it needs to move
+  to an explicit pre-flight check.
+- **Pre-`init`, git-notes-only path** (no SQLite primary to consult): the same
+  pre-flight check reads `OLD` via `GitNotesBackend::new().get(old_id)` (the
+  CLI already does this for the existing carrier-append block — reuse it,
+  moved earlier) and fails the same way if `OLD.status != "active"`, before
+  writing the new entry's own git-notes record.
+- **`memory supersede`** needs no code change — E4 only extends its
+  already-correct behavior to the other entry point.
+
+### E5 — `fold.rs`: a conflicting `superseded_by_entity_id` resolves by recency, not lexicographic min
+
+E4 stops *future* double-supersede-by-different-successor at write time on
+both CLI paths. It does not repair state already written by a pre-fix client,
+nor state written concurrently by two machines racing before E4's rejection
+is visible to the second writer (the git-notes carrier has no cross-machine
+locking — see ADR-068 D3's "known limitations"). `fold.rs`'s read-time merge
+is the only place such a conflict can still be resolved correctly, and today
+it resolves `superseded_by_entity_id` via `min_some` (lexicographically
+smallest), which is an arbitrary, not-most-recent pick — `fold_group` folds
+onto `base`, the *earliest-created* copy in the group, so `min_some` is
+comparing string bytes, not time.
+
+**Decision:** `superseded_by_entity_id` resolves to the value carried by
+whichever record in the fold group has the greatest `created_at` among those
+where the field is non-`None` (ties broken by `id` ascending, matching
+`base_key`'s existing tie-break order). This requires scanning the whole
+group for this one field specifically, rather than the current pairwise
+`base`-vs-`other` fold — `base` is the earliest-created record and is not
+guaranteed to be, or to have folded in, the most recent state update. `min_some`
+stays unchanged for `valid_at`/`invalid_at`, whose "earliest wins" semantics
+are correct as-is (a temporal validity window, not a conflicting-successor
+pointer) — this is a targeted fix to one field's resolution rule, not a
+rewrite of `merge_into`.
+
+This is a read-time robustness fix, independent of E4: it corrects how any
+already-existing conflicting carrier records fold, regardless of whether they
+were produced by the bug E4 closes, a pre-fix client, or a lost-race write.
+
+### E6 — Non-goals, consequences, security
+
+- **Non-goal:** deciding `apply_remote_note`'s `entity_id`/collision posture
+  (E3); a separate task, not this amendment.
+- **Non-goal:** a chained-supersede-by-recency feature for `add --supersedes`
+  (E4) — rejected in favor of matching `memory supersede`'s existing
+  reject-on-stale-`OLD` behavior; YAGNI absent a stated need for chaining.
+- **Non-goal:** repairing already-written conflicting carrier records in any
+  specific repo's `refs/notes/spelunk` — E5 fixes how they fold at read time;
+  it does not rewrite git-notes history (which this ADR's append-only model
+  never does).
+- **Consequence:** `MemoryStore::open` cannot be hard-failed by Step A
+  regardless of which insert path left a row `entity_id = NULL`, closing that
+  hard-fail risk, though E3's path remains an open question for its own
+  collision semantics.
+- **Consequence:** `add --supersedes` against a stale `OLD` now fails
+  loudly instead of silently creating an orphaned entry and a conflicting
+  carrier record — a deliberate, user-visible behavior change, consistent
+  with `memory supersede`'s existing contract.
+- **Security:** no new trust boundary. E1/E2 only change how already-local
+  SQLite operations recover from a constraint violation, and E4's pre-flight
+  read is a local SQLite/git-notes read already performed by the existing
+  code, just reordered; no new data leaves the machine.
+
+## Amendment (2026-07-19): `apply_remote_note` gains `entity_id` and a pull-specific collision posture
+
+**Date:** 2026-07-19
+**Deciders:** founder (Johan); architect
+
+A fourth latent `entity_id` gap on the same identity-model surface these
+amendments already cover, found while auditing every `INSERT INTO notes` for
+the class of bug the earlier amendments fixed. `MemoryStore::apply_remote_note`
+(`crates/spelunk-core/src/storage/memory/sync.rs`) – the cloud-pull path used
+when an explicit team `server_url` is configured – inserts a new local row
+without populating `entity_id` at all. Its own doc comment states an
+Add-Wins/keep-both posture ("insert a new local row carrying `remote_id`...
+pulled entries are added, never overwriting local ones") written before
+`entity_id` existed as this codebase's canonical identity.
+
+This gap does not currently risk hard-failing `MemoryStore::open`: Step A's
+own hardening (the amendment above this one) already treats a NULL-`entity_id`
+row it cannot backfill as an expected, recoverable case regardless of which
+insert path produced it, and explicitly names this function as one reason that
+hardening is needed independent of any fix here. This amendment is a design
+decision, not an incident response.
+
+### F1 – Decision: `apply_remote_note` gets the same insert-then-recover treatment, extended with pull-specific recovery steps
+
+The base amendment's own "Reconciling a dedup match" rule (A6) already
+specifies, for a match on `kind`/`title`/`body`, that status and supersede
+links "reconcile as they do today: a tombstone archives the local copy and
+archival is never undone (`apply_remote_note`...)" and that `tags`/
+`linked_files` merge by union. A6 scoped its retrofit to the git-notes carrier
+and `init`-time import, the two consumers that predated that amendment; it did
+not extend to this SQLite-side cloud-pull path. This decision closes that gap
+by extending the same already-decided rule to `apply_remote_note`, rather than
+inventing a new posture for it.
+
+Concretely: the INSERT gains `entity_id = entity_id(kind, title, body)`, and a
+UNIQUE-constraint failure on it is caught and recovered rather than
+propagated, reusing `recover_from_entity_id_collision` (`notes.rs`) exactly as
+`add_note`/`add_note_with_created_at`/`add_note_superseding` already do – not
+reimplemented. `RemoteEntry` (the `/memory/since` wire type) carries no
+`tags`/`linked_files` today, so the reused merge step has nothing to union on
+this path; that is an existing property of the wire format, not something this
+decision changes.
+
+This rejects two alternatives:
+
+- **Keep-both literally** (leave the INSERT unconstrained for this path
+  specifically) – would require carving out an exception to
+  `idx_notes_entity_id`'s UNIQUE constraint for one insert path, permanently
+  reopening the "same content, two rows" case A2/B1 exist to close, for the
+  path most likely to hit it (two teammates independently recording the same
+  decision, then syncing).
+- **Reject/error on collision** – has no precedent anywhere else in this
+  identity model; every other collision is a merge, never a hard failure, and
+  a pull that fails outright on ordinary duplicate content would make routine
+  `sync` unreliable.
+
+### F2 – Collision recovery adopts the pulled `remote_id` and propagates archival
+
+The plain tag/file merge `recover_from_entity_id_collision` performs is not
+sufficient on its own for a pull path: unlike `add_note`'s caller, the caller
+here already holds a `remote_id` and an archived/active flag that need
+somewhere to go once the row that "wins" the collision is an *existing* row
+the caller didn't mint. Layered on top of the reused merge (composing existing
+primitives, not extending `recover_from_entity_id_collision`'s own contract):
+
+- **Adopt the pulled `remote_id` onto the existing row**, via the existing
+  `set_remote_id` (already guarded `WHERE remote_id IS NULL`, so this is a
+  no-op if the existing row already carries a different `remote_id` – see the
+  twin-content case below). Without this, every future pull of the same
+  `remote_id` would repeat the same collision-recovery path indefinitely
+  instead of short-circuiting through `note_id_for_remote_id`'s existing
+  early-return, which is what actually makes a re-run of `sync` a no-op per
+  this function's own doc comment.
+- **Propagate archival**, via the existing `self.archive(...)`, exactly as the
+  already-known-`remote_id` branch above this one in the same function already
+  does: a pulled tombstone archives the existing row; an already-archived
+  existing row is never reverted to active on a non-archived pull. Same
+  never-un-archive contract, now applied to a row reached via `entity_id`
+  instead of via `remote_id`.
+- **Twin-content edge case:** if the existing row already carries a
+  *different*, non-null `remote_id` (two distinct cloud entries that happen to
+  share `kind`/`title`/`body`, pushed independently from two stores),
+  `set_remote_id`'s guard leaves it untouched – the existing row's `remote_id`
+  is a stable, arbitrary, first-recorded pick, and the second cloud id is never
+  separately representable locally. Re-pulling it repeats the same no-op merge
+  on every future `sync`, which is harmless. This is not a new tradeoff: it is
+  the pull-path manifestation of the mechanism the third amendment (B1)
+  already accepted (Johan, 2026-07-14) – recording byte-identical content
+  under two different origins converges to one local entry.
+- The whole sequence (INSERT attempt, existing-row lookup and merge,
+  `remote_id` adoption, archive propagation) runs as one transaction, mirroring
+  `add_note_superseding`'s existing `BEGIN`/`COMMIT`/`ROLLBACK` wrapping – not
+  the bare, unwrapped statement sequence `add_note`'s simpler recovery uses,
+  because this path chains more than one follow-up write after the merge.
+- **Return value is unchanged** (`Result<bool>`, not the `(id, bool)` tuple
+  `add_note` moved to): the collision-recovery branch returns `false`, the
+  same value the existing already-known-`remote_id` branch already returns for
+  a state-changing-but-not-a-new-row outcome (including when it archives).
+  Callers (`pull_and_apply` in the CLI) already treat `false` as "not a newly
+  applied entry" for the pull-count summary, which is the correct count here
+  too: nothing new appeared for the user.
+
+`note_id_for_remote_id`'s existing early-return is unchanged: it remains the
+first check, and the collision-recovery path above is reached only when it
+returns `None` – this decision does not touch how an already-`remote_id`-known
+row is found or handled.
+
+### F3 – Interaction with Step A/B (`entity_id_migration.rs`)
+
+Closing this gap removes the future flow of *new* NULL-`entity_id` rows from
+this path. It does not retroactively fix rows a pre-fix client already wrote:
+those still reach `MemoryStore::open` with `entity_id IS NULL` and still
+depend on Step A's per-row collision hardening (the amendment above this one)
+to backfill safely or skip-and-warn without hard-failing `open` – the same
+"needed regardless" reasoning that amendment already applied to
+`add_note_superseding`'s pre-fix rows applies here too. Step A's hardening is
+not superseded or made redundant by this decision; both are required, for the
+same reason they were both required there: one closes the source, the other
+protects rows written before the source was closed.
+
+`entity_id_migration.rs`'s own module doc comment currently names
+`apply_remote_note`'s gap explicitly as one of the reasons Step A must stay
+defensive. Once this decision is implemented, that reference describes a
+closed gap rather than an open one and should be corrected in the same change
+(a doc-accuracy fix, not a behavioral criterion).
+
+### F4 – Non-goals, consequences, security
+
+- **Non-goal:** no change to `RemoteEntry`'s wire shape or to the cloud
+  `/memory/since` payload. It carries no `tags`/`linked_files` today; adding
+  them is a separate, unrequested feature.
+- **Non-goal:** no change to `note_id_for_remote_id` or to how a
+  previously-synced row is found. `remote_id` remains the first-line dedup
+  key; `entity_id` is only consulted when it misses.
+- **Consequence:** `apply_remote_note` becomes idempotent under content
+  identity, not only under `remote_id` identity – content recorded locally and
+  later pulled from the cloud (or vice versa) converges to one row instead of
+  two, matching every other insert path's behavior post-promotion.
+- **Consequence:** pre-promotion (a store still holding duplicate `entity_id`
+  groups), behavior is unchanged from today: a pulled note can still land as a
+  distinct row alongside a same-content existing row, exactly as `add_note`
+  and `add_note_superseding` themselves preserve pre-promotion.
+- **Security:** no new trust boundary. `entity_id` carries no authority here
+  either (A7); the merge only ever unions metadata already accepted from the
+  configured team server, and never re-derives content from an untrusted
+  source.

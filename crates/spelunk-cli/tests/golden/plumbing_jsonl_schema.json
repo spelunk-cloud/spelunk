@@ -1,0 +1,135 @@
+{
+  "$comment": [
+    "Golden schema for the plumbing JSONL stability contract (docs/stability.md).",
+    "Field presence and type only, never values. `required` fields appear on every",
+    "emitted line; `optional` fields may be omitted but must match their type when",
+    "present. Undeclared fields are accepted: v1 evolution is additive-only.",
+    "Adding a field here without shipping it fails the conformance tests; removing,",
+    "renaming, or retyping a field in the code fails them too. That is the point.",
+    "Type spellings: string, integer, number, boolean, object, null, any,",
+    "array<T>, and `|` unions such as string|null."
+  ],
+  "commands": {
+    "cat-chunks": {
+      "$comment": "spelunk_core::search::SearchResult, via Database::chunks_for_file.",
+      "required": {
+        "chunk_id": "integer",
+        "file_path": "string",
+        "language": "string",
+        "node_type": "string",
+        "name": "string|null",
+        "start_line": "integer",
+        "end_line": "integer",
+        "content": "string",
+        "distance": "number",
+        "from_graph": "boolean",
+        "governing_specs": "array<string>",
+        "token_count": "integer",
+        "project_name": "string|null",
+        "project_path": "string|null",
+        "summary": "string|null"
+      }
+    },
+    "ls-files": {
+      "required": {
+        "path": "string",
+        "language": "string|null",
+        "chunk_count": "integer",
+        "indexed_at": "integer|null",
+        "stale": "boolean"
+      }
+    },
+    "parse-file": {
+      "required": {
+        "kind": "string",
+        "name": "string|null",
+        "start_line": "integer",
+        "end_line": "integer",
+        "content": "string",
+        "language": "string"
+      }
+    },
+    "hash-file": {
+      "required": {
+        "path": "string",
+        "hash": "string",
+        "indexed_hash": "string|null",
+        "is_current": "boolean"
+      }
+    },
+    "knn": {
+      "$comment": "SearchResult with `score` (1 - distance) spliced in at the JSON level.",
+      "required": {
+        "chunk_id": "integer",
+        "file_path": "string",
+        "language": "string",
+        "node_type": "string",
+        "name": "string|null",
+        "start_line": "integer",
+        "end_line": "integer",
+        "content": "string",
+        "distance": "number",
+        "score": "number",
+        "from_graph": "boolean",
+        "governing_specs": "array<string>",
+        "token_count": "integer",
+        "project_name": "string|null",
+        "project_path": "string|null",
+        "summary": "string|null"
+      }
+    },
+    "embed": {
+      "required": {
+        "model": "string",
+        "dimensions": "integer",
+        "vector": "array<number>"
+      }
+    },
+    "graph-edges": {
+      "required": {
+        "source_file": "string",
+        "source_name": "string|null",
+        "target_name": "string",
+        "kind": "string",
+        "line": "integer"
+      }
+    },
+    "read-memory": {
+      "$comment": "spelunk_core::storage::memory::Note. The optional fields carry serde skip_serializing_if.",
+      "required": {
+        "id": "integer",
+        "kind": "string",
+        "title": "string",
+        "body": "string",
+        "tags": "array<string>",
+        "linked_files": "array<string>",
+        "created_at": "integer",
+        "status": "string"
+      },
+      "optional": {
+        "superseded_by": "integer",
+        "source_ref": "string",
+        "valid_at": "integer",
+        "invalid_at": "integer",
+        "distance": "number",
+        "score": "number",
+        "source_project": "string",
+        "source_project_path": "string",
+        "remote_id": "string"
+      }
+    },
+    "publish-notes": {
+      "$comment": "Three outcome shapes share published+remote; the rest are outcome-specific.",
+      "required": {
+        "published": "boolean",
+        "remote": "string"
+      },
+      "optional": {
+        "ref": "string",
+        "attempts": "integer",
+        "skipped": "string",
+        "error": "string"
+      }
+    }
+  }
+}

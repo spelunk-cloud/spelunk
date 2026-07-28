@@ -162,4 +162,37 @@ If a proposed new CLI command needs LLM inference and its prompt/orchestration c
 
 ---
 
+## Implementation status
+
+Shipped in v0.8 behind PR #260. `spelunk memory harvest` routes all LLM calls through `llm/complete` and all embedding calls through `index/embed`, per the contract above. Tier-0 (no `server_url` configured) emits an actionable error (`harvest_requires_server`), and `GET /v1/health` reports `"llm.complete"` in `capabilities` when an LLM backend is configured server-side.
+
+### Migration: `lm_studio_url` users
+
+> **Superseded. Kept as the v0.8 record.** Both halves below have since been
+> overtaken: the shipped binary refuses a non-loopback plaintext `http://`
+> `server_url` (use `https://`, or a loopback host), and `api_base_url` /
+> `lm_studio_url` are now parsed but ignored rather than still serving
+> `explore` and `index --summarize`. All inference routes through
+> `spelunk-server`. For current `server_url` configuration see
+> [Team setup](../getting-started.md#team-setup-shared-memory-with-spelunk-server).
+
+If you previously used `lm_studio_url` (or `api_base_url`) in your config for
+`spelunk memory harvest`, update `~/.config/spelunk/config.toml`:
+
+```toml
+# Before
+api_base_url = "http://127.0.0.1:1234"
+
+# After — point at a spelunk-server instance
+server_url = "http://your-spelunk-server:7777"
+project_id = "your/project"
+server_key  = "..."       # if the server requires auth
+```
+
+`api_base_url` / `lm_studio_url` continue to work for `spelunk explore` and
+`spelunk index --summarize` (local-inference features), but are no longer used
+by harvest.
+
+---
+
 **Refs:** GH #260, #261, #259; question #42; decision #89 (this decision); decisions #25/#26 (BYOK), #28 (OpenAPI parity / serve-as-peers), #19 (server-default 0.8.0). Companion living doc: `docs/architecture/server-api.md`.

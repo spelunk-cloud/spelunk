@@ -55,8 +55,14 @@ pub async fn explore(args: ExploreArgs, cfg: Config) -> Result<()> {
     // Honor the capability tier: when the server was auto-discovered via the
     // loopback probe, `cfg.server_url` is unset; fill it in from the tier so the
     // inference client can be built (IMP-3 / spelunk#316).
+    //
+    // `get_inference_tier` (not `tier`/`get_tier` above, which governs the
+    // `require_tier1` feature gate): local_first always prefers the local
+    // loopback embedder/LLM for inference, even with an explicit server_url
+    // set (2026-07-23 founder decision).
     let project_root = db_path.parent().unwrap_or(&db_path);
-    let eff_cfg = tier.effective_config(&cfg, project_root);
+    let inference_tier = capability::get_inference_tier(&cfg).await;
+    let eff_cfg = inference_tier.effective_config(&cfg, project_root);
     let client = ServerInferenceClient::from_config(&eff_cfg).ok_or_else(|| {
         anyhow::anyhow!(
             "'spelunk explore' requires spelunk-server.\n\

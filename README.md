@@ -60,7 +60,7 @@ AI coding agents lose context between sessions and can't trace how code connects
 - **Code graph** — trace callers, callees, and imports across file boundaries without reading every file.
 - **Works without any server** — memory, code graph, and full-text/structural (ast-grep) search work with just the binary. No API keys, no configuration.
 - **Semantic search built in** — a local `spelunk-server` is autostarted on demand with a bundled native embedder (codefuse-ai/F2LLM-v2-330M, 896-dim, GPU-accelerated on macOS); no external inference server required. You can still point spelunk at your own OpenAI-compatible endpoint (LM Studio, Ollama, vLLM) if you prefer.
-- **100% local** — your code never leaves your machine. The server is self-hosted (local by default).
+- **100% local** — your code never leaves your machine. The server is self-hosted (local by default). This claim is enforced, not just asserted: `crates/spelunk-cli/tests/egress_containment.rs` traps every outbound connection across the local-tier command surface and fails loudly, naming the destination, on any escape past loopback.
 - **Agent-native** — JSON output (`AGENT=true`), git hooks, and a structured memory system built for the agent workflow loop.
 
 ### When to use spelunk vs grep
@@ -160,6 +160,7 @@ the first five minutes to running a shared memory server for a team.
 - [Memory](docs/memory.md): decisions, context, and requirements across sessions
 - [Agent Guide](docs/agent-guide.md): wiring spelunk into AI coding agents
 - [Commands](docs/commands.md): full reference for every subcommand
+- [Stability contract](docs/stability.md): which surfaces semver freezes, and which are free to change
 - [Architecture](docs/architecture.md): system design for contributors
 - [Examples](docs/examples/): real-world workflows
 
@@ -181,7 +182,10 @@ make check                    # run the lint + test gates CI runs
 
 ## Contributing
 
-Contributions welcome. See [Building from source](docs/building.md) for setup instructions.
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+workflow and [Building from source](docs/building.md) for setup instructions.
+Supported platforms and host requirements are listed in
+[docs/support.md](docs/support.md).
 
 Before pushing, run:
 
@@ -191,8 +195,9 @@ make check
 
 This runs the **Check & Lint** and **Test** legs of CI. CI calls the same make targets,
 so a green `make check` and a green CI agree. It does not cover every job: the Windows
-tests, Docker image build, `cargo audit` / `cargo deny`, the OpenAPI snapshot check and
-the weekly fuzz run are listed, with their opt-in targets, in
+tests, Docker image build, `cargo audit` / `cargo deny`, the OpenAPI snapshot check, the
+upgrade corpus's pinned-old-binary leg and the weekly fuzz run are listed, with their
+opt-in targets, in
 [Building from source](docs/building.md#what-make-check-does-not-cover).
 
 Note: In zsh, never pipe `make check` into `tail` or `head`: the pipeline masks the exit
@@ -213,4 +218,6 @@ gh workflow run ci.yml --ref "$(git branch --show-current)"
 [MIT](LICENSE)
 
 spelunk-server bundles a third-party embedding model (Apache-2.0). See
-[Third-party models](docs/third-party-models.md) for attribution.
+[Model attribution](docs/model-attribution.md) for licensing, or
+[Third-party models](docs/third-party-models.md) for configuring an external
+LLM or embedding endpoint.

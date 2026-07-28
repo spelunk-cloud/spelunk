@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-30  
 **Deciders:** Architect  
-**Trigger:** spelunk-oss^16 — on GPU-less machines (Linux CI runners, low-cost
+**Trigger:** On GPU-less machines (Linux CI runners, low-cost
 cloud VMs, developer laptops with no Apple Silicon Metal) the native
 F2LLM-v2-330M embedder drives 100% of one CPU core and produces roughly
 ~400 ms per chunk at the current `EMBED_BATCH_SIZE = 8`. Indexing a large

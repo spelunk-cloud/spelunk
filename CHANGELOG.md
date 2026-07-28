@@ -9,7 +9,477 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **A written stability contract, [docs/stability.md](docs/stability.md), and
+  tests that enforce it.** Until now the plumbing JSONL schemas were held stable
+  by convention alone, and nothing stated which config keys, flags, exit codes,
+  or on-disk formats you may rely on across versions. The contract now declares,
+  per surface, whether it is stable (semver-bound, additive-only), best-effort,
+  or internal, covering CLI commands and flags, plumbing JSONL fields, the `/v1/`
+  HTTP API, `config.toml` keys, and the on-disk stores
+  (`index.db`/`memory.db` migrations, `registry.db`, git-notes
+  `schema_version`, and the `.spelunk/` layout). For config it also freezes
+  *which file* a key may be set in, which is not the same question as whether
+  the key is supported: `server_url` is ignored in the personal global config
+  and `server_key` is ignored in the checked-in project config, both
+  deliberately. It is equally explicit about what is *not* stable:
+  human-readable porcelain text, log and diagnostic output, and the internal
+  crate APIs. The structured `--format json`/`jsonl` modes of porcelain
+  commands are a third category, called out separately: `spelunk status
+  --format json` is stable for its core fields, and every other `--format`
+  mode is best-effort. A deprecation policy (alias, then warn while the alias
+  lives, then remove) sets the sequence for future changes; the removed
+  `memory_server_url` key is documented as the precedent, including where it
+  fell short of it. Enforcement is real, not aspirational: a committed golden schema
+  covers every plumbing command's JSONL output, so adding a field passes while
+  removing, renaming, or retyping one fails; exit codes 0/1/2 are asserted per
+  command, including that exit 2 leaves stdout empty; a guard derived from the
+  CLI's own help refuses to let a new plumbing command ship without a declared
+  schema; and the checker itself is tested, so it cannot pass by accepting
+  everything.
+
+- **`spelunk-server --model-dir <PATH>` (or `SPELUNK_MODEL_DIR`) loads the
+  bundled F2LLM-v2-330M embedder from a pre-provisioned local directory, with
+  zero network access.** For hosts with no route to `huggingface.co` (an
+  air-gapped network, a strict corp firewall, a build image with no egress),
+  the previous online-only Hugging Face Hub fetch had no fallback. Provision
+  the flat directory (the GGUF plus `tokenizer.json`; `config.json` is
+  optional) on a connected machine first and transfer it over; see [Server
+  setup → Air-gapped / no-egress install](docs/server-setup.md#air-gapped--no-egress-install)
+  for the full fetch-and-transfer procedure. Unset by default, so the online
+  path is unchanged for the common case.
+
+### Removed
+
+- **`SPELUNK_NO_SLUG_CACHE` no longer does anything, and
+  `.spelunk/cloud-project-id.lock` is no longer written or read.** Both existed
+  only to serve the slug-to-UUID translation removed under Fixed below. The lock
+  file was deliberately left out of `.spelunk/.gitignore` so a team would share
+  one resolved identity, so a repo that reached the hosted API this way now
+  carries a tracked file that means nothing. Delete it whenever you like:
+  nothing reads it, nothing regenerates it, and there is no migration to run,
+  because the resolver and the passthrough that replaced it key on the same
+  org-unique slug and select the same project.
+- **`spelunk-server --embedding-url` / `SPELUNK_EMBEDDING_URL` and the deprecated
+  `--embedding-model` / `SPELUNK_EMBEDDING_MODEL` no longer exist.** The
+  embedding model is pinned product-wide to the bundled native embedder
+  (F2LLM-v2-330M@896); there is no longer any way to relocate where embeddings
+  are computed, only where LLM inference runs (`--llm-url` / `--llm-model` are
+  unaffected). Starting the server with either removed flag now fails with
+  clap's unknown-argument error instead of being accepted or silently ignored;
+  the corresponding environment variables have no effect. The CLI's
+  `embedding_model` config key is also removed: `spelunk plumbing embed` now
+  always reports the pinned model id instead of a config-configurable label.
+  Existing `config.toml` files that still carry `embedding_model` continue to
+  parse unchanged (the key is silently ignored, same as other pruned keys).
+  This is a breaking change to `spelunk-server`'s CLI surface, shipped pre-1.0.
+
+### Fixed
+
+- **`spelunk memory push` and `spelunk sync` now embed what they push, so a
+  pushed entry stays findable by `spelunk memory search` locally.** A push
+  shipped entries that had never been embedded (a `memory add` with no embedder
+  running, an import, a pulled entry) and left the local `memory.db` exactly as
+  it found it. The push reported `created`, and those rows remained invisible to
+  semantic `memory search` on your own machine, with nothing saying so and no
+  hint that `spelunk memory reindex` was the cure. Both commands now embed every
+  entry in the push set that lacks a usable local vector before the batch is
+  built, through the same local embedder and the same document text
+  `memory reindex` uses, and commit each vector as it completes. Note this
+  changes nothing about what travels: `kind`, `title`, and `body` were always
+  sent on every push, and the optional vector fields are additive. What changes
+  is that the local store is left correct, and that a destination advertising
+  `accepts_pushed_vectors` can now store the entry as-is instead of re-embedding
+  it. With no local embedder reachable the push still runs to completion exactly
+  as before, text-only, and says how many entries went out unembedded and how to
+  fix them; the summary line reports how many were embedded locally. Skipped in
+  `cloud_first` mode with a `server_url` set, where `memory.db` is not the store
+  of record and `memory reindex` does not apply either. Rows that were already
+  synced are outside the push set and are not embedded by this change.
+
+- **The local `spelunk-server` no longer goes unreachable while it is
+  embedding.** During a `spelunk index` run, `/v1/health` could take seconds
+  instead of well under a millisecond, `spelunk server status` reported a
+  perfectly healthy server as `(unreachable)`, and unrelated endpoints stopped
+  answering too. The liveness probe read the embedder's per-chunk token cap
+  through the same lock the embedder holds for a whole batch of forward
+  passes, and because that read was synchronous inside an async handler it
+  tied up a request-serving thread rather than releasing it, so each
+  concurrent probe made the stall worse. The cap is fixed at model load and
+  never changes, so it no longer sits behind that lock: liveness probes,
+  `spelunk server status`, and any other endpoint now stay responsive for the
+  whole index. The `/v1/health` payload is unchanged, `limits.embedder_token_cap`
+  included.
+- **`mode = "cloud_first"` against a self-hosted team server no longer fails
+  before it starts.** With a non-loopback `server_url` and a human
+  `project_id`, every memory command tried to translate the slug into an
+  internal UUID by calling `GET /v1/projects` first, and then keyed the whole
+  session by whatever came back. A self-hosted spelunk-server keys projects by
+  the slug itself and answers that endpoint in a different shape, so the
+  translation could not succeed and the command died with a parse error before
+  touching memory at all. `project_id` is now sent exactly as configured, slug
+  or UUID: both a self-hosted server and the hosted cloud API accept either, so
+  there was never anything to translate. The documented three-line
+  `cloud_first` config works as written.
+- **`spelunk index` no longer skips a crash-half-indexed file forever.** If a
+  previous run was killed after recording a file's new content hash but
+  before writing its chunks, the hash-only skip check treated the file as
+  already up to date and never reprocessed it, silently leaving it
+  unsearchable until someone thought to pass `--force`. A plain `spelunk
+  index` now also checks that the file actually has stored chunks, so it
+  self-heals on the very next run.
+- **Two `spelunk index` runs on the same project could corrupt the index
+  database; a second run now fails cleanly instead.** Racing writes from two
+  concurrent `index` processes on the same project could reproducibly corrupt
+  `index.db`. A per-project lock now serializes runs: a second `spelunk
+  index` started while one is already in progress exits immediately with
+  `index already running (pid N), try again once it finishes` rather than
+  writing to the database alongside the first run.
+- **`spelunk search` and other read-only commands could fail with "database is
+  locked" while `spelunk index` was running.** Every database open re-stamped
+  a schema-version pragma even when nothing needed migrating, and that stamp
+  always opens a write transaction, so a purely read-only command could
+  contend for the write lock against a concurrent `index` run. Opening an
+  already-current database is now read-only.
+- **`spelunk sync` and `spelunk memory pull` no longer silently stop after
+  the server's first page of entries.** A pull request never sent an
+  explicit page size, so the server applied its own 100-entry default; on a
+  first sync into an established project with more than 100 pending
+  entries, the command reported success and printed a count, but only the
+  first page ever landed locally, with no error and no indication anything
+  was missing. Both commands share the same pull path, which now requests
+  the server's maximum page size and keeps paginating, applying each page
+  as it arrives, until a page comes back short of that size. A large first
+  sync or pull now completes fully in one command instead of requiring
+  several repeated runs to converge.
+- **`spelunk index`'s embed phase now embeds locally in `local_first` mode
+  even when a team `server_url` is configured.** Both the foreground (default)
+  embed phase and the `--detach-embed` background worker's embedder-readiness
+  poll resolved their embedding target from the raw tier-probing functions
+  (`get_tier`, `probe_tier_fresh`) instead of the mode-aware
+  `get_inference_tier`/`get_inference_tier_fresh`: a `local_first` project
+  with an explicit `server_url` sent every embed batch to that `server_url`
+  instead of the local, auto-discovered embedder, silently skipping embedding
+  when the configured server has no `/index/embed` route. Both call sites now
+  route through `get_inference_tier`/`get_inference_tier_fresh`, the same fix
+  already applied to `memory add`/`reindex`/`search`/`timeline`/`harvest`/
+  `reconcile` and `explore`. `cloud_first` is unchanged. See [ADR-004's
+  2026-07-23 amendment](docs/adr/004-unified-memory-storage.md).
+- **`spelunk sync` and `spelunk memory push` now succeed on the first sync of a
+  project that has never synced before.** A sync round always pulled before
+  pushing to avoid shadowing a concurrent write, but on a project that never
+  existed server-side yet, the pre-push pull failed with an HTTP 400 against
+  the unprovisioned project. On a first sync (detected by checking whether any
+  local entry has ever synced), the sequence now reverses: push first to
+  provision the project server-side, then run a post-push pull to converge with
+  any backlog already on the server. The fix also handles adversarial server
+  crashes during first-sync push and concurrent first-sync attempts from
+  multiple clients.
+
+### Internal
+
+- **`memory.db` now opens through the same forward-only, `PRAGMA
+  user_version`-gated migration runner `index.db` already uses**, replacing
+  ad-hoc re-execution of the schema SQL with idempotency inferred from
+  `ALTER TABLE` error strings. A pre-existing store has its version inferred
+  once from table/column shape, then only the missing steps run; a store
+  stamped with a version newer than the binary supports refuses to open
+  instead of mis-running steps. No CLI flag, config key, or user-facing
+  behavior changed.
+
+## [0.9.5] — 2026-07-24
+
 ### Changed
+
+- **Default chunk-token cap (`MAX_CHUNK_TOKENS`) lowered from 2048 to 512.** A
+  quality/performance evaluation across a large gold-query corpus found
+  retrieval quality flat across 2048/1024/512/384 while 512 measurably speeds
+  up indexing, with second-order costs (vector count, storage) at the new cap
+  confirmed immaterial. `index_meta` now also tracks the chunker
+  configuration an index was built under, alongside the existing
+  `embedding_model`/`embedding_dim` provenance: opening an index that was
+  built under a different chunk-token cap prints a warning naming the drift
+  and pointing at `spelunk index --force` for a uniform re-index, rather than
+  silently leaving unchanged files on their old chunk boundaries forever. A
+  normal incremental run still proceeds after the warning: unlike an
+  embedding-model mismatch, a chunk-cap change is same-model/same-dimension
+  drift, not index corruption.
+
+### Added
+
+- **`spelunk memory reindex` backfills local note embeddings that were never
+  minted, so semantic `memory search` can surface those notes again.** A note's
+  vector is created only at `memory add` time; if no embedder was reachable
+  then, or the store was upgraded across the 768→896 embedding-dimension change
+  (which drops the old vectors), the note stays present-but-unembedded with no
+  catch-up path and is invisible to semantic KNN (it is still reachable via text
+  search, `list`, `timeline`, and `context`). `reindex` re-embeds those notes
+  through the same local embed path `memory add` uses, committing each vector as
+  it completes so an interrupted run resumes on re-run rather than starting over.
+  By default it embeds only active notes missing a vector; `--force` re-embeds
+  every active note, replacing any existing vector (useful after a model or
+  dimension change); `--include-archived` also covers archived notes; `--dry-run`
+  reports the count and writes nothing; and `--format json` emits a
+  machine-readable summary. When no embedder is reachable it fails with an
+  actionable error and writes nothing. After the 768→896 upgrade drops old
+  vectors, memory commands print a one-line notice pointing at `spelunk memory
+  reindex` so the recall regression is discoverable without `RUST_LOG`.
+
+- **`local_first` writes now queue and drain automatically; you no longer
+  need to run `spelunk sync` by hand in the normal path.** A write (`memory
+  add`/`archive`/`supersede`) with a team `server_url` configured still
+  commits to `memory.db` and returns immediately with no network call in its
+  own path, exactly as before. What's new is what happens next: the entry sits
+  in a local outbox (still just the same `memory.db` rows, no new table) until
+  a background reconciler drains it. From an interactive terminal session, the
+  write opportunistically starts (or reuses) the local `spelunk-server` and
+  hands it the outbox to push; that process also holds a live pull connection
+  to the team server, so entries recorded elsewhere on the team tend to show
+  up locally without an explicit `spelunk sync`. Non-interactive invocations
+  (CI, scripts, git hooks) never auto-start a server: the write still commits
+  and stays durably queued, and drains on the next interactive session or
+  explicit trigger. `spelunk status` now shows a quiet pending-entry count and
+  last-synced freshness for `local_first` projects (for example `mode
+  local_first  ·  2 pending, last synced 4m ago`; nothing extra when there's
+  nothing to report), in text and `--format json` (`sync_pending` /
+  `sync_last_synced_at`). `spelunk sync` and the one-way `memory push` /
+  `memory pull` still work unchanged for a forced, synchronous reconcile or a
+  non-interactive context. See [Team server and sync
+  modes](docs/memory.md#team-server-and-sync-modes).
+
+- **`spelunk memory dedupe` collapses duplicate-`entity_id` groups already
+  resident in a project's `memory.db`.** A store can already hold rows that
+  share the same content identity (`kind`/`title`/`body`) while differing in
+  `created_at`, `tags`, `linked_files`, or `status`, for example a decision
+  recorded twice by a repeated `memory harvest` run, or one merged in from
+  another machine. Opening the store now backfills each row's `entity_id` but
+  never deletes an existing row on its own, so this new command is the
+  explicit, dry-runnable way to clean duplicates up: `--dry-run` reports
+  duplicate groups and does nothing, otherwise the earliest-created row in
+  each group survives, the others' `tags` and `linked_files` merge onto it,
+  and any `supersedes` edge pointing at a removed row is repointed to the
+  survivor. It is a one-time backfill you run when you want to, not a step
+  `init` or `memory add` perform for you. See [ADR-068's third
+  amendment](docs/adr/068-zero-setup-onboarding-git-notes-memory-fallback.md).
+
+### Fixed
+
+- **`spelunk memory add` no longer crashes on a byte-identical duplicate once
+  a project's `entity_id` index has been promoted to UNIQUE.** Previously a
+  second `memory add` with the same `kind`/`title`/`body` as an existing
+  entry hit `Error: UNIQUE constraint failed: notes.entity_id`. It now reuses
+  the existing entry instead, merging the new call's `tags` and
+  `linked_files` into it, and prints `Already recorded as [kind] #id: title`
+  in place of `Stored [kind] #id: title`. See [ADR-068's fourth
+  amendment](docs/adr/068-zero-setup-onboarding-git-notes-memory-fallback.md).
+- **A `local_first` project with a team `server_url` configured now embeds
+  locally instead of 404ing.** Query and note embedding for `memory add`,
+  `memory reindex`, `memory search`, `memory timeline`, `memory harvest`,
+  `memory reconcile`, and `explore` used to route to whatever `server_url`
+  was configured, even in the default `local_first` mode, where `server_url`
+  is only a sync replica and often has no `/index/embed` route at all (e.g.
+  spelunk.cloud). The result was a 404 on `memory search`, and a silent,
+  unembedded write on `memory add`/`reconcile` (the note still saved, just
+  invisible to semantic search). Inference routing now keys off `mode`
+  instead of `server_url` presence: `local_first`/`offline` always use the
+  local, auto-discovered embedder; `cloud_first` still offloads embedding to
+  the server. `memory reindex` additionally rejects `cloud_first` with a
+  `server_url` configured, since `memory.db` isn't the store of record
+  there. See [ADR-004's 2026-07-23
+  amendment](docs/adr/004-unified-memory-storage.md).
+
+- **`spelunk memory push` and `spelunk sync` can now push a real-sized project
+  instead of timing out.** Previously a project with more than a few dozen
+  entries was pushed in requests bounded by a fixed 30-second client timeout, so
+  the push timed out and nothing landed: the server project was never even
+  created. The push now splits entries into smaller per-request batches and
+  gives each request the longer, inference-class timeout the server needs to
+  re-embed them, so a push of hundreds of entries completes and the project is
+  created by the first batch. If a batch fails partway through (for example the
+  server is briefly overloaded), the push stops at that batch, reports how far
+  it got (`Pushed X of Y entries, then stopped: ...`) with a hint to re-run to
+  resume, and exits non-zero rather than reading as success. Batches that
+  already landed are recorded, so a re-run pushes only the remainder and any
+  entry the server already holds comes back skipped, never duplicated.
+- **`spelunk sync` / `spelunk memory sync` no longer permanently skips a
+  teammate's older memory on a client's first sync.** The pull cursor is
+  derived from the newest `remote_id` known locally, and `memory_sync`
+  previously pushed before pulling, so a client's own brand-new push became
+  that newest id; any teammate content already on the server that this
+  client had never pulled was silently and permanently skipped, with no
+  error. This mainly hit a new team member's very first sync on a project
+  with prior history, but the same shape could also shadow a teammate's push
+  landing in the narrow window between a client's own pull and its own push
+  on any sync round. `memory_sync` now pulls, pushes, then pulls a second
+  time reusing the pre-push cursor, so a concurrent teammate push in that
+  window is caught within the same sync call or, at the latest, the next
+  one. No command, flag, or output format changed.
+
+### Changed
+
+- **Chunk re-windowing is now token-aware, and windowed chunks keep their identity.**
+  Oversized code nodes (and unsupported-language fallback content) were previously
+  re-split into a fixed 120-line window regardless of token count, so `MAX_CHUNK_TOKENS`
+  decided only *when* to re-window, never *how big* the result was — long-line
+  machine-generated content could still produce single windows of 10,000+ tokens.
+  Windows now accumulate whole lines up to the `MAX_CHUNK_TOKENS` budget (with a
+  single over-budget line becoming its own window, so the split always makes forward
+  progress), keeping ~12.5% token overlap between adjacent windows. Each window also
+  now carries its source node's name, docstring, and enclosing scope, so a re-windowed
+  function embeds with its symbol identity instead of `title: none`. Existing indexes
+  remain valid — this changes neither the DB schema nor the embedding format — but a
+  `spelunk index --force` re-index is recommended (not required) to pick up the
+  improved chunk shape on already-indexed repos with large, long-line files.
+### Security
+
+- **Self-hosted server bearer credentials are now scoped per server, not
+  global.** Previously a single flat `server_key` served every configured
+  `server_url`, so a developer working on two projects that each point at a
+  different self-hosted server (the topology [ADR-056](docs/adr/056-oss-server-tenancy-model.md)
+  recommends over multi-tenancy) had one key slot for two servers, with
+  whichever key lost getting 401s. The bearer for a request is now resolved
+  per the target server's origin, so keys for distinct self-hosted servers
+  coexist without collision or manual env-var juggling. A pre-existing flat
+  key migrates into the new per-server store automatically the first time
+  it's needed. See [ADR-071](docs/adr/071-per-server-client-bearer-scoping.md).
+
+### Added
+
+- **`spelunk auth set-key --server <url>` and `spelunk auth list-servers`.**
+  `set-key` stores a bearer key for a self-hosted server, scoped to its
+  origin; the key is read from stdin or an interactive prompt only, never
+  from a flag or positional argument, so it never lands in shell history or
+  `ps` output. `list-servers` prints the origins with a stored key (never the
+  key material itself). (ADR-071)
+- **`spelunk logout --servers` / `spelunk logout --server <url>`.** Clearing
+  self-hosted server keys is now an explicit, separate action from clearing
+  the spelunk.cloud login: bare `spelunk logout` clears only the `[auth]`
+  token pair, so recovering from a broken cloud login no longer has the side
+  effect of deleting server keys used on other projects. (ADR-071 D3)
+
+### Removed
+
+- **`server_key` is no longer read from a project's committed
+  `.spelunk/config.toml`.** That field let a plaintext credential live in a
+  file the docs otherwise say is safe to commit. It is now silently ignored
+  (matching the earlier `memory_server_*` alias removal precedent) rather
+  than migrated or warned about; use `spelunk auth set-key --server <url>` to
+  store the key per-developer instead. If a key was ever committed under the
+  old model, treat it as compromised: rotate it on the server and re-set it
+  on every machine that used the old one. (ADR-071 D4)
+
+### Fixed
+
+- **`spelunk-server` no longer computes an abandoned embed batch to
+  completion.** The native embedder moved a whole `/index/embed` batch into a
+  detached blocking task, so when the CLI's client gave up on a slow batch
+  (`batch_timeout`) or the server's own 1800s timeout fired first, the
+  connection closed but the embedding work kept running on the GPU/CPU for a
+  result nobody would ever read, measured at ~37% of one run's GPU time spent
+  on a single abandoned batch. A client disconnect or server-side timeout now
+  cancels the in-flight batch (checked when a queued batch reaches the front
+  of the embedder's lock, between sub-batches, and per chunk on the
+  sequential path), and the abandonment is logged with the chunk count
+  completed. No request/response contract change. (#631)
+- **`memory add --supersedes OLD` against an already-archived OLD no longer
+  writes conflicting git-notes carrier records.** The SQL layer's archive-OLD
+  update already silently no-ops when OLD is not active, but the CLI never
+  checked that outcome before appending a state-update record to the git-notes
+  carrier, so running `--supersedes OLD` twice with two different successors
+  left two conflicting `archived` records for OLD's entity, each naming a
+  different successor — and the read-time fold picked between them by
+  lexicographic string comparison, not recency, so the wrong successor could
+  silently display. `--supersedes` now checks OLD is active *before* any
+  write (SQLite or git-notes), on both storage paths, and fails with the same
+  "No active memory entry with id `<old-id>` (old)." error `memory supersede`
+  already gives for the same case — this is a deliberate behavior change: the
+  command used to succeed against a stale OLD, and now it errors instead.
+  Fold-time resolution of any conflicting records written before this fix
+  (or by a lost cross-machine race) is also hardened: `superseded_by_entity_id`
+  now resolves to the record with the greatest `created_at`, not the smallest
+  `entity_id` string. (ADR-068 E4/E5)
+- **Indexing no longer drops the docstring from a documented Rust item
+  followed by an attribute, or a documented Python function/class wrapped in
+  a decorator.** `preceding_comment`'s walk back over sibling nodes stopped
+  at the first non-whitespace node it found, so a Rust `#[derive(...)]` /
+  `#[async_trait]` attribute (a real sibling sitting between the item and
+  its doc comment) or a Python `@decorator` (which tree-sitter-python wraps
+  together with the definition in one `decorated_definition` node) made the
+  walk land on the attribute or wrapper instead of the comment, so no
+  docstring was captured at all, silently. This affects retrieval quality,
+  since a chunk's docstring is part of what gets embedded and searched
+  (`Chunk::embedding_text()`); attributed/decorated items are common in
+  async Rust services and in most idiomatic Python. The walk now skips
+  `attribute_item` siblings (Rust) and starts from the enclosing
+  `decorated_definition` when present (Python), so the docstring is
+  captured as before. TypeScript decorators, Java annotations, and every
+  other currently supported language with similar syntax (PHP, Kotlin,
+  Swift, C#, C++, C) attach it as a child of the item in their grammars and
+  were confirmed unaffected. No schema or embedding-format change; run
+  `spelunk index --force` to recover docstrings on already-indexed
+  attributed/decorated items.
+- **`spelunk index` no longer treats a failure to connect to the local
+  server the same as a slow request, and no longer lets one poison later
+  batch sizing.** A batch that failed because the client couldn't open a
+  TCP connection at all (the server momentarily unreachable, not just slow
+  to respond) was previously classified the same as a request that ran out
+  of its time budget: the client halved the batch size and folded the
+  failed attempt's elapsed time into its running throughput estimate, even
+  though a connect failure carries no signal about batch sizing or
+  embedding speed. Connect failures are now classified separately and
+  retried at the same batch size with a bounded backoff (five attempts,
+  5s to 180s) instead of shrinking, and no longer feed the rate estimate;
+  once those retries are exhausted, indexing falls back to the existing
+  manual re-run path unchanged.
+- **`spelunk sync` now actually pulls teammates' entries for a client that
+  has already pushed or synced before.** The team server's batch-push
+  endpoint acknowledged each pushed entry with its raw database row id
+  (e.g. `"1"`) instead of its `sync_id`, and the CLI stores whatever id it
+  is acknowledged with as that entry's `remote_id`, then computes its next
+  pull cursor as the greatest `remote_id` it has on file. A small integer
+  string sorts lexically after every real `sync_id` (a UUIDv7, which starts
+  with a hex timestamp), so once a client had pushed anything at all, its
+  next pull matched nothing server-side even when teammates had added newer
+  entries. A fresh client, whose `remote_id` starts unset, never hit this,
+  which is why the fresh-clone case always looked fine while day-to-day team
+  sync quietly stopped receiving updates after the first push. The server
+  now acknowledges pushes with the same `sync_id` `/memory/since` cursors
+  on, so an established client's pull cursor advances correctly.
+
+### Changed
+
+- **`spelunk index` skips generated, vendored, and minified files.** Build output,
+  vendored dependencies, and minified assets are no longer parsed, chunked, or
+  embedded, so the index reflects source you wrote rather than machine-generated files.
+- **Linux release binaries now target glibc 2.31 as the support floor.** Builds
+  run in a `debian:11` (Bullseye) container to ensure compatibility with Debian
+  11+ and Ubuntu 20.04+. Previously, releases silently required glibc 2.39
+  (Ubuntu 24.04-era), causing crashes on older distros. The `.deb` package
+  declares `libdbus-1-3` as a dependency; tarball users on minimal images must
+  install `libdbus-1-3` separately.
+- **`spelunk init` starts the server before indexing and detaches the embedding pass.**
+  On a fresh install, the prompt now returns after parsing, with embeddings arriving in the background. A detached worker
+  polls the embedder readiness and runs the embed phase, resumable by re-running
+  `spelunk index`. The server is auto-started before parsing begins (rather than after),
+  and a not-yet-ready embedder is a transient condition to wait on rather than a
+  terminal reason to skip the embed pass. (ADR-070 D1, D2)
+- **Search over a warming index emits coverage-gated notices.** When KNN search runs
+  over an incompletely-embedded corpus, a one-line stderr notice names the coverage
+  percentage and its shape ("front-loaded by importance and recency"). In `auto` mode on zero
+  coverage, search falls back to ast-grep with a notice naming embeddings as building
+  in the background; in explicit `semantic`/`hybrid` mode, zero coverage produces an
+  actionable error naming the resume command instead of "No results found." Partial
+  coverage results stay served (KNN order-independence + useful prefix) and are labelled
+  accordingly. (ADR-070 D3)
+- **`spelunk status` reports the embed worker's recorded liveness and token-weighted
+  progress.** A live background worker triggers "Embedding in progress" (not a guess
+  from embedded counts); no live worker + pending work prints "Embedding incomplete"
+  plus the resume command. Coverage (chunks embedded / total chunks) and progress
+  (percentage of work done, measured by token weight) are two separately-named measures,
+  and a measured-this-run ETA derives from the worker's recorded baseline (never cached
+  across runs). The old hedging parenthetical is gone. JSON status gains
+  `embedding_pending`, `embed_worker_alive`, and `embed_tokens` fields. (ADR-070 D4, D6)
 
 - **Memory entries are now identified by their content.** An entry's canonical
   identity is a SHA-256 over exactly its `kind`, `title`, and `body`, so the
@@ -90,14 +560,48 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   remains gated to initialized projects. (ADR-068)
 - **`spelunk init` now configures the `origin` fetch refspec for `refs/notes/spelunk`**,
   so project memory notes travel automatically on `git fetch`. When init detects
-  an `origin` remote, it adds `+refs/notes/spelunk:refs/notes/spelunk` to the
-  fetch config (idempotently) and prints the push command users run to publish
-  their memory to the remote (re-run after each memory change, since every
-  memory add/remove creates a new notes commit). Teammates then run `spelunk init` in their
+  an `origin` remote, it adds the refspec to the fetch config (idempotently) and
+  names the command that publishes memory back (`spelunk hooks install
+  --pre-push`, below). Teammates then run `spelunk init` in their
   clones (or manually add the same refspec) and `git fetch` to receive notes. In
   projects without an `origin`, init prints the exact git commands to run later
   when the remote is added. See [docs/memory.md](#sharing-memory-across-clones-via-git-notes).
-  (ADR-068)
+  (ADR-068; the refspec value is corrected by ADR-069, see Fixed)
+- **`spelunk hooks install --pre-push` publishes your memory on `git push`.** The
+  hook fetches the remote's `refs/notes/spelunk`, merges it into yours with
+  `cat_sort_uniq` (a union, so neither side's entries are dropped), and pushes
+  the result to the named remote you are pushing to, so decisions travel with the
+  code they describe. Publishing is **opt-in**: your memory stays local until you
+  install it, and `spelunk init` now says so and names the command. Reading a
+  teammate's memory needs no opt-in and is unchanged. Publishing follows the
+  remote's *name*: a push that spells out a URL (`git push https://… main`) has no
+  name to resolve, so it pushes code without publishing memory and a later `git
+  push origin` publishes it.
+
+  Publishing is tied to `git push` because that is the only moment that reliably
+  coincides with "this code is being shared". An entry recorded against a commit
+  you have not pushed can reach the remote while the commit does not, leaving the
+  note unresolvable in a fresh clone: it is on the remote, and nobody ever sees
+  it. That is what the old per-change manual push hint produced whenever you
+  recorded a decision before pushing the commit it describes, which is the normal
+  order of work; `init` no longer advertises it. Pushing the notes ref by hand
+  still works as a no-hook fallback, after you have pushed the commits.
+
+  The hook **never blocks your push**: on a publish failure it warns on stderr
+  and exits 0, so a failed publish cannot cost you your code push. It retries a
+  lost race up to three times and never force-pushes. The one case that does stop
+  your push is spelunk itself being gone: the hook records the absolute path of
+  the binary that installed it rather than looking `spelunk` up on `PATH`, so it
+  keeps working under GUI git clients (which on macOS inherit their environment
+  from launchd, not your shell profile). If you move or reinstall spelunk, re-run
+  the install command to re-resolve the path. It never overwrites a pre-push hook
+  it did not write, and `spelunk hooks uninstall` removes it. (ADR-069 D1/D3/D7)
+- **`spelunk plumbing publish-notes`** is the flow behind that hook, which is a
+  shim around it. It is the first plumbing subcommand that **writes** and
+  performs **network I/O**, so the namespace is no longer read-only by
+  construction; anything that assumed so needs to account for it.
+  `--best-effort` downgrades a publish failure to a stderr warning and exit 0.
+  (ADR-069 D7)
 - **Native in-process HTTPS for `spelunk-server`** via `--tls-cert`/`--tls-key`
   (env `SPELUNK_SERVER_TLS_CERT`/`SPELUNK_SERVER_TLS_KEY`), both-or-neither. The
   server terminates TLS itself, so a team/remote deployment is a routable
@@ -122,6 +626,122 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   keys are now silently ignored rather than mapped.
 
 ### Fixed
+
+- **`spelunk hooks install` honors `core.hooksPath`.** Hooks were previously written
+  to `.git/hooks` even when `core.hooksPath` pointed elsewhere, so git never ran them
+  while `init` reported them installed. Install now resolves the hooks directory via
+  git and writes where git will invoke them.
+- **A TLS certificate failure against a configured `server_url` no longer
+  reports "unreachable".** When the capability probe's TLS handshake failed,
+  the WARN printed only reqwest's flattened top-level message ("error sending
+  request for url (...)") and `spelunk status`/`spelunk check` showed
+  `[unreachable]`, exactly as if the server were down, even though it was
+  reachable and only certificate trust had failed. The probe now walks the
+  full error chain and prints it, special-cases the classic self-hosting.md
+  client-trust traps (a CA:TRUE certificate served as its own leaf, or a
+  `server_ca` file that is the server's leaf rather than the issuing CA), and
+  distinguishes the two failure modes in output: `[unreachable]` for a
+  TCP/connect-level miss (refused, timed out), `[tls: <cause>]` for a
+  connection that reached the server but failed TLS trust.
+- **`spelunk memory push` now works against OSS team servers.** The batch-push
+  endpoint (`POST /v1/projects/{id}/memory/batch`) was previously available only
+  on cloud-api, so `spelunk memory push` returned 405 Method Not Allowed against
+  a self-hosted `spelunk-server`. The OSS team server now implements the same
+  endpoint with idempotent re-push on `external_id`, enabling push-only workflows.
+- **`spelunk sync`'s pull leg now works against OSS team servers.** The
+  pull half spoke a different wire format than the OSS server's
+  `/memory/since` endpoint understood (a UUID cursor and an `{entries,
+  count}` envelope vs. the endpoint's timestamp-only, bare-array contract),
+  so `spelunk sync` could push but not pull against a self-hosted
+  `spelunk-server`. `/memory/since` now accepts an optional `since_id` cursor
+  alongside the existing `t` timestamp parameter and returns the matching
+  envelope shape when it is used; `spelunk memory since` (which still uses
+  `t`) is unaffected.
+- **`spelunk memory watch` no longer panics when only an auto-discovered
+  loopback server is available.** `require_tier1` gates on the probed
+  capability tier, which also passes for an auto-discovered inference-only
+  loopback server (ADR-004) whose `server_url` is unset; `memory watch`
+  unwrapped that case with `.expect("require_tier1 passed")` and crashed
+  instead of reporting the missing configuration. It now returns the same
+  actionable "requires `server_url` to be configured" error that `memory
+  push` and `sync` already use for this case.
+- **`spelunk memory push` and `spelunk memory sync` no longer claim to have
+  pushed entries that were never sent, never durably persisted, or that the
+  server rejected.** Three bugs in the same push path could each make "Done.
+  Pushed N entries" (or `sync`'s equivalent) print when nothing meaningful had
+  happened. The reported count was the number of sync-eligible rows rather
+  than the rows actually included in the batch request, so a push where every
+  row was already synced — no HTTP request sent at all — still printed
+  "Pushed N entries." Separately, a batch item was stamped with the local
+  `remote_id` that permanently excludes a row from all future pushes as soon
+  as the server's response carried an id for it, without checking the item's
+  own reported status first; a response that returned an id for an entry it
+  had not actually persisted would silently and permanently take that row out
+  of every future retry. And the summary trusted the server's aggregate
+  `created`/`skipped` counters instead of the authoritative per-item
+  `results[]` list, so a batch whose aggregate counters understated what
+  happened (observed: a server reporting `created: 0` for entries it had in
+  fact persisted) was reported exactly as understated, not as what actually
+  happened. All three are fixed: the reported count now reflects rows
+  actually sent, a row is only stamped as synced when its own status
+  affirmatively means the server durably has it, and created/skipped/failed
+  counts are reconciled from per-item results (the aggregate counters are used
+  only as a fallback when the server sends no per-item detail at all). A push
+  where nothing was sent now reads "Nothing to push — N entries already
+  synced." instead of implying work was done, and a batch with a partial
+  failure reports the real successes and failures instead of masking them.
+  A fourth gap in the same path is also fixed: a push where every attempted
+  entry failed (nothing created, nothing skipped) previously still printed
+  "Done."/"Sync complete." with a failed count appended and exited 0. Both
+  commands now treat a total failure as a hard error — the message leads
+  with "Push failed"/"Sync failed" instead of success framing, and the
+  process exits non-zero, so a caller checking the exit code or skimming
+  for "Done" can no longer mistake a fully-failed batch for a completed one.
+  `spelunk sync`'s pull step still runs and its results are still reported
+  even when the push half fails outright.
+- **Concurrent memory writes can no longer silently erase each other's
+  entries.** The git-notes write path is a read-modify-write of the note on
+  `HEAD`, and nothing serialized it: two simultaneous `memory add` commands
+  could read the same note body, and the later write-back dropped the earlier
+  writer's entry, with both exiting 0. Worse, a writer treated *any* failure to
+  read the existing note as "no note yet", so one transient git failure inside
+  the write rewrote the whole note as just that writer's line, erasing every
+  prior entry (observed live on Windows CI, where it wiped 6 of 8 concurrent
+  entries). Three changes close this. Writes are now serialized end to end by a
+  cross-process lock file in the git common dir, one lock shared by all
+  worktrees because worktrees share the notes ref. A failed note read is
+  retried briefly and then fails the writer, rather than being mistaken for an
+  empty note. And a writer that cannot take the lock within its 5-second wait
+  fails with an error naming the lock file and telling you to retry; it never
+  writes unlocked. Many concurrent writers on a slow machine can exceed that
+  wait legitimately: every entry already written is intact, and retrying the
+  failed command is the remedy. What the failure looks like depends on the
+  store: after `spelunk init` the entry is already safe in `memory.db`, so
+  `memory add` exits 0 and prints `Warning: entry stored locally, but the
+  git-notes carry failed, so it will not travel with the repo: …` on stderr
+  (previously a failed carry was logged where nobody saw it); before `init`,
+  and with `--backend git-notes`, git notes is the primary store, so `memory
+  add` fails. On the rare filesystem where the lock file cannot be created at
+  all, the write-through proceeds unserialized and prints `Warning: wrote to
+  git notes without the cross-process lock …` on stderr: concurrent writes
+  there can still lose entries, and the warning says so. (#185, #632; ADR-069
+  D6/D8)
+- **A decision recorded independently on two machines now lists once, not twice.**
+  Two machines that record the same decision (identical `kind`, `title`, and
+  `body`) derive the same identity from that content, but `spelunk memory list`
+  and `spelunk context` read every copy back and showed each one, so a decision
+  both teammates had recorded looked like two competing entries. Those reads now
+  fold copies by identity: one entry, `tags` and `linked_files` unioned across
+  the copies (added, never removed), and the earliest recording time kept. An
+  entry archived on any machine reads as archived everywhere. This matches the
+  identity-keyed dedup `memory reconcile` and `spelunk init` already do on
+  import.
+
+  Reads that walk every note are also substantially faster. The fold has to see
+  every copy of an entry before it can emit one, so a read can no longer stop as
+  soon as it has enough entries the way it did before; note blobs are therefore
+  read with a single `git cat-file --batch` rather than one `git notes show`
+  subprocess per note.
 
 - **`spelunk init` no longer breaks plain `git fetch` / `git pull`, and no
   longer lets a fetch destroy your unpushed memory.** The fetch refspec `init`
@@ -164,7 +784,8 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   if the lock is busy the merge is skipped and the read proceeds anyway (the
   union is idempotent, so the next read catches up). Your `notes.mergeStrategy`
   is never written; the strategy is passed per-invocation. *Publishing* your own
-  memory remains a manual `git push origin refs/notes/spelunk`. (ADR-069)
+  memory stays opt-in: install the pre-push hook (see Added) or push
+  `refs/notes/spelunk` by hand. (ADR-069)
 - **Memory entries now read back in chronological order after a merge.** The
   union merge sorts lines lexicographically, so a note's records are no longer
   in append order once teammates' entries are folded in. Reads now sort by
@@ -227,8 +848,6 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   `async` at 100% instead of 56%. Confidence is now pooled across all of a
   language's chunks, so mixed `.ts`/`.tsx` projects may see reported confidence
   drop. The lower figure is the accurate one, and no conventions are lost.
-  `spelunk plumbing read-conventions --lang tsx` now matches no rows (exit 1);
-  use `--lang typescript`.
 - **`spelunk server stop` reliably terminates a wedged local server.** A daemon
   whose `/v1/health` had stopped responding could not be stopped and was
   silently orphaned across a `stop && start`. `stop` now recognises a hung
@@ -252,6 +871,65 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   how many produced nothing; `RUST_LOG=warn` shows the cause. Retrying needs
   `spelunk index --force`, since a chunk whose summary failed is recorded as
   attempted and a plain re-run skips it.
+- **Background-phase diagnostics are no longer discarded.** Errors and warnings
+  from the detached `--_background-phases` child (on repos over 100 files) and
+  `--_embed-phases` child (with `--detach-embed`), including LLM summary
+  failures and remedies, now route to `.spelunk/index-background.log` with a
+  user-visible pointer on the status line. The log is bounded (truncated per
+  run).
+
+  **Upgrade note:** existing projects must add `*.log` to `.spelunk/.gitignore`
+  by hand, since the template is written only on first init. Run:
+  ```bash
+  echo "*.log" >> .spelunk/.gitignore
+  ```
+- **`spelunk org switch` now stays in effect after the access token expires.**
+  The switched-to org lived only in the short-lived (~5 minute) WorkOS access
+  token; nothing re-applied it when that token was refreshed. The first token
+  refresh after any `org switch` — triggered by the next `spelunk memory push`,
+  `sync`, or other cloud-api/team-server call — silently reverted the session
+  to the account's default org and persisted the reverted token, with no error
+  or warning. Anything pushed after that point landed in the wrong org.
+  Refreshes now re-send the durably stored active org, so a switched org
+  survives rotation and stays in effect until you switch again.
+- **macOS no longer prompts for keychain authorization multiple times per
+  `spelunk` invocation.** `Config::load` read the personal-store `server_key`
+  unconditionally, even when an environment variable or a WorkOS `[auth]`
+  token already outranked it and made the read pointless, and the CLI's
+  pre-parse `--help` gate ran a full `Config::load` of its own ahead of the
+  real one, so a single command could touch the keychain several times with
+  nothing cached in between (each uncached read is a separate OS
+  authorization on macOS; per-item ACLs don't dedupe across accesses). Three
+  changes close this: the pre-parse gate now checks only whether `llm_model`
+  is configured, read straight from the config file, without constructing a
+  secret store at all; `Config::load`'s `server_key` resolution skips the
+  personal-store read entirely once an env var or `[auth]` token already
+  resolves the bearer; and the keychain-backed store now caches each key's
+  value process-wide, so a key that is read is fetched from the OS keychain
+  at most once per invocation no matter how many call sites ask for it.
+- **`spelunk index` on repos over 100 files could summarize against the wrong
+  config, or silently ignore `--no-summaries`/`--summary-batch-size`, once
+  indexing continued in its detached background phase.** Above the 100-file
+  threshold, indexing hands graph rank, spec discovery, and LLM summaries to a
+  detached child process; that child (and the separate one spawned by
+  `--detach-embed`) rebuilt its own command line from scratch instead of
+  forwarding the parent's, so it re-resolved the default config in place of
+  whatever `--config` the parent had resolved (summarizing against the wrong
+  config, or skipping the pass entirely if that default config has no chat
+  model configured), and dropped `--summary-batch-size` from both spawns and
+  `--no-summaries` from the background-phases spawn (so a run given
+  `--no-summaries` could still generate them in the background). All three are
+  now forwarded through one shared argv-building function used by both spawn
+  sites. `spelunk index` still exits 0 if summarization fails in the child;
+  this only changes what the child is given, not what it does with a failure.
+
+### Known issues
+
+- **`memory archive` and `supersede` do not yet travel via the git-notes carrier.**
+  Archiving or superseding an entry updates your local `memory.db`, but that state
+  change is not yet propagated through `refs/notes/spelunk` to teammates: entries
+  sync, their archived/superseded state does not. A fix is tracked for a follow-up
+  release.
 
 ## [0.9.3] — 2026-07-08
 
@@ -281,7 +959,7 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   now refuses a non-loopback plaintext bind unconditionally, whether or not a key
   is set; the error names the interface/port. There is no opt-out. Loopback
   binds are unchanged. See
-  [docs/server.md](docs/server.md#non-loopback-plaintext-binds-are-refused-no-override).
+  `docs/server.md#non-loopback-plaintext-binds-are-refused-no-override`.
   - **Docker Compose demoted to a local scaffold; bare-metal/systemd is now
     the recommended team-server deployment.** The shipped `docker-compose.yml`
     previously bound the `spelunk-server` container to `0.0.0.0` directly,
@@ -298,9 +976,9 @@ spelunk uses [Semantic Versioning](https://semver.org/).
     server process itself. For a team-reachable instance, run the binary
     bare-metal under systemd instead, with your own TLS terminator in front of
     the same loopback bind on that host — see
-    [Self-hosting](docs/self-hosting.md). `docker-compose.full.yml` (Ollama
+    `docs/self-hosting.md`. `docker-compose.full.yml` (Ollama
     sidecar) and `Caddyfile` (bundled TLS sidecar) are removed; no proxy ships
-    with this repo. See [docs/server.md](docs/server.md#quick-start-docker).
+    with this repo. See `docs/server.md#quick-start-docker`.
 - **Server robustness/info-leak hardening (error-string sniffing, raw FTS5 errors, unbounded
   file reads).**
   - `AppError::Internal` no longer inspects the error message text (previously it returned the
@@ -446,7 +1124,7 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   `.spelunk/config.toml` has `server_url = "http://<host>:<port>"` pointing at
   anything other than loopback, spelunk will now refuse to start** with a
   one-line error telling you to switch to `https://` (put a TLS-terminating
-  reverse proxy in front — see [Self-hosting](docs/self-hosting.md)) or move
+  reverse proxy in front: see `docs/self-hosting.md`) or move
   the server to loopback. Loopback `http://` and all `https://` URLs are
   unaffected.
 - **The CLI no longer sends the bearer token to `/v1/health`.** That endpoint
@@ -511,14 +1189,14 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   no key now fails to start. Loopback binds are unaffected. **Breaking for the
   keyless Docker quickstart**: the container image binds `0.0.0.0` by default,
   so `docker compose up -d` with no `SPELUNK_SERVER_KEY` set now refuses to
-  start — see [Quick start (Docker)](docs/server.md#quick-start-docker).
+  start: see `docs/server.md#quick-start-docker`.
 - **ADR-056 single-trust-domain guardrails.** Per [ADR-056](docs/adr/056-oss-server-tenancy-model.md),
   a `spelunk-server` instance's shared API key is the tenancy boundary by
   design — every keyholder administers every project on that instance; there is
   no per-project ACL. The server now logs a prominent startup warning restating
   this whenever it binds a non-loopback address with a key configured (a
   shared/team deployment); suppressed on loopback binds and when no key is
-  configured. See [Trust model](docs/server.md#trust-model).
+  configured. See `docs/server.md#trust-model`.
 - **Secret scanner now scans the docstring and LLM summary, not just the raw
   chunk content.** `Chunk::embedding_text()` prepends the docstring (and, once
   generated, the LLM summary) to what actually gets stored and embedded, but the
@@ -683,13 +1361,24 @@ to re-embed. (#439, #441)
   machines are preserved. A new `spelunk memory pull` does a one-way delta pull.
   Sync is identity-keyed on a time-ordered UUID carried by each entry, so it is
   idempotent (re-running never duplicates) and drift-free across machine clocks;
-  archived entries propagate as tombstones. (ADR-037 P1, #425)
+  archived entries propagate as tombstones. (#425)
 
 - **Sync modes (`mode = offline | local_first | cloud_first`).** A new `mode`
   config field (and `SPELUNK_MODE` env override) controls how the CLI reconciles
   local and cloud memory. The default preserves existing behaviour: with no
   `server_url` the CLI is `offline`; with a `server_url` set it is `local_first`.
-  `SPELUNK_NO_SERVER=1` remains a hard kill-switch. (ADR-037 P1, #425)
+  `SPELUNK_NO_SERVER=1` remains a hard kill-switch. (#425)
+- **Sync-mode indicator and state-scoped capability hints.** `spelunk status`
+  gains a neutral one-word `mode` line reporting the active sync mode
+  (`local_first`, `cloud_first`, or `offline`) whenever a `server_url` or an
+  explicit `mode` is configured; it carries no call to action. Capability hints
+  are now scoped to the configuration: the embedder hint points at the team
+  server when an explicit `server_url` is configured (not the auto-discovered
+  loopback); the explore hint truthfully names an unreachable configured server
+  instead of suggesting to set one that is already set. `cloud_first` mode pins
+  hard-error behavior: reads and writes fail loudly when the server is
+  unreachable or untrusted, and local data is never silently substituted as a
+  fallback.
 
 ### Changed
 

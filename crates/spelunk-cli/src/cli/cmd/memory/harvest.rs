@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 
+use super::super::color::cprintln;
 use super::{MemoryHarvestArgs, backend_err};
 use crate::{
     capability,
@@ -54,7 +55,10 @@ pub(super) async fn memory_harvest(
     // (which reads only `server_url`). For an auto-discovered server that means
     // local storage; for an explicit team `server_url` memory stays remote.
     let project_root = mem_path.parent().unwrap_or(mem_path);
-    let tier = capability::get_tier(cfg).await;
+    // `get_inference_tier` (not `get_tier`): local_first always prefers the
+    // local loopback embedder/LLM, even with an explicit server_url set
+    // (2026-07-23 founder decision).
+    let tier = capability::get_inference_tier(cfg).await;
     let eff_cfg = tier.effective_config(cfg, project_root);
     let cfg = &eff_cfg;
 
@@ -398,7 +402,7 @@ async fn memory_harvest_git(
                 })
                 .await
             {
-                Ok(id) => id,
+                Ok((id, _created)) => id,
                 Err(e) => {
                     eprintln!(
                         "  warning: failed to store entry '{title}' ({full_sha}), skipping: {e:#}"
@@ -408,7 +412,7 @@ async fn memory_harvest_git(
             };
 
             let short_sha = &full_sha[..full_sha.len().min(8)];
-            println!("  + [{kind}] #{note_id}: {title}  \x1b[2m({short_sha})\x1b[0m");
+            cprintln!("  + [{kind}] #{note_id}: {title}  \x1b[2m({short_sha})\x1b[0m");
             stored += 1;
         }
     }
@@ -761,7 +765,7 @@ async fn memory_harvest_failures(
                 })
                 .await
             {
-                Ok(id) => id,
+                Ok((id, _created)) => id,
                 Err(e) => {
                     eprintln!(
                         "  warning: failed to store entry '{title}' ({full_sha}), skipping: {e:#}"
@@ -771,7 +775,7 @@ async fn memory_harvest_failures(
             };
 
             let short_sha = &full_sha[..full_sha.len().min(8)];
-            println!("  + [antipattern] #{note_id}: {title}  \x1b[2m({short_sha})\x1b[0m");
+            cprintln!("  + [antipattern] #{note_id}: {title}  \x1b[2m({short_sha})\x1b[0m");
             stored += 1;
         }
     }

@@ -9,10 +9,16 @@ on:
     # Run weekly on Monday at 08:00 UTC to catch newly-disclosed advisories.
     - cron: "0 8 * * 1"
 
+# Deny by default; both jobs below only check out the repo and run a
+# read-only audit/deny tool, so `contents: read` covers them.
+permissions: {}
+
 jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -43,6 +49,8 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

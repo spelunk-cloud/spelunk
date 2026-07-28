@@ -1,10 +1,15 @@
 //! `spelunk memory push` — one-way push of local memory to the cloud.
 //!
-//! ADR-037 D2/D3 changes vs. the MVP placeholder:
-//! - **Text-only.** The client never ships a vector; the server backfills the
-//!   embedding with its configured model (ADR-010/ADR-020). The old
-//!   `local.get_embedding(...)` send path is gone — it carried the *local*
-//!   model's vectors into the cloud's space and broke KNN over synced rows.
+//! Changes vs. the MVP placeholder:
+//! - **Text-only by default; optional pushed vector.** The client ships no
+//!   vector and the server backfills the embedding with its configured model
+//!   — unless the server advertises `accepts_pushed_vectors`, in which case an
+//!   entry with a local fp32/896 embedding carries it (same model + dim as the
+//!   server), so the server stores it as-is instead of re-embedding. The old
+//!   unconditional `get_embedding` send path (which carried a *mismatched*
+//!   local model's vectors into the cloud's space and broke KNN) stays gone;
+//!   the gated path only sends a vector the server has said it will accept for
+//!   its own space.
 //! - **Batched.** Entries go via `POST /memory/batch`, not N single POSTs.
 //! - **Idempotent.** Each entry carries its stable UUID as the cloud
 //!   `external_id`, so re-pushing skips already-present entries instead of
@@ -18,7 +23,7 @@
 use anyhow::{Context, Result};
 
 use super::MemoryPushArgs;
-use super::sync::push_local_oneway;
+use super::sync::{LocalEmbedPolicy, local_embed_summary, push_local_oneway, unembedded_warning};
 use crate::{
     capability,
     cli::cmd::auth_api,
@@ -35,10 +40,7 @@ pub async fn memory_push(
     let tier = capability::get_tier(cfg).await;
     capability::require_tier1("memory push", tier, cfg.server_url.as_deref())?;
 
-    let base_url = cfg
-        .server_url
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("memory push requires `server_url` to be configured."))?;
+    let base_url = capability::require_explicit_server_url("memory push", cfg)?;
     let project_id = cfg.project_id.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "`project_id` is not configured. Set it in `.spelunk/config.toml` \
@@ -50,7 +52,7 @@ pub async fn memory_push(
     let local = MemoryStore::open(src_path)
         .with_context(|| format!("opening local memory at {}", src_path.display()))?;
     // Refresh a stale WorkOS access token before the cloud-api call.
-    let key = auth_api::ensure_fresh_server_key(cfg).await?;
+    let key = auth_api::ensure_fresh_server_key(cfg, &base_url).await?;
     let client = CloudSyncClient::new(
         &base_url,
         &project_id,
@@ -59,13 +61,67 @@ pub async fn memory_push(
     )?;
 
     println!("Pushing local memory to {base_url}…");
-    let summary = push_local_oneway(&local, &client, args.include_archived).await?;
+    // Attach the local fp32/896 vector only when the server advertises it;
+    // otherwise the push is text-only and the server re-embeds.
+    let accepts_pushed_vectors = tier.caps().is_some_and(|c| c.accepts_pushed_vectors);
+    let local_embed = LocalEmbedPolicy::for_push(cfg, src_path);
+    let summary = push_local_oneway(
+        &local,
+        &client,
+        args.include_archived,
+        accepts_pushed_vectors,
+        &local_embed,
+    )
+    .await?;
+    if summary.without_local_vector > 0 {
+        eprintln!("{}", unembedded_warning(summary.without_local_vector));
+    }
     if summary.attempted == 0 {
-        println!("No local memory entries to push.");
+        if summary.already_synced > 0 {
+            println!(
+                "Nothing to push — {} entries already synced.",
+                summary.already_synced
+            );
+        } else {
+            println!("No local memory entries to push.");
+        }
+    } else if let Some(reason) = summary.interrupted.as_deref() {
+        // A chunk failed mid-push. Report what already landed and how to resume,
+        // then exit non-zero: earlier chunks are durably stamped, so a re-run
+        // pushes only the remainder and already-pushed entries return 207
+        // `skipped`. Must not read as success.
+        anyhow::bail!(
+            "Pushed {} of {} entries, then stopped: {reason}. \
+             Re-run to resume (already-pushed entries are skipped).",
+            summary.created + summary.skipped,
+            summary.attempted
+        );
+    } else if summary.created == 0 && summary.skipped == 0 {
+        // Total failure: nothing durably landed. Must not read as success —
+        // a caller skimming for "Done" or checking only the exit code would
+        // otherwise miss a fully-failed batch (this is the data-loss shape
+        // the bug was filed over).
+        anyhow::bail!(
+            "Push failed: 0 of {} entries reached the server ({} failed).",
+            summary.attempted,
+            summary.failed
+        );
+    } else if summary.failed > 0 {
+        println!(
+            "Done. Pushed {} entries (created {}, skipped {}, {} failed).{}",
+            summary.attempted,
+            summary.created,
+            summary.skipped,
+            summary.failed,
+            local_embed_summary(&summary)
+        );
     } else {
         println!(
-            "Done. Pushed {} entries (created {}, skipped {}).",
-            summary.attempted, summary.created, summary.skipped
+            "Done. Pushed {} entries (created {}, skipped {}).{}",
+            summary.attempted,
+            summary.created,
+            summary.skipped,
+            local_embed_summary(&summary)
         );
     }
     Ok(())

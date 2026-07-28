@@ -1,6 +1,6 @@
-//! HTTP client for WorkOS-direct device-flow auth (ADR-047).
+//! HTTP client for WorkOS-direct device-flow auth.
 //!
-//! Supersedes the cloud-api `/v1/auth/*` proxy (ADR-045). A live multi-org
+//! Supersedes the cloud-api `/v1/auth/*` proxy. A live multi-org
 //! device login proved every token leg the CLI needs is a WorkOS PUBLIC-CLIENT
 //! exchange — `client_id` only, no secret — so the CLI talks to WorkOS directly
 //! and no longer routes auth through cloud-api.
@@ -24,8 +24,13 @@ use serde::Deserialize;
 
 use spelunk_core::config::{AuthTokens, Config};
 
-/// Default cloud API base URL (used only for `GET /v1/me`).
-pub const DEFAULT_CLOUD_URL: &str = "https://api.spelunk.cloud";
+/// Default cloud API base URL (used for `GET /v1/me`, and as the cloud-vs-
+/// self-hosted origin boundary for bearer resolution, ADR-071 D2). Single
+/// source of truth lives in `spelunk_core::config::server_keys`, which also
+/// reads it (and its `SPELUNK_CLOUD_URL` override) when deciding credential
+/// kind; re-exported here so every existing `auth_api::DEFAULT_CLOUD_URL`
+/// call site keeps working unchanged.
+pub use spelunk_core::config::server_keys::DEFAULT_CLOUD_URL;
 
 /// Default WorkOS User Management API base URL.
 pub const DEFAULT_WORKOS_URL: &str = "https://api.workos.com";
@@ -363,7 +368,8 @@ pub async fn poll_token(
 /// `POST /user_management/authenticate` with the refresh-token grant.
 ///
 /// With `organization_id` set this is a silent org-switch; without it, a plain
-/// refresh. A non-member / unknown organisation surfaces as a clear error.
+/// refresh reverts to the account's default org. A non-member / unknown
+/// organisation surfaces as a clear error.
 pub async fn refresh_token(
     client: &reqwest::Client,
     workos_url: &str,
@@ -397,8 +403,13 @@ pub async fn refresh_token(
 /// runs — every cloud-api call would then `401`. This guard refreshes proactively
 /// when the token is at/past expiry (with a small skew window, see
 /// [`AuthTokens::is_expired`]) using the stored refresh token directly against
-/// WorkOS (refresh grant, ADR-047), persists the rotated tokens to `[auth]`, and
+/// WorkOS (refresh grant), persists the rotated tokens to `[auth]`, and
 /// returns the tokens to use.
+///
+/// The refresh re-sends `auth.org_id` as `organization_id` so a prior `org
+/// switch` survives rotation — WorkOS's refresh grant otherwise reverts to the
+/// account's default org when `organization_id` is omitted, silently undoing
+/// the switch on every expiry (see [`refresh_token`]).
 ///
 /// When the token is still valid, `auth` is returned unchanged (no network
 /// call). A refresh failure (revoked/expired refresh token) surfaces a clear
@@ -417,44 +428,64 @@ pub async fn ensure_fresh_token(
         return Ok(auth.clone());
     }
 
-    let rotated = refresh_token(client, workos_url, client_id, &auth.refresh_token, None)
-        .await
-        .map_err(|e| e.context("session expired and token refresh failed — run `spelunk login`"))?
-        .into_auth_tokens();
+    let rotated = refresh_token(
+        client,
+        workos_url,
+        client_id,
+        &auth.refresh_token,
+        org_id_for_refresh(&auth.org_id),
+    )
+    .await
+    .map_err(|e| e.context("session expired and token refresh failed — run `spelunk login`"))?
+    .into_auth_tokens();
     persist(&rotated)?;
     Ok(rotated)
 }
 
-/// Resolve the bearer token to send to cloud-api, refreshing the stored WorkOS
-/// access token first if it has expired.
+/// The `organization_id` to re-request on a plain refresh: `auth.org_id` when
+/// set, `None` when empty (an orgless account, or tokens predating org
+/// tracking) so the refresh grant falls back to its default-org behaviour
+/// instead of sending an empty `organization_id` form field.
+pub(crate) fn org_id_for_refresh(org_id: &str) -> Option<&str> {
+    (!org_id.is_empty()).then_some(org_id)
+}
+
+/// Resolve the bearer token to send to `server_url`, refreshing the stored
+/// WorkOS access token first if it has expired.
 ///
-/// The CLI's effective bearer (`cfg.server_key`) is the `[auth]` access token
-/// when the user logged in via WorkOS. Because access tokens are short-lived,
-/// commands that hit cloud-api directly (e.g. `spelunk sync`, `spelunk memory
-/// pull`) must guard against using an already-expired token, which would 401.
+/// Resolution goes through [`Config::bearer_for`] (ADR-071 D2): only a
+/// cloud-origin `server_url` can ever resolve to the `[auth]` access token,
+/// so a self-hosted `server_url` never mistakes an unrelated cloud login for
+/// its own credential. Because access tokens are short-lived, commands that
+/// hit cloud-api directly (e.g. `spelunk sync`, `spelunk memory pull`) must
+/// guard against using an already-expired token, which would 401.
 ///
 /// Behaviour:
-///   - When `[auth]` tokens are present AND the bearer was derived from them
-///     (the WorkOS-login case) AND they are expired, refresh directly against
-///     WorkOS, persist the rotated tokens, and return the fresh access token.
-///   - Otherwise return `cfg.server_key` unchanged — a bare/team `server_key`
-///     or an env override is not refreshable here, and a still-valid token needs
-///     no network round-trip.
+///   - When `[auth]` tokens are present AND the resolved bearer was derived
+///     from them (i.e. `server_url` is the cloud origin) AND they are
+///     expired, refresh directly against WorkOS, persist the rotated tokens,
+///     and return the fresh access token.
+///   - Otherwise return the resolved bearer unchanged: a self-hosted
+///     server-key or an env override is not refreshable here, and a
+///     still-valid token needs no network round-trip.
 ///
 /// A refresh failure surfaces a clear "run `spelunk login`" error.
-pub async fn ensure_fresh_server_key(cfg: &Config) -> Result<Option<String>> {
-    // Only the WorkOS-login bearer (server_key derived from [auth].access_token)
-    // is refreshable; a team/env key is returned as-is.
+pub async fn ensure_fresh_server_key(cfg: &Config, server_url: &str) -> Result<Option<String>> {
+    let resolved = cfg.bearer_for(server_url)?;
+
+    // Only the WorkOS-login bearer (the cloud kind, resolved from
+    // [auth].access_token) is refreshable; a self-hosted server-key is
+    // returned as-is.
     let Some(auth) = cfg
         .auth
         .as_ref()
-        .filter(|a| Some(a.access_token.as_str()) == cfg.server_key.as_deref())
+        .filter(|a| Some(a.access_token.as_str()) == resolved.as_deref())
     else {
-        return Ok(cfg.server_key.clone());
+        return Ok(resolved);
     };
 
     if !auth.is_expired() {
-        return Ok(cfg.server_key.clone());
+        return Ok(resolved);
     }
 
     let client = build_client()?;
@@ -684,7 +715,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_fresh_token_refreshes_and_persists_when_expired() {
         use std::sync::{Arc, Mutex};
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
@@ -692,6 +723,7 @@ mod tests {
             fake_jwt(&serde_json::json!({ "exp": 5_000_000_000_i64, "org_id": "org_1" }));
         Mock::given(method("POST"))
             .and(path("/user_management/authenticate"))
+            .and(body_string_contains("organization_id=org_1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": fresh_jwt,
                 "refresh_token": "rt-rotated",
@@ -725,6 +757,108 @@ mod tests {
             "rt-rotated",
             "rotated tokens must be persisted"
         );
+    }
+
+    /// Regression test for the org-switch-doesn't-stick bug: a refresh of an
+    /// expired token scoped to a switched-to org (`auth.org_id`) must re-send
+    /// that same org as `organization_id`, so the session stays scoped to it
+    /// instead of silently reverting to the account's default org.
+    #[tokio::test]
+    async fn ensure_fresh_token_preserves_switched_org_across_refresh() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let fresh_jwt =
+            fake_jwt(&serde_json::json!({ "exp": 5_000_000_000_i64, "org_id": "org_switched" }));
+        // The mock only answers a request whose form body names the switched
+        // org; a plain refresh (no organization_id) would 404 here instead.
+        Mock::given(method("POST"))
+            .and(path("/user_management/authenticate"))
+            .and(body_string_contains("organization_id=org_switched"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": fresh_jwt,
+                "refresh_token": "rt-rotated",
+                "organization_id": "org_switched",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Simulates state right after `org switch org_switched`: the access
+        // token has since expired, but auth.org_id still names the switched org.
+        let expired_after_switch = AuthTokens {
+            access_token: "at-expired".into(),
+            refresh_token: "rt-old".into(),
+            expires_at: 0,
+            org_id: "org_switched".into(),
+        };
+
+        let client = build_client().unwrap();
+        let out = ensure_fresh_token(
+            &client,
+            &server.uri(),
+            "client_test",
+            &expired_after_switch,
+            |_| Ok(()),
+        )
+        .await
+        .expect("refresh scoped to the switched org should succeed");
+
+        assert_eq!(
+            out.org_id, "org_switched",
+            "the rotated token must stay scoped to the switched org, not revert to the default"
+        );
+    }
+
+    /// An account with no active org (`org_id` empty — e.g. tokens from before
+    /// `org switch` was ever used) falls back to a plain refresh: no
+    /// `organization_id` field is sent at all, matching prior behaviour.
+    #[tokio::test]
+    async fn ensure_fresh_token_empty_org_id_sends_plain_refresh() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        struct AssertNoOrgId;
+        impl Respond for AssertNoOrgId {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body = String::from_utf8_lossy(&request.body);
+                assert!(
+                    !body.contains("organization_id"),
+                    "an empty org_id must not send organization_id at all, got body: {body}"
+                );
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": fake_jwt(&serde_json::json!({ "exp": 5_000_000_000_i64 })),
+                    "refresh_token": "rt-rotated",
+                }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/user_management/authenticate"))
+            .respond_with(AssertNoOrgId)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let expired_no_org = AuthTokens {
+            access_token: "at-expired".into(),
+            refresh_token: "rt-old".into(),
+            expires_at: 0,
+            org_id: String::new(),
+        };
+
+        let client = build_client().unwrap();
+        ensure_fresh_token(
+            &client,
+            &server.uri(),
+            "client_test",
+            &expired_no_org,
+            |_| Ok(()),
+        )
+        .await
+        .expect("plain refresh with no org should still succeed");
     }
 
     /// When the refresh grant is rejected (revoked/expired refresh token), the

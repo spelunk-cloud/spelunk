@@ -122,7 +122,10 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
     // the inference client can be built (mirrors explore.rs / memory/search.rs,
     // see spelunk#316).
     let project_root = db_path.parent().unwrap_or(&db_path);
-    let tier = capability::get_tier(&cfg).await;
+    // `get_inference_tier` (not `get_tier`): local_first always prefers the
+    // local loopback embedder, even with an explicit server_url set
+    // (2026-07-23 founder decision).
+    let tier = capability::get_inference_tier(&cfg).await;
     let cfg = tier.effective_config(&cfg, project_root);
 
     // Apply --local-only: discard linked deps.
@@ -173,6 +176,50 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
         return Ok(());
     }
 
+    // ── Embedding coverage is a first-class search input (chunk-shaped) ──────
+    // A just-built, unembedded index is not stale, so the staleness probe can
+    // never see the warmup window; the empty-result path below gates on
+    // coverage instead. Invariant: `No results found.` is only ever printed
+    // when the corpus that was searched was complete; whenever coverage is
+    // partial, the output names what was incomplete. Notices go to stderr so
+    // json/jsonl stdout stays machine-clean. No threshold: "incomplete" is a
+    // fact, the percentage is reported, and the user judges.
+    let coverage: Option<(i64, i64)> = if mode == "text" {
+        // FTS is written at parse time and covers every chunk.
+        None
+    } else {
+        Database::open(&db_path)
+            .and_then(|db| db.stats())
+            .ok()
+            .map(|s| (s.embedding_count, s.chunk_count))
+    };
+
+    if let Some((embedded, total)) = coverage {
+        match coverage_disposition(embedded, total, auto_mode) {
+            CoverageDisposition::Complete => {}
+            CoverageDisposition::PartialNotice => {
+                eprintln!("{}", warmup_notice_partial(embedded, total));
+            }
+            CoverageDisposition::ZeroFallBack => {
+                eprintln!("{}", warmup_notice_zero_auto(total));
+                return search_live(
+                    &args.query,
+                    &args.format,
+                    std::path::Path::new("."),
+                    args.limit,
+                );
+            }
+            CoverageDisposition::ZeroExplicitError => {
+                return Err(anyhow::anyhow!(warmup_error_zero_explicit(mode, total)));
+            }
+        }
+    }
+    let coverage_partial = matches!(coverage, Some((e, t)) if e < t);
+    // Set when an empty semantic result over a partial corpus was re-run as
+    // text search: the FTS corpus is complete, so the plain empty-result line
+    // becomes truthful again.
+    let mut fell_back_to_text = false;
+
     let mut results = if mode == "text" {
         // Text mode: FTS5 only, no embedding model required.
         let sp = spinner("Searching (text)…");
@@ -216,7 +263,7 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
         // "ast-grep not found" error isn't misattributed.
         if auto_mode && query_vec_result.is_err() {
             sp.finish_and_clear();
-            eprint_semantic_unavailable_notice(tier, &cfg);
+            eprint_semantic_unavailable_notice(&tier, &cfg);
             return search_live(
                 &args.query,
                 &args.format,
@@ -250,21 +297,42 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
         )?;
         sp.finish_and_clear();
 
-        // Auto mode: stale index + empty results → fall back to ast-grep silently.
-        if auto_mode && res.is_empty() && !args.no_stale_check && index_is_stale(&db_path) {
+        // Auto mode, empty result set:
+        //  - partial coverage → re-run as text search over the complete FTS
+        //    corpus rather than reporting an absence KNN over a partial corpus
+        //    cannot substantiate (the warmup notice already went to stderr);
+        //  - full coverage → today's behaviour: stale index falls back to
+        //    ast-grep.
+        if auto_mode && res.is_empty() && coverage_partial {
+            eprintln!("[no semantic results in the embedded portion; using text search]");
+            fell_back_to_text = true;
+            let db = Database::open(&db_path)?;
+            db.search_text(&args.query, args.limit.min(100))
+                .unwrap_or_default()
+        } else if auto_mode && res.is_empty() && !args.no_stale_check && index_is_stale(&db_path) {
             return search_live(
                 &args.query,
                 &args.format,
                 std::path::Path::new("."),
                 args.limit,
             );
+        } else {
+            res
         }
-
-        res
     };
 
     if results.is_empty() {
-        println!("No results found.");
+        if coverage_partial && !fell_back_to_text {
+            // Explicit semantic/hybrid over a partial corpus: the plain
+            // absence claim is not substantiated, name the incompleteness.
+            let (e, t) = coverage.unwrap_or((0, 0));
+            println!(
+                "No results found in the embedded portion of the index \
+                 (searchable {e}/{t} chunks; the rest is not embedded yet)."
+            );
+        } else {
+            println!("No results found.");
+        }
         return Ok(());
     }
 
@@ -573,32 +641,136 @@ pub(crate) fn search_live(
     Ok(())
 }
 
+/// What the embedding coverage of the index means for this search
+/// (`spelunk search` warmup contract). Three coverage states by two mode
+/// classes, exhaustively; there is deliberately no coverage threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverageDisposition {
+    /// Every chunk is embedded (or the index is empty, handled earlier):
+    /// today's behaviour, no notice.
+    Complete,
+    /// `0 < coverage < 100`: run KNN and always emit the one-line warmup
+    /// notice, in auto and explicit modes alike, so a thin result set is
+    /// never mistaken for a complete one.
+    PartialNotice,
+    /// Zero coverage in `auto` mode: fall back to the live search, with a
+    /// notice naming warmup as the reason.
+    ZeroFallBack,
+    /// Zero coverage in an explicit `semantic`/`hybrid` mode: an actionable
+    /// error naming warmup and the resume command. Never `No results found.`.
+    ZeroExplicitError,
+}
+
+/// The three-state coverage table (`0` / partial / `100`, by auto vs explicit
+/// semantic/hybrid). `embedded >= total` covers the defensive over-count case.
+fn coverage_disposition(embedded: i64, total: i64, auto_mode: bool) -> CoverageDisposition {
+    if total <= 0 || embedded >= total {
+        return CoverageDisposition::Complete;
+    }
+    if embedded <= 0 {
+        if auto_mode {
+            CoverageDisposition::ZeroFallBack
+        } else {
+            CoverageDisposition::ZeroExplicitError
+        }
+    } else {
+        CoverageDisposition::PartialNotice
+    }
+}
+
+/// One-line warmup notice for a partially-embedded corpus: carries the
+/// coverage percentage AND its shape. The queue drains in priority order
+/// (`graph_rank DESC, mtime DESC` — most-referenced code first, then most
+/// recently modified), so a prefix is the most important/recent code, not a
+/// sample across the repo: the user has a complete picture of the code most
+/// likely to matter and a blind spot over the rest, and a bare percentage
+/// would read as the opposite failure mode (a uniformly thinner picture of
+/// everything).
+fn warmup_notice_partial(embedded: i64, total: i64) -> String {
+    let pct = if total > 0 {
+        (embedded.max(0) as u64).saturating_mul(100) / total as u64
+    } else {
+        0
+    };
+    format!(
+        "[warmup: searchable {embedded}/{total} chunks ({pct}%), front-loaded by importance \
+         and recency; a missing result may mean \"not embedded yet\", not \"not in the \
+         codebase\" (check `spelunk status`)]"
+    )
+}
+
+/// Zero-coverage notice for `auto` mode, printed before the live-search
+/// fallback: names warmup as the reason.
+fn warmup_notice_zero_auto(total: i64) -> String {
+    format!(
+        "[semantic search is warming up: 0/{total} chunks embedded; using ast-grep. \
+         Embeddings build in the background (check `spelunk status`)]"
+    )
+}
+
+/// Zero-coverage error for explicit `semantic`/`hybrid`: actionable, naming
+/// warmup and the resume command.
+fn warmup_error_zero_explicit(mode: &str, total: i64) -> String {
+    format!(
+        "semantic search is still warming up: 0/{total} chunks are embedded, so a {mode} \
+         search would search nothing.\n\
+         Embeddings build in the background; check `spelunk status`. If no embed worker is \
+         running, resume with `spelunk index .`.\n\
+         Use `--mode text` or `--mode ast-grep` in the meantime."
+    )
+}
+
 /// Build the one-line notice explaining why `auto`-mode search is falling back
 /// from semantic to ast-grep, differentiating the cases the readiness contract
 /// exposes.
 ///
 /// Pure so it can be unit-tested without capturing stderr; `has_server_url` is
 /// `cfg.server_url.is_some()`.
+///
+/// `remote_url` is `Some` when the probed server came from an explicit
+/// `server_url` (not loopback auto-discovery). The unavailable-embedder
+/// notice must then name that server instead of pointing at `spelunk server
+/// logs`, which only reads the local auto-daemon's log and would show clean
+/// logs for a failure that lives on the remote server.
+///
+/// `server_url` is `cfg.server_url` (used only for the offline case, where no
+/// probe ever reached the point of populating `remote_url`): the configured
+/// server never answered at all, so the notice names it directly and flags
+/// that it overrides the auto-discovered local daemon. `is_windows` is
+/// injected rather than read from `cfg!(windows)` inline so the function stays
+/// pure and the platform-gated hint is unit-testable on any host.
 fn semantic_unavailable_message(
     embedder_state: Option<capability::EmbedderState>,
-    has_server_url: bool,
+    server_url: Option<&str>,
+    remote_url: Option<&str>,
+    is_windows: bool,
 ) -> String {
     use capability::EmbedderState;
     match embedder_state {
         Some(EmbedderState::Loading) => "[semantic search unavailable: model still warming up — \
              retry shortly (`spelunk server status`); using ast-grep]"
             .to_string(),
-        Some(EmbedderState::Unavailable) => {
-            "[semantic search unavailable: embedder failed to load — \
-             see `spelunk server logs`; using ast-grep]"
-                .to_string()
-        }
+        Some(EmbedderState::Unavailable) => match remote_url {
+            Some(url) => format!(
+                "[semantic search unavailable: embedder failed to load on team server {url}; \
+                 check that server's own logs; using ast-grep]"
+            ),
+            None => "[semantic search unavailable: embedder failed to load; \
+                 see `spelunk server logs`; using ast-grep]"
+                .to_string(),
+        },
         Some(_) => "[semantic search unavailable on this server; using ast-grep]".to_string(),
         None => {
-            if has_server_url {
-                "[no server reachable — on Windows, allow the loopback listener through \
-                 Defender Firewall (`spelunk server status`); using ast-grep]"
-                    .to_string()
+            if let Some(url) = server_url {
+                let windows_hint = if is_windows {
+                    " On Windows, allow the loopback listener through Defender Firewall."
+                } else {
+                    ""
+                };
+                format!(
+                    "[no server reachable at {url} (the configured server_url, overriding the \
+                     auto-discovered local daemon);{windows_hint} using ast-grep]"
+                )
             } else {
                 "[no server running — start one with `spelunk server start` to enable \
                  semantic search; using ast-grep]"
@@ -613,7 +785,12 @@ fn semantic_unavailable_message(
 fn eprint_semantic_unavailable_notice(tier: &capability::Tier, cfg: &Config) {
     eprintln!(
         "{}",
-        semantic_unavailable_message(tier.embedder_state(), cfg.server_url.is_some())
+        semantic_unavailable_message(
+            tier.embedder_state(),
+            cfg.server_url.as_deref(),
+            tier.explicit_remote_url(),
+            cfg!(windows),
+        )
     );
 }
 
@@ -622,34 +799,216 @@ mod tests {
     use super::*;
     use crate::capability::EmbedderState;
 
+    // ── coverage_disposition: the three-state warmup table, all six cells ──────
+
+    #[test]
+    fn coverage_zero_auto_falls_back_with_notice() {
+        assert_eq!(
+            coverage_disposition(0, 100, true),
+            CoverageDisposition::ZeroFallBack
+        );
+    }
+
+    #[test]
+    fn coverage_zero_explicit_is_an_actionable_error() {
+        assert_eq!(
+            coverage_disposition(0, 100, false),
+            CoverageDisposition::ZeroExplicitError
+        );
+    }
+
+    #[test]
+    fn coverage_partial_auto_runs_knn_with_notice() {
+        assert_eq!(
+            coverage_disposition(40, 100, true),
+            CoverageDisposition::PartialNotice
+        );
+    }
+
+    #[test]
+    fn coverage_partial_explicit_runs_knn_with_the_same_notice() {
+        assert_eq!(
+            coverage_disposition(40, 100, false),
+            CoverageDisposition::PartialNotice
+        );
+    }
+
+    #[test]
+    fn coverage_full_auto_is_todays_behaviour_no_notice() {
+        assert_eq!(
+            coverage_disposition(100, 100, true),
+            CoverageDisposition::Complete
+        );
+    }
+
+    #[test]
+    fn coverage_full_explicit_is_todays_behaviour_no_notice() {
+        assert_eq!(
+            coverage_disposition(100, 100, false),
+            CoverageDisposition::Complete
+        );
+    }
+
+    #[test]
+    fn coverage_has_no_threshold() {
+        // "Incomplete" is a fact, not a tunable: 1 missing chunk out of 100k
+        // still notices, and 1 embedded chunk out of 100k still serves KNN.
+        assert_eq!(
+            coverage_disposition(99_999, 100_000, true),
+            CoverageDisposition::PartialNotice
+        );
+        assert_eq!(
+            coverage_disposition(1, 100_000, false),
+            CoverageDisposition::PartialNotice
+        );
+    }
+
+    #[test]
+    fn coverage_defensive_cases_are_complete() {
+        // Empty index (handled by earlier guards) and an over-count must not
+        // produce warmup output.
+        assert_eq!(
+            coverage_disposition(0, 0, true),
+            CoverageDisposition::Complete
+        );
+        assert_eq!(
+            coverage_disposition(120, 100, false),
+            CoverageDisposition::Complete
+        );
+    }
+
+    // ── warmup notices: percentage, shape, and actionability ───────────────────
+
+    #[test]
+    fn partial_notice_names_coverage_and_its_front_loaded_shape() {
+        let n = warmup_notice_partial(11_813, 27_734);
+        assert!(n.contains("11813/27734"), "labelled coverage: {n}");
+        assert!(n.contains("42%"), "carries the percentage: {n}");
+        assert!(
+            n.contains("front-loaded by importance and recency"),
+            "names the shape so a subsystem miss reads as a blind spot, not a thin sample: {n}"
+        );
+        assert!(n.contains("spelunk status"), "actionable: {n}");
+    }
+
+    /// Regression guard (spelunk-oss embed-queue reorder): the embed queue's
+    /// `ORDER BY` changed from raw parse/insertion order (`c.id`) to
+    /// `graph_rank DESC, mtime DESC, c.id` — the queue is no longer "the first
+    /// N files walked" in any sense. The warmup notice's copy was corrected to
+    /// "front-loaded by importance and recency" to match; this guards against
+    /// any regression to the stale "indexing order" wording, which described a
+    /// mechanism that no longer exists.
+    ///
+    /// The reorder does not affect the coverage/completeness contract (verified
+    /// above: `coverage_disposition` only ever reads `(embedded, total)`
+    /// counts, never queue order, so "ordering mistaken for completeness" does
+    /// not regress) — this is purely about the notice's user-facing
+    /// *explanation* of the ordering mechanism staying accurate.
+    #[test]
+    fn partial_notice_no_longer_claims_indexing_order_after_the_reorder() {
+        let n = warmup_notice_partial(11_813, 27_734);
+        assert!(
+            !n.contains("indexing order"),
+            "the embed queue is no longer ordered by parse/indexing order since the \
+             recency+graph_rank reorder (ORDER BY c.graph_rank DESC, f.mtime DESC, c.id) — \
+             this notice's copy is stale and describes a mechanism that no longer exists: {n}"
+        );
+    }
+
+    #[test]
+    fn zero_auto_notice_names_warmup_as_the_reason() {
+        let n = warmup_notice_zero_auto(27_734);
+        assert!(n.contains("warming up"));
+        assert!(n.contains("0/27734"));
+        assert!(n.contains("ast-grep"));
+    }
+
+    #[test]
+    fn zero_explicit_error_names_warmup_and_the_resume_command() {
+        let e = warmup_error_zero_explicit("semantic", 27_734);
+        assert!(e.contains("warming up"));
+        assert!(e.contains("spelunk index ."), "resume command: {e}");
+        assert!(e.contains("--mode text"), "usable alternative: {e}");
+        assert!(
+            !e.contains("No results found"),
+            "never the empty-result claim: {e}"
+        );
+    }
+
     // ── semantic_unavailable_message: auto-mode fallback notice (#5) ────────────
 
     #[test]
     fn notice_loading_advises_retry() {
-        let msg = semantic_unavailable_message(Some(EmbedderState::Loading), true);
+        let msg = semantic_unavailable_message(
+            Some(EmbedderState::Loading),
+            Some("http://x:1"),
+            None,
+            false,
+        );
         assert!(msg.contains("warming up"));
         assert!(msg.contains("ast-grep"));
     }
 
     #[test]
-    fn notice_unavailable_points_at_logs() {
-        let msg = semantic_unavailable_message(Some(EmbedderState::Unavailable), true);
+    fn notice_unavailable_loopback_points_at_logs() {
+        // Loopback auto-discovery: the failing embedder IS the local daemon,
+        // so `spelunk server logs` is the right place to look.
+        let msg = semantic_unavailable_message(
+            Some(EmbedderState::Unavailable),
+            Some("http://x:1"),
+            None,
+            false,
+        );
         assert!(msg.contains("failed to load"));
         assert!(msg.contains("spelunk server logs"));
     }
 
     #[test]
-    fn notice_no_server_with_configured_url_mentions_firewall() {
-        // Offline (no reachable server) but a server_url was configured →
-        // the likely Windows cause is a blocked loopback listener.
-        let msg = semantic_unavailable_message(None, true);
+    fn notice_unavailable_remote_names_that_server_never_local_logs() {
+        // Explicit server_url: `spelunk server logs` reads the LOCAL daemon's
+        // log, which is clean when the failure lives on the team server. The
+        // notice must name the probed server instead.
+        let msg = semantic_unavailable_message(
+            Some(EmbedderState::Unavailable),
+            Some("http://x:1"),
+            Some("https://team.example:7777"),
+            false,
+        );
+        assert!(msg.contains("failed to load"));
+        assert!(msg.contains("https://team.example:7777"), "got: {msg}");
+        assert!(
+            !msg.contains("spelunk server logs"),
+            "must not point a remote failure at local logs: {msg}"
+        );
+    }
+
+    #[test]
+    fn notice_no_server_names_the_configured_url_on_windows() {
+        // Offline (no reachable server) but a server_url was configured: name
+        // the actual URL that was attempted, note it overrides the
+        // auto-discovered local daemon, and mention the Windows cause only
+        // when actually running on Windows.
+        let msg = semantic_unavailable_message(None, Some("https://team.example:7777"), None, true);
+        assert!(msg.contains("https://team.example:7777"), "got: {msg}");
         assert!(msg.contains("no server reachable"));
         assert!(msg.contains("Firewall"));
+        assert!(msg.contains("overriding"), "got: {msg}");
+    }
+
+    #[test]
+    fn notice_no_server_with_configured_url_omits_windows_hint_elsewhere() {
+        // Same offline+configured-url case, but not on Windows: the
+        // Defender-specific hint must not appear.
+        let msg =
+            semantic_unavailable_message(None, Some("https://team.example:7777"), None, false);
+        assert!(msg.contains("https://team.example:7777"), "got: {msg}");
+        assert!(msg.contains("no server reachable"));
+        assert!(!msg.contains("Firewall"), "got: {msg}");
     }
 
     #[test]
     fn notice_no_server_no_url_suggests_starting_one() {
-        let msg = semantic_unavailable_message(None, false);
+        let msg = semantic_unavailable_message(None, None, None, false);
         assert!(msg.contains("spelunk server start"));
     }
 
@@ -665,9 +1024,44 @@ mod tests {
             Some(EmbedderState::Unknown),
             None,
         ] {
-            for has_url in [true, false] {
-                assert!(!semantic_unavailable_message(state, has_url).is_empty());
+            for url in [Some("http://x:1"), None] {
+                for remote_url in [None, Some("https://team.example:7777")] {
+                    for is_windows in [true, false] {
+                        assert!(
+                            !semantic_unavailable_message(state, url, remote_url, is_windows)
+                                .is_empty()
+                        );
+                    }
+                }
             }
         }
+    }
+
+    /// **Gap check:** `/v1/health`'s embedder state stays
+    /// `ready` while the embed admission queue sheds a `/search` call with
+    /// 429 (health is a separate, unaffected endpoint) - so `search_query`'s
+    /// failure surfaces here with `embedder_state = Some(Ready)`. There is no
+    /// dedicated "busy" case; it falls into the generic `Some(_)` arm. The
+    /// 2026-07-22 live-repro comment on this task asked for the client to
+    /// distinguish "server busy (embedding)" from "unavailable" so it can say
+    /// "busy, retrying" - that request is NOT implemented: a saturated-but-
+    /// healthy server still gets labeled "unavailable," not "busy." This is a
+    /// real, verified gap (not a regression from this change, and not fixed
+    /// by it), left as a follow-up rather than guessed at here since the
+    /// exact wording and whether to plumb the 429/EmbedderBusy reason through
+    /// `search_query` is a product/UX call, not a mechanical hardening fix.
+    #[test]
+    fn notice_ready_embedder_still_says_unavailable_not_busy() {
+        let msg = semantic_unavailable_message(Some(EmbedderState::Ready), None, None, true);
+        assert!(
+            msg.contains("unavailable"),
+            "documents current behavior: a Ready-but-saturated embedder gets the generic \
+             'unavailable' notice, not a busy/retry-specific one: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("busy") && !msg.to_lowercase().contains("retry"),
+            "if this ever starts mentioning busy/retry, a Busy-aware notice has been added - \
+             update this test to lock in the new behavior instead: {msg}"
+        );
     }
 }

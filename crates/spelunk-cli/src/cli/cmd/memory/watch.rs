@@ -13,6 +13,7 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 
+use super::super::color::cprintln;
 use super::MemoryWatchArgs;
 use crate::{capability, config::Config};
 
@@ -25,7 +26,12 @@ fn backoff_secs(attempt: u32) -> u64 {
 pub(super) async fn memory_watch(args: MemoryWatchArgs, cfg: &Config) -> Result<()> {
     let tier = capability::get_tier(cfg).await;
     capability::require_tier1("memory watch", tier, cfg.server_url.as_deref())?;
-    let base_url = cfg.server_url.as_deref().expect("require_tier1 passed");
+    // `require_tier1` also passes for an auto-discovered loopback server
+    // (inference-only, ADR-004) whose `server_url` is unset; watching a team
+    // stream needs the explicit team server, so check for it separately.
+    let base_url = cfg.server_url.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("`spelunk memory watch` requires `server_url` to be configured.")
+    })?;
     let project_id = cfg.project_id.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
             "`project_id` is not configured. \
@@ -67,7 +73,8 @@ pub(super) async fn memory_watch(args: MemoryWatchArgs, cfg: &Config) -> Result<
         .build()
         .context("building HTTP client for memory watch")?;
         let mut req = client.get(&url);
-        if let Some(key) = cfg.server_key.as_deref() {
+        let bearer = cfg.bearer_for(base_url)?;
+        if let Some(key) = bearer.as_deref() {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
         if let Some(ref id) = last_event_id {
@@ -250,9 +257,9 @@ fn print_cloud_event(data: &str) -> bool {
             let kind = e.kind.as_deref().unwrap_or("?");
             let title = e.title.as_deref().unwrap_or("(untitled)");
             let seq = e.seq.unwrap_or(0);
-            println!("\x1b[1mseq-{seq:07}\x1b[0m  \x1b[33m[{kind}]\x1b[0m  {title}",);
+            cprintln!("\x1b[1mseq-{seq:07}\x1b[0m  \x1b[33m[{kind}]\x1b[0m  {title}",);
             if let Some(ts) = &e.created_at {
-                println!("     \x1b[2m{ts}\x1b[0m");
+                cprintln!("     \x1b[2m{ts}\x1b[0m");
             }
             println!();
             true
@@ -260,12 +267,12 @@ fn print_cloud_event(data: &str) -> bool {
         "memory.archived" => {
             let id = e.entry_id.as_deref().unwrap_or("?");
             let seq = e.seq.unwrap_or(0);
-            println!("\x1b[2mseq-{seq:07}  archived {id}\x1b[0m");
+            cprintln!("\x1b[2mseq-{seq:07}  archived {id}\x1b[0m");
             println!();
             true
         }
         "memory.conflict_detected" | "memory.conflict_resolved" => {
-            println!("\x1b[2m{data}\x1b[0m");
+            cprintln!("\x1b[2m{data}\x1b[0m");
             true
         }
         "auth_error" => {
@@ -288,13 +295,13 @@ fn print_legacy_note(data: &str) {
         tags: Vec<String>,
     }
     if let Ok(n) = serde_json::from_str::<Slim>(data) {
-        println!(
+        cprintln!(
             "\x1b[1m#{id}\x1b[0m  \x1b[33m[{kind}]\x1b[0m  {title}",
             id = n.id,
             kind = n.kind,
             title = n.title,
         );
-        println!(
+        cprintln!(
             "     \x1b[2m{}\x1b[0m",
             super::super::status::format_age(n.created_at)
         );

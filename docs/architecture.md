@@ -43,7 +43,15 @@ src/
     mod.rs             Clap structs (Cli, Command, *Args)
     cmd/               One file per subcommand (index.rs, search.rs, etc.)
 
-  config.rs            Config struct, loads from ~/.config/spelunk/config.toml
+  config/
+    mod.rs             Config struct, loads from ~/.config/spelunk/config.toml
+    sync_mode.rs       SyncMode enum: offline / local_first / cloud_first mode selection
+    project_id.rs      project-id derivation from git remote / local fallback
+    paths.rs           config-dir + project/db discovery
+    persist.rs         config.toml / secret-store read-write
+    predicates.rs      URL/UUID/env predicates
+    tls.rs             custom CA trust-anchor application
+    secret_store.rs    OS keychain / file secret-store backend
 
   backends.rs          Re-exports ActiveEmbedder / ActiveLlm (feature-gated)
 
@@ -83,7 +91,7 @@ Architectural decisions are recorded in [docs/adr/](adr/). Key ones:
 
 Tree-sitter parses source code into an AST and spelunk extracts named semantic nodes (functions, structs, classes, methods, traits, impls) as individual chunks. This means each chunk is a meaningful unit of code with a name, type, and scope — not an arbitrary 100-line window.
 
-Fallback: sliding window (120 lines, 15-line overlap) for unsupported languages. Markdown uses heading-based chunking.
+Fallback: a token-aware sliding window for unsupported languages and for oversized semantic nodes that need re-windowing. Each window accumulates whole lines up to `MAX_CHUNK_TOKENS` (512), with ~12.5% token overlap between adjacent windows (the ratio behind the historical 120-line/15-line-overlap split); a single line that alone exceeds the budget becomes its own window so the cap always binds. Re-windowed chunks carry the source node's `name`/`docstring`/`parent_scope` so they still embed with their symbol identity rather than `title: none`. Markdown uses heading-based chunking.
 
 ### Storage: SQLite + sqlite-vec, nothing else
 
@@ -140,9 +148,14 @@ to maintain, plus a forced memory re-embed/re-harvest on migration) buys nothing
 
 The dimension upgrade for pre-0.9 `FLOAT[768]` databases is handled **per store**:
 `Database::apply_dim_upgrade_migration` rebuilds the chunk table as
-`INT8[896]`, while `MemoryStore::migrate` rebuilds `note_embeddings` as
-`FLOAT[896]` (each guarded by its own marker table). There is no path that leaves
-memory stranded on the stale 768-dim layout.
+`INT8[896]`, while `MemoryStore::apply_dim_upgrade_migration` (one step in
+`MemoryStore::run_migrations`, the same forward-only `PRAGMA user_version`-gated
+runner `index.db` uses) rebuilds `note_embeddings` as `FLOAT[896]` (each still
+guarded by its own marker table). There is no path that leaves
+memory stranded on the stale 768-dim layout. The `note_embeddings` rebuild is
+empty rather than converting the old vectors, so semantic recall on pre-upgrade
+notes is lost until they are re-embedded with `spelunk memory reindex`; a
+one-line notice after the upgrade points the user at that command.
 
 ### Backend abstraction
 
@@ -154,7 +167,7 @@ To add a new backend: implement the trait (in `spelunk-embed` for an embedder, o
 
 `src/indexer/secrets.rs` runs regex patterns against the full text that will be persisted and embedded for each chunk (docstring + content) before storage, and separately against LLM-generated summaries when they're produced (summaries don't exist yet at chunk-store time). Chunks matching known credential patterns (AWS keys, PEM headers, GitHub PATs, etc.) are silently dropped in full — including their docstring — and a warning naming only the symbol is logged; a secret-bearing summary is stored as an empty string instead.
 
-This scanner is **best-effort defense-in-depth, not a security boundary** — a finite set of regexes cannot catch every credential format. The actual boundary is that code never leaves the local machine unless a team `server_url` is explicitly configured; the scanner only reduces the chance of a credential being embedded/stored (and, on that explicit-server path, transmitted) by accident.
+This scanner is **best-effort defense-in-depth, not a security boundary** — a finite set of regexes cannot catch every credential format. The actual boundary is that code never leaves the local machine unless a team `server_url` is explicitly configured; the scanner only reduces the chance of a credential being embedded/stored (and, on that explicit-server path, transmitted) by accident. This boundary is enforced by `crates/spelunk-cli/tests/egress_containment.rs`, which traps every outbound connection across local-tier CLI flows and fails loudly, naming the destination, on any escape past loopback.
 
 ### Multi-project registry
 

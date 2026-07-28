@@ -44,8 +44,8 @@ keys-table / scoped-key model are relabelled accordingly.
 
 | Check | Status |
 |---|---|
-| Configured key never held or compared as plaintext | ☑ `auth.rs::ApiKeyAuth::new` hashes the key with BLAKE3 into a 32-byte digest at construction; the plaintext is not retained (oss^58) |
-| Key comparison uses constant-time equality (not `==` on strings) | ☑ `auth.rs` hashes the provided token and compares digests with `constant_time_eq::constant_time_eq_32` (oss^58) |
+| Configured key never held or compared as plaintext | ☑ `auth.rs::ApiKeyAuth::new` hashes the key with BLAKE3 into a 32-byte digest at construction; the plaintext is not retained |
+| Key comparison uses constant-time equality (not `==` on strings) | ☑ `auth.rs` hashes the provided token and compares digests with `constant_time_eq::constant_time_eq_32` |
 | `sk-sp-` prefix format validated before any DB lookup | N/A (cloud-only). The OSS server has no `sk-sp-` prefix and no per-key DB lookup; the key is opaque and matched by digest. |
 | Revoked/deleted keys rejected immediately (no cache window) | N/A (cloud-only). There is no key store to revoke from; a single shared key is rotated by restarting the server with a new value (ADR-056). |
 | Key scope enforced: project-scoped key cannot write to other projects | N/A by design (ADR-056). The shared key grants full access to every project on the instance; isolation is by running separate instances. |
@@ -80,7 +80,7 @@ case (the bearer key would cross the network in the clear). The refusal names th
 interface/port. There is no
 override; the only supported posture for a shared server is to bind loopback.
 Covered by unit test
-`non_loopback_with_key_plaintext_is_refused_unconditionally` (oss^79).
+`non_loopback_with_key_plaintext_is_refused_unconditionally`.
 
 ## 4. Input validation
 
@@ -89,18 +89,18 @@ UUIDs, so the "malformed UUID" row is reframed as a slug length/sanity cap.
 
 | Check | Status |
 |---|---|
-| Title field: max 500 characters enforced at route handler | ☑ `handlers.rs` `MAX_TITLE_LEN = 500`, returns 400 on violation (oss^60) |
-| Body field: max 50 000 characters enforced at route handler | ☑ `handlers.rs` `MAX_BODY_LEN = 50_000`, returns 400 on violation (oss^60) |
-| Path param (project slug) validated; an over-long slug returns 400, not 500 | ☑ `handlers.rs` `MAX_SLUG_LEN = 200`, enforced in `require_project` and the handlers that bypass it (add_note / index_embed / project_search / explore / llm_complete) (oss^60) |
-| All SQL uses parameterised queries, no string concatenation | ☑ verified: `db.rs` uses `params!` throughout (no `format!`/concatenation into SQL across `crates/spelunk-server/src/`); FTS5 terms are quoted as literals via `fts5_quote_literal` (oss^65) |
+| Title field: max 500 characters enforced at route handler | ☑ `handlers.rs` `MAX_TITLE_LEN = 500`, returns 400 on violation |
+| Body field: max 50 000 characters enforced at route handler | ☑ `handlers.rs` `MAX_BODY_LEN = 50_000`, returns 400 on violation |
+| Path param (project slug) validated; an over-long slug returns 400, not 500 | ☑ `handlers.rs` `MAX_SLUG_LEN = 200`, enforced in `require_project` and the handlers that bypass it (add_note / index_embed / project_search / explore / llm_complete) |
+| All SQL uses parameterised queries, no string concatenation | ☑ verified: `db.rs` uses `params!` throughout (no `format!`/concatenation into SQL across `crates/spelunk-server/src/`); FTS5 terms are quoted as literals via `fts5_quote_literal` |
 
-Beyond this table, oss^60 also added a `tower_http` middleware stack (see §DoS in
+Beyond this table, the input-validation hardening also added a `tower_http` middleware stack (see §DoS in
 [`THREAT-MODEL.md`](THREAT-MODEL.md#d--denial-of-service)): `RequestBodyLimitLayer`
 (2 MiB), `TimeoutLayer` (30s, exempting `/memory/stream`), `ConcurrencyLimitLayer`
 (256), plus IP-keyed rate limiting on `/explore` and `/llm/complete`, and an
 embedding-vector-length check against the configured dim.
 
-**`/index/embed` timeout carve-out (spelunk-oss^71/^73/^74, PR #513 field-failure
+**`/index/embed` timeout carve-out (PR #513 field-failure
 follow-up):** the blanket 30s `TimeoutLayer` above made `/index/embed` unusable — a
 legitimate calibrated batch (or even a single oversized chunk on slow/CPU-only
 hardware) genuinely needs minutes, and was being killed at 30s regardless of what
@@ -147,7 +147,7 @@ service authenticated by one bearer key. The JWT/database rows are relabelled.
 
 | Check | Status |
 |---|---|
-| Server refuses to start if `JWT_SECRET` is absent or < 32 bytes | N/A (cloud-only). The OSS server has no JWT; auth is the shared `SPELUNK_SERVER_KEY`. The applicable startup guard is `main.rs::check_bind_safety`, ☑ implemented: it refuses a non-loopback plaintext bind **unconditionally** in both the keyless case (open server) and the keyed case (bearer key in cleartext), naming the interface. Neither refusal has an opt-out (oss^79). |
+| Server refuses to start if `JWT_SECRET` is absent or < 32 bytes | N/A (cloud-only). The OSS server has no JWT; auth is the shared `SPELUNK_SERVER_KEY`. The applicable startup guard is `main.rs::check_bind_safety`, ☑ implemented: it refuses a non-loopback plaintext bind **unconditionally** in both the keyless case (open server) and the keyed case (bearer key in cleartext), naming the interface. Neither refusal has an opt-out. |
 | `DATABASE_URL` never logged | N/A (cloud-only). No `DATABASE_URL`; the DB is a local SQLite file path. The applicable rule, that the bearer key is never logged, holds: ☑ `auth.rs` never logs the key or its hash. |
 | No secrets in default config files or committed `.env` files | ☑ verified: no committed `.env` and no secrets in the server's default config; `SPELUNK_SERVER_KEY` is supplied by the operator at runtime |
 | `.env*` excluded from any server-side file operations | N/A. The server does not walk the filesystem or index files; only the CLI indexer reads project trees (where `.env*` exclusion applies, and is documented in the CLI program). |
@@ -156,19 +156,19 @@ service authenticated by one bearer key. The JWT/database rows are relabelled.
 
 | Check | Status |
 |---|---|
-| 5xx responses do not leak stack traces or internal paths | ☑ `AppError::Internal` returns a fixed generic "Internal server error" 500 regardless of the underlying error text; the one safe case (embedding dim mismatch) is a typed 400 with a fixed message (`lib.rs`, `db.rs`) (oss^65, PR #509) |
+| 5xx responses do not leak stack traces or internal paths | ☑ `AppError::Internal` returns a fixed generic "Internal server error" 500 regardless of the underlying error text; the one safe case (embedding dim mismatch) is a typed 400 with a fixed message (`lib.rs`, `db.rs`) (PR #509) |
 | 422 injection responses reveal category, not pattern | ☑ `handlers.rs` returns `{field, category, message}`; the raw regex is never exposed (see §1) |
 | 401 responses consistent (cannot distinguish a missing key from a wrong key) | ☑ `auth.rs` returns the same `AuthError("Unauthorized")` mapped to 401 for both a missing `Authorization` header and a wrong bearer token; there is no 403 path (single shared key), so the missing-vs-wrong distinction does not leak |
 
-<!-- Evidence note (oss^65, PR #509, merged): AppError::Internal no longer sniffs the error
+<!-- Evidence note (PR #509, merged): AppError::Internal no longer sniffs the error
      Display text for substrings like "mismatch"/"required"; that was the leak. The one
      legitimately safe case (per-project embedding dimension mismatch) is now a typed
      DimensionMismatch error mapped to a 400 with a fixed safe message
      (crates/spelunk-server/src/db.rs, lib.rs); every other Internal error returns a fixed generic
      "Internal server error" 500. The same PR also quoted FTS5 MATCH terms as literals
      (crates/spelunk-core/src/utils/mod.rs fts5_quote_literal, applied in storage/search.rs +
-     storage/memory/search.rs), with an embedded-NUL-byte edge case tracked as a follow-up in
-     spelunk-oss^75, and added a uniform MAX_FILE_BYTES gate in
+     storage/memory/search.rs), with an embedded-NUL-byte edge case tracked as a separate
+     follow-up, and added a uniform MAX_FILE_BYTES gate in
      crates/spelunk-cli/src/cli/cmd/index/parse_phase.rs. -->
 
 ---

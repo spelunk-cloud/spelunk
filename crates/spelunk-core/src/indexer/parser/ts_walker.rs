@@ -1,4 +1,4 @@
-use super::super::chunker::{Chunk, ChunkKind, MAX_CHUNK_TOKENS, sliding_window};
+use super::super::chunker::{Chunk, ChunkKind, chunk_token_cap, sliding_window};
 use crate::error::IndexError;
 use crate::search::tokens::estimate_tokens;
 use anyhow::Result;
@@ -282,7 +282,7 @@ fn walk_node_inner(
                 | ChunkKind::Interface
         );
 
-        if estimate_tokens(&content) > MAX_CHUNK_TOKENS {
+        if estimate_tokens(&content) > chunk_token_cap() {
             if is_container {
                 // Suppress the container's own chunk; its children already carry
                 // fine-grained chunks framed by parent_scope. Re-window only if the
@@ -294,10 +294,26 @@ fn walk_node_inner(
                     }
                 }
                 if out.len() == before {
-                    push_windowed(&content, ctx, start_row, out);
+                    push_windowed(
+                        &content,
+                        ctx,
+                        start_row,
+                        name.as_deref(),
+                        docstring.as_deref(),
+                        parent_scope,
+                        out,
+                    );
                 }
             } else {
-                push_windowed(&content, ctx, start_row, out);
+                push_windowed(
+                    &content,
+                    ctx,
+                    start_row,
+                    name.as_deref(),
+                    docstring.as_deref(),
+                    parent_scope,
+                    out,
+                );
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32) {
                         walk_node_inner(child, ctx, scope_label.as_deref(), out, depth + 1);
@@ -337,9 +353,28 @@ fn walk_node_inner(
 }
 
 /// Re-window an oversized node's text into sliding-window sub-chunks, offsetting
-/// each sub-chunk's line span by the node's 0-based `start_row`.
-fn push_windowed(content: &str, ctx: &WalkCtx<'_>, start_row: usize, out: &mut Vec<Chunk>) {
-    for mut sub in sliding_window(content, ctx.file_path, ctx.language, 120, 15) {
+/// each sub-chunk's line span by the node's 0-based `start_row`. The node's
+/// identity (`name`/`docstring`/`parent_scope`) is threaded onto every sub-chunk
+/// so a re-windowed node keeps its symbol name and docstring in the embedding
+/// text instead of degrading to `title: none`.
+#[allow(clippy::too_many_arguments)]
+fn push_windowed(
+    content: &str,
+    ctx: &WalkCtx<'_>,
+    start_row: usize,
+    name: Option<&str>,
+    docstring: Option<&str>,
+    parent_scope: Option<&str>,
+    out: &mut Vec<Chunk>,
+) {
+    for mut sub in sliding_window(
+        content,
+        ctx.file_path,
+        ctx.language,
+        name,
+        docstring,
+        parent_scope,
+    ) {
         sub.start_line += start_row;
         sub.end_line += start_row;
         out.push(sub);
@@ -557,17 +592,55 @@ fn sql_object_name(node: &tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
 
 /// Return the text of the comment node that immediately precedes `node`
 /// (skipping whitespace), if any.
+///
+/// Rust attributes (`#[derive(...)]`) are real siblings, skipped in the loop
+/// below. Python wraps decorator+def in one `decorated_definition` node, so
+/// the walk must start from that parent instead of `node`. TS/Java attach
+/// decorators as a child, so neither case applies there. Ruby's
+/// `private def foo; end` visibility idiom (and lookalikes like `memoize def
+/// foo; end`) parses the def as a `method` node nested two levels inside a
+/// `call` (`private(def foo; end)`), so the walk must start from that `call`
+/// ancestor instead of the `method` node. Gated on the `method` being the
+/// argument_list's only child so an unrelated comment above a multi-arg call
+/// that merely happens to carry a `def` as one of several arguments (e.g.
+/// `some_call(other_arg, def foo; end)`) doesn't get misattached to `foo`.
+///
+/// Some grammars (Python `class_definition`/`function_definition`, Ruby
+/// `class`/`module`) attach a leading comment as a child of the enclosing
+/// `block`'s own parent, immediately before the `body` field, rather than as
+/// the first child inside the block. That bites only the first documented
+/// member of a body: when `start` has no sibling of its own (nothing else in
+/// its block precedes it), check one level up for that comment-as-child case.
 pub(super) fn preceding_comment(node: &tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
-    let mut prev = node.prev_sibling()?;
-    // skip over whitespace / newline tokens
-    while prev.kind() == "\n"
-        || prev.kind() == "newline"
-        || prev.is_extra()
-            && prev.kind() != "comment"
-            && prev.kind() != "line_comment"
-            && prev.kind() != "block_comment"
-            && prev.kind() != "doc_comment"
-    {
+    let start = match node.parent() {
+        Some(parent) if parent.kind() == "decorated_definition" => parent,
+        Some(parent) if parent.kind() == "argument_list" && parent.named_child_count() == 1 => {
+            match parent.parent() {
+                Some(call) if call.kind() == "call" => call,
+                _ => *node,
+            }
+        }
+        _ => *node,
+    };
+    match start.prev_sibling() {
+        Some(prev) => scan_backward_for_comment(prev, src),
+        None => scan_backward_for_comment(start.parent()?.prev_sibling()?, src),
+    }
+}
+
+fn scan_backward_for_comment(mut prev: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
+    loop {
+        let skip = prev.kind() == "\n"
+            || prev.kind() == "newline"
+            || prev.kind() == "attribute_item"
+            || prev.is_extra()
+                && prev.kind() != "comment"
+                && prev.kind() != "line_comment"
+                && prev.kind() != "block_comment"
+                && prev.kind() != "doc_comment";
+        if !skip {
+            break;
+        }
         prev = prev.prev_sibling()?;
     }
     if matches!(

@@ -3,11 +3,59 @@
 //! Every test that needs an indexed project DB should call
 //! `index_fixture_project()`.  Tests that need no index still share helpers
 //! for constructing `Command` instances.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+// Git-config isolation lives once in `spelunk_core::test_support`, reached
+// here via the `test-support`-featured dev-dependency in this crate's
+// Cargo.toml. `scripts/check-git-isolation.sh` enforces that a test file
+// spawning `git` wires in `isolate_git_config`/`git_command`, however
+// qualified, including through this re-export.
+pub use spelunk_core::test_support::isolate_git_config;
+
+// A spawned `spelunk` binary registers sqlite-vec for its own process, but a
+// `rusqlite::Connection` opened here does not inherit that: without this, any
+// query touching a `vec0` table (`embeddings`, memory vectors) fails, and an
+// assertion reading through `unwrap_or(0)` misreports the error as "empty".
+// `sqlite3_auto_extension` is process-global, so the `OnceLock` is what keeps
+// concurrent tests in one binary from racing on it.
+pub fn register_sqlite_vec() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        #[allow(clippy::missing_transmute_annotations)]
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
+
+/// Create a git repo in `dir` with a fabricated identity and one initial
+/// commit, isolated from the developer's ambient git config.
+///
+/// Every setup git step is asserted: a silent setup failure surfaces later as
+/// an unrelated assertion on the command under test.
+pub fn init_git_repo(dir: &Path) {
+    isolate_git_config();
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Test"]);
+    std::fs::write(dir.join("README.md"), "hello\n").expect("write README.md");
+    run(&["add", "."]);
+    run(&["commit", "-q", "-m", "initial commit"]);
+}
 
 /// Build a `spelunk` test command that never touches the OS keychain and never
 /// reads or writes the developer's real `~/.config/spelunk`.
@@ -55,7 +103,23 @@ pub fn spelunk_bin_in(home: &Path) -> Command {
         // `spelunk_config_dir()` uses `dirs::home_dir()` (HOME on Unix); unset
         // XDG_CONFIG_HOME so the file store lands under `<home>/.config/spelunk`
         // and never the developer's real config dir.
-        .env_remove("XDG_CONFIG_HOME");
+        .env_remove("XDG_CONFIG_HOME")
+        // `dirs::home_dir()` 6.x on Windows calls `SHGetKnownFolderPath` (a
+        // Registry lookup) rather than reading `HOME`/`USERPROFILE`, so the
+        // `HOME` redirect above is a no-op there: every subprocess this spawns
+        // would otherwise land on the same real `%USERPROFILE%\.config\spelunk`,
+        // and concurrent tests racing on one `secrets.toml` corrupt it (see the
+        // identical, already-documented gap on `SPELUNK_STATE_DIR` in
+        // `capability/probe.rs` and `SPELUNK_SCRIPTS_DIR` in `memory/add.rs`).
+        // `SPELUNK_CONFIG_DIR` bypasses `dirs::home_dir()` entirely and works
+        // identically on every platform.
+        .env("SPELUNK_CONFIG_DIR", home.join(".config").join("spelunk"))
+        // The HOME redirect above hides `~/.gitconfig` from the git this child
+        // spawns, but an exported GIT_CONFIG_GLOBAL outranks HOME and would
+        // still reach it. Not a Windows path, but git skips a scope whenever
+        // its var is set, whatever the path resolves to.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
     cmd
 }
 
@@ -86,7 +150,7 @@ pub fn spelunk_cmd(db_path: &Path, config_path: &Path) -> Command {
 /// API base URL.  Returns the config file path.
 pub fn write_config(dir: &Path, db_path: &Path, api_base: &str) -> PathBuf {
     let cfg = format!(
-        "db_path = {:?}\napi_base_url = {:?}\nembedding_model = \"test-model\"\nllm_model = \"test-chat\"\n",
+        "db_path = {:?}\napi_base_url = {:?}\nllm_model = \"test-chat\"\n",
         db_path, api_base
     );
     let config_path = dir.join("config.toml");
@@ -94,28 +158,44 @@ pub fn write_config(dir: &Path, db_path: &Path, api_base: &str) -> PathBuf {
     config_path
 }
 
-/// Like `write_config` but also configures `server_url` + `project_id` for
-/// Tier 1 operation (server-based embedding during `spelunk index`).
+// Like `write_config` but also configures `server_url` + `project_id` for
+// Tier 1 operation (server-based embedding during `spelunk index`).
+//
+// `Config::load` only honors `server_url`/`project_id` from a project-level
+// `.spelunk/config.toml` (discovered by walking up from CWD) or
+// `SPELUNK_SERVER_URL`/`SPELUNK_PROJECT_ID` env, never from the `--config`
+// file, which is the global personal config. So this writes those two fields
+// to `<project_dir>/.spelunk/config.toml` instead of the returned global
+// file. The caller's `Command` must set `.current_dir(project_dir)` (or
+// wherever `project_dir` resolves to) or the discovery walk will never find
+// it.
 pub fn write_config_with_server(
     dir: &Path,
     db_path: &Path,
     api_base: &str,
     server_url: &str,
+    project_dir: &Path,
 ) -> PathBuf {
-    let cfg = format!(
-        concat!(
-            "db_path = {:?}\n",
-            "api_base_url = {:?}\n",
-            "embedding_model = \"test-model\"\n",
-            "llm_model = \"test-chat\"\n",
-            "server_url = {:?}\n",
-            "project_id = {:?}\n",
-        ),
-        db_path, api_base, server_url, FIXTURE_PROJECT_ID,
-    );
-    let config_path = dir.join("config.toml");
-    std::fs::write(&config_path, cfg).expect("write config");
+    let config_path = write_config(dir, db_path, api_base);
+    write_project_server_config(project_dir, server_url, FIXTURE_PROJECT_ID);
     config_path
+}
+
+// Write `<project_dir>/.spelunk/config.toml` with `server_url` + `project_id`,
+// the only config file `Config::load` honors those fields from (besides env).
+// The caller's `Command` must set `.current_dir(project_dir)`.
+//
+// An empty `project_id` is omitted entirely (rather than written as `""`) so
+// a loopback-only test that doesn't need one (see `Config::validate_with_project`)
+// leaves `project_id` genuinely unset, not set to an empty string.
+pub fn write_project_server_config(project_dir: &Path, server_url: &str, project_id: &str) {
+    let spelunk_dir = project_dir.join(".spelunk");
+    std::fs::create_dir_all(&spelunk_dir).expect("create .spelunk dir");
+    let mut cfg = format!("server_url = {server_url:?}\n");
+    if !project_id.is_empty() {
+        cfg.push_str(&format!("project_id = {project_id:?}\n"));
+    }
+    std::fs::write(spelunk_dir.join("config.toml"), cfg).expect("write project config");
 }
 
 /// Dynamic responder for `POST /v1/projects/{id}/index/embed`.
@@ -259,11 +339,26 @@ pub fn index_project_dir(project_dir: &Path) -> (TempDir, PathBuf, PathBuf) {
     });
 
     let mock_url = _mock_server.uri();
-    let config_path = write_config_with_server(tmp.path(), &db_path, &mock_url, &mock_url);
+    let config_path =
+        write_config_with_server(tmp.path(), &db_path, &mock_url, &mock_url, tmp.path());
 
     // Pass `--db` explicitly so the index is written to our temp DB path,
     // not to `<project_dir>/.spelunk/index.db` (the default project-local location).
+    // `.current_dir(tmp.path())`: the project-level config discovery walks up
+    // from CWD, not from the `project_dir` positional arg (which may be an
+    // unrelated source tree, e.g. the shared fixture).
+    //
+    // `SPELUNK_MODE=cloud_first`: this fixture's whole point is a Tier 1
+    // index with real embeddings landed via the mock `server_url` above, not
+    // exercising local-vs-remote routing. Under the default `local_first`
+    // mode an explicit `server_url` with no loopback embedder configured is
+    // now correctly refused, which would leave chunks unembedded and every
+    // KNN-dependent consumer of this fixture broken. `.spelunk/config.toml`
+    // doesn't recognize a `mode` key (see `write_project_server_config`), so
+    // this must go through the env var.
     spelunk_bin_in(tmp.path())
+        .current_dir(tmp.path())
+        .env("SPELUNK_MODE", "cloud_first")
         .arg("--config")
         .arg(&config_path)
         .arg("index")

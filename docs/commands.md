@@ -1,8 +1,10 @@
 # Commands Reference
 
 Every command accepts `-c, --config <path>` to override the default config file
-(`~/.config/spelunk/config.toml`). The flags and defaults below match the
-installed binary; run `spelunk <command> --help` to confirm against your version.
+(`~/.config/spelunk/config.toml`), and `--color <auto|always|never>` to control
+colored output (default `auto`: on when stdout is a terminal and `NO_COLOR` is
+unset). The flags and defaults below match the installed binary; run
+`spelunk <command> --help` to confirm against your version.
 
 A local `spelunk-server` is autostarted on demand and provides embeddings
 (native, via the candle-served F2LLM-v2-330M model) and, when a chat model is
@@ -15,10 +17,11 @@ always-available commands (`graph`, text/ast-grep `search`, `memory add/list`,
 
 ## spelunk init
 
-Initialise spelunk for the current project: register it, parse and chunk the
-source tree, start the local server if needed, embed the code, and (when inside
-a git repo with an `origin` remote) configure the fetch refspec so project
-memory notes travel automatically on `git fetch`.
+Initialise spelunk for the current project: register it, start the local server
+if needed, parse and chunk the source tree, hand the embedding pass to a
+detached background worker, and (when inside a git repo with an `origin` remote)
+configure the fetch refspec so project memory notes travel automatically on
+`git fetch`.
 
 ```
 spelunk init [options]
@@ -43,8 +46,8 @@ slug.
 `refs/notes/spelunk` arrives on `git fetch`, landing on the tracking ref
 `refs/notes/origin/spelunk`. `memory list`, `context`, and `init` merge that
 tracking ref into your own notes, so *reading* teammates' memory needs no extra
-step. *Publishing* yours is still manual: the init output includes the push
-command; re-run it after each memory change so new notes commits travel. See
+step. *Publishing* yours is opt-in: your memory stays local until you install the
+pre-push hook, and the init output names the command that does it. See
 [Sharing memory across clones via git-notes](memory.md#sharing-memory-across-clones-via-git-notes).
 
 **Memory survives history rewrites:** `init` also points `notes.rewriteRef` at
@@ -85,10 +88,10 @@ spelunk index <path> [options]
 | `--batch-size <n>` | 0 (auto) | Cap on the embedding batch size (chunks per server request); the embed phase calibrates the actual size from measured throughput, up to this cap. 0 leaves the cap at the server's own 256-chunk limit |
 | `--force` | false | Force full re-index (ignore change detection) |
 | `--recount` | false | Backfill `token_count` for existing chunks and exit |
-| `--no-summaries` | false | Skip LLM summary generation even when `llm_model` is configured |
+| `--no-summaries` | false | Skip LLM summary generation even when `server_url` is configured |
 | `--summary-batch-size <n>` | 10 | Chunks per LLM summary request |
 | `--detach` | false | Re-exec in the background and return immediately (used by git hooks) |
-| `--detach-embed` | false | Parse in the foreground, then run the embedding phase in a background process and return the prompt |
+| `--detach-embed` | false | Parse in the foreground, then run the embedding phase in a detached background process and return the prompt (`spelunk init` does this automatically) |
 
 A plain `spelunk index` (no `--force`) re-indexes changed files (blake3 hash)
 and also backfills embeddings for any already-parsed chunk that has no embedding
@@ -100,26 +103,157 @@ Summaries are the exception: a chunk whose summary failed (say the LLM was
 unreachable) is recorded as attempted rather than missing, so a plain re-run
 skips it. Use `--force` to retry those.
 
+If a previous run was interrupted after recording a file's new content hash
+but before writing its chunks (a process kill mid-parse, for example), that
+file looks up to date by hash alone but has no chunks. A plain `spelunk index`
+detects this and reprocesses the file automatically; you don't need `--force`
+to recover from it.
+
+Only one `spelunk index` run is allowed per project at a time. If a run is
+already in progress, starting a second one fails immediately with `index
+already running (pid N), try again once it finishes` instead of writing to
+the database alongside the first run.
+
+The index also remembers the chunker configuration (currently just the
+`MAX_CHUNK_TOKENS` cap) it was built under. If a plain `spelunk index` detects
+that the running build's chunker config differs from what's recorded, it
+prints a warning and proceeds anyway rather than failing: unchanged files keep
+their old chunk boundaries until re-parsed, so the index temporarily mixes
+chunk granularities. Run `spelunk index --force` to re-chunk every file under
+the current config and clear the warning.
+
 The embed phase calibrates its own batch size instead of guessing: it times a
 1-chunk request, then a 4-chunk request, and sizes subsequent requests (and
-their timeouts) from the observed per-chunk rate — smaller batches on slow
+their timeouts) from the observed token-weighted rate: smaller batches on slow
 hardware, larger ones (up to 256 chunks, or your `--batch-size` cap if lower)
-on fast hardware. It keeps re-measuring as the run progresses, so a rate that
+on fast hardware. Sizing by tokens rather than chunk count keeps the deadline
+honest when the queue crosses from small chunks into large ones. It keeps re-measuring as the run progresses, so a rate that
 drifts partway through is picked up rather than locked to the first sample.
 Each batch is written to the database as soon as it completes, so an
 interrupted run (timeout, machine sleep, process kill) never loses
 already-embedded chunks — re-run `spelunk index` to pick up where it left off.
+A batch that can't even reach the server (the local server is momentarily
+unresponsive, not just slow) is retried automatically at the same batch size
+with backoff, rather than being treated as a request that was too big; only
+once those retries are exhausted does the run stop and wait on a manual
+re-run. A batch that reaches the server but gets back `429` (the server's
+bounded embed queue is already full, e.g. another `index` or a `search` is
+mid-embed) is retried the same way, at the same batch size, but sleeping for
+the server's own `Retry-After` instead of the fixed backoff schedule; see
+`POST /index/embed` in `docs/architecture/server-api.md`.
 
-`--detach-embed` is useful when embedding a large codebase on slow hardware:
-parsing finishes in the foreground (so the index is immediately usable for
-text and ast-grep search) and the long embedding pass continues in the
-background. Run `spelunk status` afterwards to check progress; it shows an
-"Embedding in progress" line with the embedded/total count until every chunk
-is embedded. If the background pass is interrupted, re-running `spelunk index`
-resumes it (already-embedded chunks are skipped).
+`spelunk init` always hands the embedding pass to a detached background worker,
+and `--detach-embed` opts a manual `spelunk index` run into the same behaviour:
+parsing finishes in the foreground (the index is immediately usable for text and
+ast-grep search) and the long embedding pass continues in the background, with
+the worker waiting out a still-loading embedder rather than skipping. A plain
+`spelunk index` without the flag embeds in the foreground. Run `spelunk status`
+to check a background pass; it shows an "Embedding in progress" line with
+searchable chunks and work percentage until every chunk is embedded. If the
+background pass is interrupted, re-running `spelunk index` resumes it
+(already-embedded chunks are skipped).
 
 Add a `.spelunkignore` file (same syntax as `.gitignore`) to any directory to
 exclude files from indexing. It takes higher precedence than `.gitignore`.
+
+### File filtering
+
+Beyond `.gitignore` and `.spelunkignore`, spelunk applies a **built-in default
+exclude set** during indexing. These are files that are typically committed to
+the repo (so `.gitignore` never catches them) yet carry near-zero retrieval
+value while costing real embed and parse wall-clock. The defaults cover:
+
+- **Package lockfiles** – `package-lock.json`, `npm-shrinkwrap.json`,
+  `packages.lock.json`.
+- **Minified assets** – `*.min.js`, `*.min.css`.
+- **Vendored / generated directories** – `vendor/`, `node_modules/`,
+  `third_party/`, `dist/`, `generated/`, `__generated__/`.
+- **Generated / protobuf codegen** – `*.generated.*`, `*.gen.go`, `*.gen.ts`,
+  `zz_generated*.go`, `*.pb.go`, `*.pb.cc`, `*.pb.h`, `*_pb2.py`,
+  `*_pb2_grpc.py`, `*_pb.js`, `*_pb.d.ts`.
+- **Bulk machine-data** – `schema.json`, `*.schema.json`, and translation /
+  locale JSON (`translations/`, `locales/`, `locale/`, `i18n/` globs).
+
+#### The `[index]` config table
+
+Tune the filter with an `[index]` table in your config
+(`~/.config/spelunk/config.toml`, or a project-level `.spelunk/config.toml`):
+
+```toml
+[index]
+# Extra gitignore-syntax lines, layered on top of the built-in defaults.
+exclude = ["*.snap", "fixtures/"]
+# Whether to apply the built-in default exclude set (above). Default: true.
+use_default_excludes = true
+# Whether to skip files that self-declare as generated (see below). Default: true.
+detect_generated = true
+```
+
+`exclude` lines are **appended after** the defaults, and matching is
+last-match-wins (gitignore semantics). A project `.spelunk/config.toml`
+overrides the global value **per field**: an absent key leaves the global (or
+default) value in place, so setting only `exclude` in a project does not reset
+`detect_generated`.
+
+#### Re-including a filtered file
+
+A leading `!` re-includes a path the defaults would otherwise drop:
+
+```toml
+[index]
+exclude = ["!src/api/client.gen.ts"]
+```
+
+There is one **git-parity boundary**: a `!file` line cannot re-include a file
+that sits under an already-excluded (pruned) parent directory. This matches git
+itself. To re-include content under, say, `vendor/`, re-include the
+**directory**:
+
+```toml
+[index]
+exclude = ["!vendor/", "!vendor/**"]
+```
+
+Note that this re-include layer cannot reach the sensitive-file exclusion
+(`.env*`, `*.pem`, private keys). Those are dropped by a separate,
+non-overridable layer before the filter ever runs, so no `[index]` line can
+bring them back.
+
+#### Self-declared generated markers
+
+When `detect_generated` is on (the default), spelunk also skips files whose head
+self-declares as generated, even when the filename looks ordinary. It reads the
+first 5 lines (up to 4 KiB) and looks for either:
+
+- a literal `@generated` token, anywhere in that window; or
+- the Go-style header `// Code generated by <tool>. DO NOT EDIT.`
+
+**Known limitation:** a leading UTF-8 byte-order mark (BOM) defeats the anchored
+Go `// Code generated ... DO NOT EDIT.` marker, because the BOM sits before the
+`//` and breaks the line anchor. The `@generated` token is position-independent
+and is unaffected. This is rare in practice and documented here for
+completeness; add an explicit `exclude` glob if you hit it.
+
+#### Why a file was skipped
+
+Run `spelunk chunks <path>` on a file that produced no chunks: if the built-in
+filter excluded it, the output names the matched pattern (or generated marker)
+and prints the `[index]` re-include recipe, instead of a bare "No chunks found".
+
+#### Filtered-count semantics
+
+At the end of the parse phase, indexing prints a line like:
+
+```
+Filtered out 7 generated/vendored/data file(s) (built-in index filter; override in [index] of .spelunk/config.toml)
+```
+
+That count includes **file-level** excludes (a lockfile, a `*.min.js`, a
+generated-marker hit) but **not** files inside a pruned directory. When a
+directory such as `node_modules/` is excluded, the walk never descends into it,
+so its contents are never enumerated or counted. The number therefore will not
+equal the total file count of your vendored trees; it counts what the walk saw
+and dropped, not what it skipped by never entering.
 
 **Example:**
 
@@ -133,8 +267,11 @@ spelunk index ./myproject --force --batch-size 16
 ## spelunk search
 
 Search the index. In `auto` mode (the default) spelunk uses semantic/hybrid
-search when an index and server are available and silently falls back to
-ast-grep otherwise.
+search when an index and server are available. During embeddings warmup, a
+coverage notice is printed to stderr naming the percentage and shape of
+embedded chunks; on zero coverage `auto` falls back to ast-grep. Explicit
+`semantic`/`hybrid` on a warming index returns an actionable error naming the
+resume command instead of an absence claim.
 
 ```
 spelunk search <query> [options]
@@ -226,10 +363,23 @@ spelunk status [options]
 | `-l, --list` | false | One-line-per-project format (implies `--all`) |
 | `--format text\|json` | text | Output format |
 
-When chunks outnumber embeddings, `spelunk status` prints an "Embedding in
-progress" line showing the embedded/total count. This covers both an active
-background embed (e.g. `spelunk index --detach-embed` still running) and an
-interrupted run that can be resumed with `spelunk index`.
+When embeddings are incomplete, `spelunk status` prints an "Embedding in progress"
+line (when a live background worker is detected) or "Embedding incomplete" (when
+no worker is running but chunks remain unembedded). Coverage is shown as searchable
+chunks and percentage; progress is shown as percentage of work done, measured by
+token weight. An incomplete status includes the `spelunk index .` resume command
+(or, when the embedder is unavailable, a pointer at the server logs instead).
+
+For a project in `local_first` mode (a team `server_url` configured, the
+default sync mode), the `mode` line also carries a quiet pending-entry count
+and last-synced freshness once there's something to report, for example
+`mode  local_first  ·  2 pending, last synced 4m ago`. A project with nothing
+pending and nothing synced yet shows no extra clause, and this line never
+suggests running `spelunk sync`: the background reconciler drains the queue
+on its own during interactive sessions (see [Team server and sync
+modes](memory.md#team-server-and-sync-modes)). `--format json` carries the
+same information as `sync_pending` / `sync_last_synced_at`, both `null`
+outside `local_first`.
 
 **Example:**
 
@@ -402,10 +552,11 @@ spelunk autoclean
 
 ## spelunk hooks
 
-Manage git post-commit hooks.
+Manage spelunk's git hooks.
 
 ```
 spelunk hooks install [--ci]
+spelunk hooks install --pre-push
 spelunk hooks uninstall
 ```
 
@@ -413,6 +564,41 @@ spelunk hooks uninstall
 `spelunk memory harvest` after each commit (both `--detach` so git is not
 blocked). Developers without `spelunk` installed are unaffected. `--ci` prints a
 GitHub Actions workflow step instead of writing a hook.
+
+`install --pre-push` writes a pre-push hook that publishes your memory
+(`refs/notes/spelunk`) to the named remote you are pushing to, so decisions travel
+with the code they describe. It merges the remote's notes into yours before
+pushing (a union, so neither side is dropped) and retries a lost race up to three
+times. It never blocks your push: on failure it warns on stderr and exits 0, and
+it never force-pushes. Publishing is opt-in, so your memory stays local until you
+install it. Publishing follows the remote's *name*, so a push that spells out a
+URL instead (`git push https://… main`) pushes your code without publishing your
+memory; a later `git push origin` publishes it. See
+[memory.md](memory.md#sharing-memory-across-clones-via-git-notes).
+
+The hook is a shim around [`spelunk plumbing
+publish-notes`](#spelunk-plumbing), with the absolute path of the installing
+binary embedded rather than a `PATH` lookup, so it keeps working under GUI git
+clients. If you move or reinstall spelunk the hook fails loudly; re-run
+`spelunk hooks install --pre-push` to re-resolve the path.
+
+`install` resolves the hooks directory the way git itself does
+(`git rev-parse --git-path hooks`), so it honors `core.hooksPath` if you have
+one set (as husky, lefthook, and the pre-commit framework do) and follows a
+linked worktree back to its shared hooks directory.
+
+Neither hook overwrites one it did not write: if a hook of that name already
+exists, `install` reports it and leaves the file alone. If the resolved hooks
+directory sits inside the repository's tracked working tree (the husky/lefthook
+pattern, where `core.hooksPath` points at a committed directory such as
+`.husky/`), `install` refuses instead of writing there: that directory is
+shared with every clone, so a silent write would commit spelunk's hook to the
+whole team rather than just this machine. Add the hook to that directory
+yourself, or point `core.hooksPath` at an untracked location and re-run.
+Otherwise, git never clones `.git/hooks`, so installing either hook affects
+only your own clone.
+
+`uninstall` removes every hook spelunk installed, leaving any other hooks alone.
 
 ---
 
@@ -479,31 +665,35 @@ resolves one for you instead of leaving a session that needs a follow-up
   no-org session is persisted.
 
 Tokens are written to the `[auth]` table of `~/.config/spelunk/config.toml`
-(file mode `0600`). Existing setups that use a static `server_key` (or the
-`SPELUNK_SERVER_KEY` environment variable) keep working unchanged until you next
-run `spelunk login`; `SPELUNK_SERVER_KEY` continues to take precedence, which is
-handy for CI.
+(file mode `0600`). Existing setups that use a self-hosted server key (stored via
+`spelunk auth set-key`, or the `SPELUNK_SERVER_KEY` environment variable) keep
+working unchanged; `SPELUNK_SERVER_KEY` continues to take precedence, which is
+handy for CI. See `spelunk auth` below for the self-hosted credential itself;
+`spelunk login` only ever manages the `[auth]` cloud token pair.
 
-### Where the `server_key` credential is stored
+### Where the self-hosted server key is stored
 
-The static `server_key` bearer credential is **not** kept in plaintext in
-`config.toml`. It lives in your operating system's secret store:
+See [`spelunk auth`](#spelunk-auth) below for the full per-server credential
+story (ADR-071). In short: a self-hosted server's bearer key is **not** kept in
+plaintext anywhere. It lives in your operating system's secret store:
 
-- **macOS** — Keychain
-- **Linux** — Secret Service (libsecret / `org.freedesktop.secrets`)
-- **Windows** — Credential Manager
+- **macOS**: Keychain
+- **Linux**: Secret Service (libsecret / `org.freedesktop.secrets`)
+- **Windows**: Credential Manager
 
-The first time you run any command after upgrading, a `server_key` previously
-written to `~/.config/spelunk/config.toml` is migrated into the OS keychain and
-removed from the file automatically — no action required. (A shared
-`server_key` set in a project's checked-in `.spelunk/config.toml` is left as-is;
-it is a team key by design, not a personal credential.)
+keyed by the server's origin, so keys for two different self-hosted servers
+never collide. A flat `server_key` from an install predating this scheme is
+migrated in automatically the first time it's needed for a given server; no
+action required. A `server_key` line in a project's checked-in
+`.spelunk/config.toml` is no longer read at all (it was a plaintext-in-a-committed-file
+footgun); if a project config still has that line, remove it and have each
+developer run `spelunk auth set-key --server <url>` instead.
 
 **Headless / CI / containers.** When no OS keychain backend is available, the
 credential never causes a hard failure:
 
 - `SPELUNK_SERVER_KEY` remains the non-interactive escape hatch and always takes
-  precedence — set it in CI and you never touch the keychain.
+  precedence: set it in CI and you never touch the keychain.
 - Otherwise spelunk falls back to an owner-only (`0600`) file at
   `~/.config/spelunk/secrets.toml`.
 
@@ -516,6 +706,36 @@ credential never causes a hard failure:
 | `file` | Always use the `secrets.toml` file store (e.g. a container that mounts secrets from elsewhere). |
 
 The credential is never logged.
+
+---
+
+## spelunk auth
+
+Manage the per-server bearer credentials a self-hosted `server_url` resolves
+through (ADR-071). Distinct from `spelunk login`, which manages the
+spelunk.cloud `[auth]` token pair.
+
+```
+spelunk auth set-key --server <url>
+spelunk auth list-servers
+```
+
+| Subcommand | Notes |
+|------------|-------|
+| `set-key --server <url>` | Store a bearer key for the given server, keyed by its origin (scheme + host + non-default port). The key is read from stdin if piped, otherwise from an interactive prompt; it is never accepted as a flag value or positional argument. |
+| `list-servers` | Print every server origin with a stored key, one per line. Never prints key material. Notes if a legacy flat key is still present and pending migration. |
+
+```bash
+echo "$SERVER_KEY" | spelunk auth set-key --server https://spelunk.internal.example.com
+spelunk auth list-servers
+```
+
+Resolution precedence for a given request's `server_url`: the `SPELUNK_SERVER_KEY`
+environment variable (if set, always wins, regardless of origin) takes priority
+over the per-origin store; a spelunk.cloud origin instead resolves through the
+`[auth]` token pair from `spelunk login`. This lets CI pin a single key for the
+one server it talks to without touching the keychain, while a developer's
+machine holds separate keys per self-hosted server.
 
 ---
 
@@ -539,13 +759,26 @@ spelunk org switch acme
 
 ## spelunk logout
 
-Remove stored spelunk.cloud credentials. Clears the `[auth]` tokens written by
-`spelunk login` from `~/.config/spelunk/config.toml`, the `server_key` from the
-OS keychain (or `secrets.toml` fallback), and any legacy plaintext `server_key`
-still left in `config.toml`.
+Remove stored spelunk.cloud credentials. Bare `spelunk logout` clears **only**
+the `[auth]` token pair written by `spelunk login`; it does not touch any
+self-hosted server key, so recovering from a broken cloud login never costs
+you the keys you use on other projects (ADR-071 D3). Clearing server keys is a
+separate, explicit action:
 
 ```
+spelunk logout [--servers | --server <url>]
+```
+
+| Flag | Notes |
+|------|-------|
+| (none) | Clears only the `[auth]` cloud token pair. If any server keys are still stored, prints how many and how to clear them. |
+| `--servers` | Also clears every stored server key: the per-origin map and any legacy flat entry. |
+| `--server <url>` | Also clears just the stored key for that one server's origin. Mutually exclusive with `--servers`. |
+
+```bash
 spelunk logout
+spelunk logout --server https://spelunk.internal.example.com
+spelunk logout --servers
 ```
 
 ---
@@ -573,6 +806,8 @@ spelunk memory pull                         # one-way: pull new server entries i
 spelunk memory sync                         # two-way: push local + pull remote (see `spelunk sync`)
 spelunk memory watch                        # stream new entries from the server (SSE)
 spelunk memory reconcile [--dry-run] [--all-projects] [--source-db <path>]
+spelunk memory dedupe [--dry-run] [--format text|json]
+spelunk memory reindex [--force] [--include-archived] [--dry-run] [--format text|json]
 ```
 
 All `memory` subcommands accept `--backend sqlite|git-notes` (default `sqlite`)
@@ -590,7 +825,16 @@ and `source_project` / `source_project_path` fields in JSON.
 
 **git-notes write-through:** when `store_in_git_notes` is true (the default),
 `spelunk memory add` also appends the entry to `refs/notes/spelunk` on `HEAD`,
-so memory travels with the code. Outside a git repo this is a graceful no-op.
+so memory travels with the code. The repo is resolved from the database in
+use, the `--db <path>` directory when given, otherwise the discovered
+`.spelunk` project, not the invocation's working directory: pointing `--db`
+at another project's database writes notes to that project's repo. Outside a
+git repo this is a graceful no-op. Concurrent writes are serialized by a
+cross-process lock, and a write that
+cannot take the lock in time fails rather than risk erasing a concurrent
+writer's entry: `memory add` warns on stderr that the entry is stored locally
+but will not travel with the repo (pre-`init`, where git notes is the sole
+store, it fails instead), and retrying the command is the remedy.
 
 **Entry identity:** entries are identified by a SHA-256 over exactly their
 `kind`, `title`, and `body`, so the same decision recorded on two machines
@@ -599,6 +843,34 @@ import dedup on it: entries with identical text collapse into one even when
 their creation time, tags, or linked files differ, and the survivor carries the
 union of the tags and linked files. The `id` shown by `memory list` is a local
 row number, not this identity. See [Entry identity](memory.md#project-memory).
+Existing duplicate rows already resident in `memory.db` are never collapsed
+automatically; use `spelunk memory dedupe` to do that explicitly (see
+[Collapsing duplicate entries already in memory.db](memory.md#collapsing-duplicate-entries-already-in-memorydb)).
+Once a store's duplicates are cleared and its `entity_id` index is promoted to
+UNIQUE, a plain `memory add` for byte-identical content no longer errors: it
+reuses the existing entry and prints `Already recorded as ...` instead of
+`Stored ...`. The same reuse applies to `spelunk sync` / `spelunk memory pull`:
+a pulled entry matching an existing local row's identity merges into that row
+(adopting the remote id, archiving it if the pulled entry is archived) instead
+of adding a duplicate, so the printed pull count reflects only genuinely new
+rows. Pre-promotion, a pull can still add a distinct row alongside matching
+local content, same as `memory add`.
+
+**Backfilling missing embeddings:** a note's semantic vector is minted at
+`memory add` time, and again by `memory push` / `sync` for any entry in the set
+they are about to push that still lacks one. A note that misses both, added
+while the embedder was down and never pushed, or carried
+through the 768→896 embedding-dimension upgrade (which drops the old vectors),
+stays present-but-unembedded: still found by text search, `list`, `timeline`,
+and `context`, but absent from semantic `memory search`. `spelunk memory
+reindex` re-embeds those notes against the local embedder (the same path
+`memory add` uses), so it needs a reachable embedder and exits non-zero if none
+is; it commits each vector as it goes, so an interrupted run resumes on re-run.
+`--force` re-embeds every active note (replacing existing vectors), `--include-archived`
+also covers archived notes, and `--dry-run` reports counts without writing or
+contacting the embedder. This is separate from `spelunk index`, which re-embeds
+the code index. See
+[Backfilling missing embeddings](memory.md#backfilling-missing-embeddings).
 
 ---
 
@@ -608,6 +880,14 @@ Two-way sync (shorthand for `spelunk memory sync`): push your local memory
 entries to the configured server **and** pull remote entries into the local
 `memory.db`, so a team converges on one shared memory. Code never leaves the
 machine; only memory does. Requires a configured `server_url`.
+
+Under the default `local_first` mode, a background reconciler already drains
+unpushed entries and pulls new ones during interactive sessions, so this
+command is no longer required in the normal day-to-day path: `spelunk
+status` shows what's still pending. Reach for `spelunk sync` when you want an
+immediate, synchronous reconcile instead of waiting on the background drain,
+or in a non-interactive context (CI, a script, a git hook) where the
+background reconciler never auto-starts.
 
 ```
 spelunk sync [--project <slug>] [--source <path>] [--include-archived]
@@ -622,13 +902,35 @@ spelunk sync [--project <slug>] [--source <path>] [--include-archived]
 For a one-directional transfer, use `spelunk memory push` (local → server) or
 `spelunk memory pull` (server → local).
 
+**The push embeds what it pushes.** Before the batch is built, both `spelunk
+sync` and `spelunk memory push` embed every entry in the push set that has no
+usable local vector, through the local loopback embedder and using the same
+document text `spelunk memory reindex` uses, and commit each vector to
+`memory.db`. A pushed entry is then findable by semantic `memory search` locally
+without a separate `reindex`. This changes what is stored locally, not what is
+sent: `kind`, `title`, and `body` are serialised on every push and always were,
+and the vector fields are additive. The step is skipped in `cloud_first` mode
+with a `server_url` set, the same condition `memory reindex` declines under. With
+no local embedder reachable the push still completes, text-only, with the exit
+code it always had, and prints one warning naming how many entries went out
+without a local embedding and that `spelunk memory reindex` is the cure. The
+summary line reports the local embed count separately from `created` /
+`skipped` / `failed`, for example `Sync complete. Pushed 4 entries (created 4,
+skipped 0), applied 1 new remote entries. Embedded 2 locally.` Entries already
+synced, and entries arriving via `memory pull`, are outside the push set and are
+not embedded by this step. See [Backfilling missing
+embeddings](memory.md#backfilling-missing-embeddings).
+
 ---
 
 ## spelunk plumbing
 
 Low-level commands for agents and scripts. All emit JSONL and exit non-zero on
 error (exit 1 for "no results", exit 2 for errors). See
-[plumbing-and-porcelain.md](plumbing-and-porcelain.md).
+[plumbing-and-porcelain.md](plumbing-and-porcelain.md). These field names,
+types, and exit codes are semver-bound and test-enforced; the
+[stability contract](stability.md) says exactly what may change and what may
+not.
 
 ```
 spelunk plumbing cat-chunks <file>     # indexed chunks for a file
@@ -639,7 +941,25 @@ spelunk plumbing knn <query>           # KNN vector search
 spelunk plumbing embed                 # read stdin lines, emit vectors
 spelunk plumbing graph-edges           # code graph edges
 spelunk plumbing read-memory           # memory entries as JSONL
+spelunk plumbing publish-notes [remote]  # publish memory notes to a remote
 ```
+
+`publish-notes` fetches the remote's `refs/notes/spelunk` onto the tracking ref,
+merges it into yours with `cat_sort_uniq`, and pushes the result (defaulting to
+`origin`). It is the flow behind `spelunk hooks install --pre-push`, which is the
+command to reach for; this one is the plumbing underneath it.
+
+Unlike the rest of the namespace it **writes** and performs **network I/O**, so
+"plumbing is read-only" does not hold for it. It exits 2 on a publish failure
+like any other plumbing command; `--best-effort` downgrades that to a warning on
+stderr and exit 0, which is what the hook uses so a failed publish can never cost
+you your `git push`.
+
+If another process holds the notes lock, the merge cannot run, so the publish is
+skipped rather than pushed unmerged. That is reported on stderr and as
+`"skipped":"lock_unavailable"` on stdout, and exits 0 whether or not
+`--best-effort` was passed. Nothing is lost: your records stay on the local ref
+and publish on your next push.
 
 ---
 
@@ -648,11 +968,14 @@ spelunk plumbing read-memory           # memory entries as JSONL
 | Variable | Effect |
 |----------|--------|
 | `AGENT=true` | Force JSON output for commands that support it |
+| `NO_COLOR` | Any non-empty value disables colored output, overriding the `auto` default (`--color=always` still overrides `NO_COLOR`) |
 | `SPELUNK_NO_SERVER=1` | Never autostart or use a server (fully offline / no-server mode) |
 | `SPELUNK_SERVER_URL` | Point the CLI at a specific server URL |
 | `SPELUNK_CLOUD_URL` | Override the spelunk.cloud API URL used by `login` / `org` (default `https://api.spelunk.cloud`) |
 | `SPELUNK_SERVER_KEY` | Static credential for a team/self-hosted server; takes precedence over the keychain-stored credential and `login` tokens (the non-interactive escape hatch for CI / headless) |
 | `SPELUNK_SERVER_CA` | Path to a PEM CA bundle to trust for a `SPELUNK_SERVER_URL` whose certificate is signed by an internal or self-signed CA. Added as a trust anchor on top of the built-in roots; TLS verification stays on (no insecure mode). Overrides `server_ca` in `config.toml`. |
 | `SPELUNK_SECRET_STORE` | Secret-store backend: `auto` (default — keychain, file fallback), `keychain` (require the OS keychain), or `file` (force `~/.config/spelunk/secrets.toml`) |
+| `SPELUNK_CONFIG_DIR` | Override the whole `~/.config/spelunk/` directory (not just the config file), same as `-c, --config` but for the entire directory |
+| `SPELUNK_STATE_DIR` | Override the runtime state directory (default `~/.local/state/spelunk/`) that holds the server's pid/port/log/db files and the embed worker's pid/baseline files. Every reader and writer resolves through this same variable, so it is safe to redirect wholesale (useful for test isolation, containers, or a non-default `HOME`). |
 | `RUST_LOG=debug` | Enable verbose logging |
 | `EDITOR` / `VISUAL` | Editor opened by `spelunk memory add` when `--body` is omitted |

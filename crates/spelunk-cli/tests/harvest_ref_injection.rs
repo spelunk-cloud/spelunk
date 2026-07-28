@@ -8,40 +8,43 @@
 //! overwrite the target file.
 
 mod plumbing_helpers;
-use plumbing_helpers::spelunk_bin;
+use plumbing_helpers::{init_git_repo, spelunk_bin};
 
 use predicates::prelude::*;
 use std::fs;
-use std::process::Command as StdCommand;
 use tempfile::tempdir;
 
-fn write_harvest_config(dir: &std::path::Path, extra: &str) -> std::path::PathBuf {
+// `server_url`/`project_id` only satisfy harvest's upfront "server
+// configured" gate: the injection guard under test fires before any request
+// reaches that address, so it deliberately never needs to be reachable.
+// `Config::load` only honors those two fields from project-level
+// `.spelunk/config.toml` (or env), never the global `--config` file, so they
+// land in `dir`'s project config instead of `dir/config.toml`. Every caller
+// sets `.current_dir(dir)`.
+//
+// `mode = "cloud_first"` (global config) is required since the 2026-07-23
+// ADR-004 revision: `Config::resolve_inference_url()` no longer falls back to
+// an unreachable `server_url` under the default `local_first`, so the Tier-0
+// gate this helper means to satisfy unconditionally would (correctly) start
+// checking real reachability instead, and nothing listens on the address
+// below. Only `cloud_first` keeps the old "a configured server_url always
+// satisfies the gate" behavior this test relies on to reach the injection
+// guard beneath it.
+fn write_harvest_config(dir: &std::path::Path) -> std::path::PathBuf {
     let db_path = dir.join("memory.db");
     let config_path = dir.join("config.toml");
     let content = format!(
-        "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\n{extra}",
+        "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nmode = \"cloud_first\"\n",
         db_path
     );
     fs::write(&config_path, content).expect("write config.toml");
+    plumbing_helpers::write_project_server_config(dir, "http://127.0.0.1:7777", "test/proj");
     config_path
 }
 
 /// Initialize a throwaway git repo with a single commit so a real HEAD exists.
 fn init_repo(dir: &std::path::Path) {
-    let run = |args: &[&str]| {
-        let status = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .expect("run git");
-        assert!(status.success(), "git {args:?} failed");
-    };
-    run(&["init", "-q"]);
-    run(&["config", "user.email", "test@example.com"]);
-    run(&["config", "user.name", "Test"]);
-    fs::write(dir.join("README.md"), "hello\n").unwrap();
-    run(&["add", "."]);
-    run(&["commit", "-q", "-m", "initial commit"]);
+    init_git_repo(dir);
     // ADR-067: `memory harvest` fails closed without a local `.spelunk/` project,
     // so make this repo a real project — otherwise the guard fires before the
     // ref-injection check under test is reached.
@@ -59,10 +62,7 @@ fn harvest_rejects_option_like_branch_and_does_not_touch_victim_file() {
     let victim_path = victim_dir.path().join("victim.txt");
     assert!(!victim_path.exists());
 
-    let config_path = write_harvest_config(
-        temp.path(),
-        "server_url = \"http://127.0.0.1:7777\"\nproject_id = \"test/proj\"\n",
-    );
+    let config_path = write_harvest_config(temp.path());
 
     let malicious_branch_arg = format!("--branch=--output={}", victim_path.display());
 
@@ -94,10 +94,7 @@ fn harvest_rejects_option_like_git_range() {
     let victim_dir = tempdir().unwrap();
     let victim_path = victim_dir.path().join("victim2.txt");
 
-    let config_path = write_harvest_config(
-        temp.path(),
-        "server_url = \"http://127.0.0.1:7777\"\nproject_id = \"test/proj\"\n",
-    );
+    let config_path = write_harvest_config(temp.path());
 
     let malicious_range_arg = format!("--git-range=--output={}", victim_path.display());
 
@@ -126,10 +123,7 @@ fn harvest_rejects_short_option_like_branch() {
     let temp = tempdir().unwrap();
     init_repo(temp.path());
 
-    let config_path = write_harvest_config(
-        temp.path(),
-        "server_url = \"http://127.0.0.1:7777\"\nproject_id = \"test/proj\"\n",
-    );
+    let config_path = write_harvest_config(temp.path());
 
     let mut cmd = spelunk_bin();
     cmd.current_dir(temp.path())
@@ -153,10 +147,7 @@ fn harvest_rejects_bare_double_dash_branch() {
     let temp = tempdir().unwrap();
     init_repo(temp.path());
 
-    let config_path = write_harvest_config(
-        temp.path(),
-        "server_url = \"http://127.0.0.1:7777\"\nproject_id = \"test/proj\"\n",
-    );
+    let config_path = write_harvest_config(temp.path());
 
     let mut cmd = spelunk_bin();
     cmd.current_dir(temp.path())
@@ -186,10 +177,7 @@ fn harvest_rejects_option_like_branch_with_shell_metacharacters() {
     let victim_dir = tempdir().unwrap();
     let victim_path = victim_dir.path().join("victim3.txt");
 
-    let config_path = write_harvest_config(
-        temp.path(),
-        "server_url = \"http://127.0.0.1:7777\"\nproject_id = \"test/proj\"\n",
-    );
+    let config_path = write_harvest_config(temp.path());
 
     let malicious_branch_arg = format!(
         "--branch=--output={};touch /tmp/oss61-pwned",

@@ -152,7 +152,7 @@ spelunk graph validate_token --kind calls
 spelunk index .
 ```
 
-To exclude files or directories from indexing, add a `.spelunkignore` file (same syntax as `.gitignore`) at any directory. It takes higher precedence than `.gitignore`.
+To exclude files or directories from indexing, add a `.spelunkignore` file (same syntax as `.gitignore`) at any directory. It takes higher precedence than `.gitignore`. Indexing also applies a built-in filter that skips generated, vendored, minified, and machine-data files (lockfiles, `node_modules/`, `*.min.js`, protobuf codegen, and files that self-declare `@generated`); tune it with the `[index]` table in config. See [File filtering](commands.md#file-filtering).
 
 **Note:** Indexing is optional and only needed if you use semantic search. If you only use `spelunk graph` and full-text search, there's nothing to rebuild after changes.
 
@@ -291,7 +291,8 @@ When using a shared memory server (`server_url` in config), agents can coordinat
 # Poll for new entries since a given timestamp
 spelunk memory since <epoch>
 
-# Stream entries as they arrive (requires a configured server)
+# Stream entries as they arrive (requires an explicit `server_url`; an
+# auto-discovered loopback server does not satisfy this)
 spelunk memory watch
 ```
 
@@ -347,7 +348,7 @@ Exit codes across all plumbing commands:
 - **1** — no results (empty set, not an error)
 - **2** — hard error (bad flags, missing DB, I/O failure) — diagnostics on stderr
 
-Commands marked **(requires server)** need an embedding model running on the configured endpoint.
+Commands marked **(requires server)** need a running `spelunk-server` with its embedder ready.
 
 ### cat-chunks *(requires index)*
 
@@ -514,9 +515,9 @@ Example output:
 {"model":"f2llm-v2-330m","dimensions":896,"vector":[0.021,-0.043,...]}
 ```
 
-(The model name reflects the `embedding_model` config value and the
-dimensionality reflects whichever embedder the server is using — the bundled
-native embedder is codefuse-ai/F2LLM-v2-330M at 896 dimensions.)
+(The model name is the pinned model id, and the dimensionality reflects the
+bundled native embedder: codefuse-ai/F2LLM-v2-330M at 896 dimensions.
+Neither is configurable.)
 
 ---
 

@@ -1,0 +1,21 @@
+# Pinned release assets used to produce the upgrade corpus.
+#
+# Each line is `sha256  asset-name`, matching the digest GitHub records for that
+# release asset (`gh api repos/<slug>/releases/tags/<tag>`). generate.sh refuses
+# to run against an asset that is not listed here: a fixture is only evidence
+# about a real release if the bytes are the ones that release shipped.
+#
+# Entries exist per host triple, because the corpus can be regenerated on any
+# machine that can run the old binaries. Add the triple you need after checking
+# the downloaded file against the digest GitHub reports for it.
+
+# aarch64-apple-darwin
+5bee62a2820b1de394b7c14385d097b23ec11fdafe26180c61f8d79b21b903a1  spelunk-v0.7.1-aarch64-apple-darwin.tar.gz
+98c5d455546b9351da56a7210bb11f93b872a188344200dbfc424cc8cb395d0c  spelunk-v0.8.3-aarch64-apple-darwin.tar.gz
+efa249cf0ec67976277f543fda70ba66b2246bd414f2e6c1ccd8be957bf400d8  spelunk-v0.9.2-aarch64-apple-darwin.tar.gz
+285ecbdec8bdb02d1e51234666fea077cd1ea8ba6879f8bed3fd136187a355de  spelunk-v0.9.3-aarch64-apple-darwin.tar.gz
+776ccfbe31c46a197672e030e4c8af9736cf8bd72db0ab7366869b5126c8062a  spelunk-v0.9.5-aarch64-apple-darwin.tar.gz
+
+# x86_64-unknown-linux-gnu (the CI runner's triple; only the release the
+# old-binary-reads-a-current-database check uses is pinned here)
+a32f311c4ebb66ceb2c1f00a7d44c07fc22bb001a7af66b69d677cd86b5c8508  spelunk-v0.9.3-x86_64-unknown-linux-gnu.tar.gz

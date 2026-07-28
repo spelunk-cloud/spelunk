@@ -335,11 +335,11 @@ def main() -> None:
     if args.no_deepseek:
         env = dict(os.environ)
         endpoint_kind = "native"
-        api_key_source = "n/a (--no-deepseek, uses ambient Claude Code auth)"
+        provenance_label = "n/a (--no-deepseek, uses ambient Claude Code auth)"
         base_url_used = None
     else:
         api_key = args.api_key or os.environ.get("DEEPSEEK_API_KEY")
-        api_key_source = "flag:--api-key" if args.api_key else "env:DEEPSEEK_API_KEY"
+        provenance_label = "flag:--api-key" if args.api_key else "env:DEEPSEEK_API_KEY"
         if not api_key:
             parser.error(
                 "No DeepSeek API key provided. Use --api-key, set DEEPSEEK_API_KEY, "
@@ -390,7 +390,7 @@ def main() -> None:
         "model": args.model,
         "model_source": "api",
         "api_base_url": base_url_used,
-        "api_key_source": api_key_source,
+        "api_key_source": provenance_label,
         # Null only on baseline, where no spelunk tools are wired in.
         "spelunk_version": (
             get_spelunk_version() if args.condition in SPELUNK_CONDITIONS else None

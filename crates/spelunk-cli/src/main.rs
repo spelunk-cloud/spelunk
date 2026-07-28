@@ -6,6 +6,7 @@ mod cli;
 mod server_client;
 
 use clap::{CommandFactory, FromArgMatches};
+use cli::cmd::plumbing::PlumbingCommand;
 use cli::{Cli, Command};
 use spelunk_core::{
     config, conventions, embeddings, error, indexer, registry, search, storage, utils,
@@ -37,21 +38,37 @@ async fn main() -> Result<()> {
             .find(|w| w[0] == "--config" || w[0] == "-c")
             .map(|w| std::path::PathBuf::from(&w[1]))
     };
-    let llm_configured = config::Config::load(pre_config_path.as_deref())
-        .map(|c| c.llm_model.is_some())
-        .unwrap_or(false);
+    let llm_configured = config::Config::llm_model_configured(pre_config_path.as_deref());
 
     // Hide `explore` from help when no chat model is configured.
     let matches = Cli::command()
         .mut_subcommand("explore", |c| c.hide(!llm_configured))
         .get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
+    cli::cmd::set_color_choice(cli.color);
 
-    let cfg = config::Config::load(cli.config.as_deref())?;
+    // Config loads before dispatch, so `--best-effort` has to be honoured here
+    // or a publish never reaches the arm that keeps a hook's push alive (D3).
+    // That command ignores `cfg`, so defaults are inert; every other command
+    // still fails loudly on a config it cannot load.
+    let best_effort_publish = matches!(&cli.command, Command::Plumbing(p)
+        if matches!(&p.command, PlumbingCommand::PublishNotes(a) if a.best_effort));
+    let cli_config_path = cli.config.clone();
+    let cfg = match config::Config::load(cli.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) if best_effort_publish => {
+            eprintln!("spelunk: {e:#}");
+            config::Config::default()
+        }
+        Err(e) => return Err(e),
+    };
 
     match cli.command {
         Command::Init(args) => cli::cmd::init(args, cfg).await,
-        Command::Index(args) => cli::cmd::index(args, cfg).await,
+        Command::Index(mut args) => {
+            args.config_path = cli_config_path;
+            cli::cmd::index(args, cfg).await
+        }
         Command::Search(args) => cli::cmd::search(args, cfg).await,
         Command::Status(args) => cli::cmd::status(args, cfg).await,
         Command::Check(args) => cli::cmd::check(args, cfg).await,
@@ -88,7 +105,8 @@ async fn main() -> Result<()> {
         }
         Command::Server(args) => cli::cmd::server(args).await,
         Command::Login(args) => cli::cmd::login(args).await,
-        Command::Logout => cli::cmd::logout().await,
+        Command::Logout(args) => cli::cmd::logout(args).await,
         Command::Org(args) => cli::cmd::org(args).await,
+        Command::Auth(args) => cli::cmd::auth(args).await,
     }
 }

@@ -28,6 +28,7 @@ pub struct GraphArgs {
     pub live: bool,
 }
 
+use super::color::cprintln;
 use super::helpers::open_project_db;
 use super::search::{index_is_stale, maybe_warn_stale};
 use crate::config::Config;
@@ -172,12 +173,15 @@ fn graph_live(symbol: &str, format: &str, kind_filter: &Option<String>, root: &P
             }
         }
         _ => {
-            println!("\x1b[1mIncoming to '{symbol}' (live scan — no ranking):\x1b[0m");
+            cprintln!("\x1b[1mIncoming to '{symbol}' (live scan — no ranking):\x1b[0m");
             for e in &edges {
                 let loc = e.source_name.as_deref().unwrap_or(&e.source_file);
-                println!(
+                cprintln!(
                     "  \x1b[36m{}\x1b[0m  {}  \x1b[2m({}:{})\x1b[0m",
-                    e.kind, e.source_file, loc, e.line
+                    e.kind,
+                    e.source_file,
+                    loc,
+                    e.line
                 );
             }
         }
@@ -202,34 +206,44 @@ fn print_edges(edges: &[GraphEdge], query: &str) {
         .collect();
 
     if !outgoing.is_empty() {
-        println!("\x1b[1mOutgoing from '{query}':\x1b[0m");
+        cprintln!("\x1b[1mOutgoing from '{query}':\x1b[0m");
         for e in &outgoing {
             let loc = e.source_name.as_deref().unwrap_or(&e.source_file);
-            println!(
+            cprintln!(
                 "  \x1b[33m{}\x1b[0m  {}  \x1b[2m({}:{})\x1b[0m",
-                e.kind, e.target_name, loc, e.line
+                e.kind,
+                e.target_name,
+                loc,
+                e.line
             );
         }
         println!();
     }
     if !incoming.is_empty() {
-        println!("\x1b[1mIncoming to '{query}':\x1b[0m");
+        cprintln!("\x1b[1mIncoming to '{query}':\x1b[0m");
         for e in &incoming {
             let loc = e.source_name.as_deref().unwrap_or(&e.source_file);
-            println!(
+            cprintln!(
                 "  \x1b[36m{}\x1b[0m  {}  \x1b[2m({}:{})\x1b[0m",
-                e.kind, e.source_file, loc, e.line
+                e.kind,
+                e.source_file,
+                loc,
+                e.line
             );
         }
         println!();
     }
     if !other.is_empty() {
-        println!("\x1b[1mRelated edges:\x1b[0m");
+        cprintln!("\x1b[1mRelated edges:\x1b[0m");
         for e in &other {
             let loc = e.source_name.as_deref().unwrap_or(&e.source_file);
-            println!(
+            cprintln!(
                 "  {} -- \x1b[33m{}\x1b[0m --> {}  \x1b[2m({}:{})\x1b[0m",
-                loc, e.kind, e.target_name, e.source_file, e.line
+                loc,
+                e.kind,
+                e.target_name,
+                e.source_file,
+                e.line
             );
         }
     }

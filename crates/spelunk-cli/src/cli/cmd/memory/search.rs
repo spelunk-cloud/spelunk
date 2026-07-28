@@ -16,6 +16,7 @@ pub(super) async fn memory_search(
 
     // Discovery nudge: warn once when unimported server.db notes exist.
     super::reconcile::maybe_emit_nudge(mem_path, cfg);
+    super::outbox::poll_and_apply(cfg, mem_path).await;
 
     // Honor the auto-discovered server tier: loopback auto-discovery sets the
     // capability tier without populating `cfg.server_url`, so build an
@@ -23,7 +24,10 @@ pub(super) async fn memory_search(
     // (mirrors `explore` — IMP-3 / spelunk#316). Falls back to `cfg` unchanged
     // when the tier isn't `Server` or `server_url` is already configured.
     let project_root = mem_path.parent().unwrap_or(mem_path);
-    let tier = capability::get_tier(cfg).await;
+    // `get_inference_tier` (not `get_tier`): local_first always prefers the
+    // local loopback embedder for query-embedding, even with an explicit
+    // server_url set (2026-07-23 founder decision).
+    let tier = capability::get_inference_tier(cfg).await;
     let eff_cfg = tier.effective_config(cfg, project_root);
     let cfg = &eff_cfg;
 

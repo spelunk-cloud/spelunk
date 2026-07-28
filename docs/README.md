@@ -62,9 +62,11 @@ documented and verified against the binary; reference lives after the journey, n
 before it.
 
 - [Commands](commands.md): every subcommand, flag, and environment variable
+- [Config reference](config-reference.md): every field in `config.toml`, with defaults and env overrides
 - [Memory model](memory.md): kinds, cross-project visibility, git-notes write-through
 - [Architecture](architecture.md) and [capability tiers](architecture/capability-tiers.md)
 - [Plumbing and porcelain](plumbing-and-porcelain.md): JSONL commands for scripts and agents
+- [Stability contract](stability.md): what a version bump may change, per surface, and what it may not
 - [Security](security/THREAT-MODEL.md): threat model and boundaries (secret scanning is defense-in-depth, not a boundary)
 
 ## 5. Local vs server vs team-server
@@ -100,7 +102,7 @@ for that. Only memory does.
 
 - [Getting Started → capability tiers](getting-started.md#capability-tiers-where-inference-and-memory-live): the tier table in context
 - [Getting Started → team setup](getting-started.md#team-setup-shared-memory-with-spelunk-server): how to set `server_url` and sync
-- [Server setup](server.md) and [Self-hosting](self-hosting.md): deploy and expose a team server
+- [Server setup](server-setup.md): deploy and expose a team server (Docker, systemd, TLS, client config)
 - [Remote agents](remote-agents.md): run an agent in a container against your server
 
 ---

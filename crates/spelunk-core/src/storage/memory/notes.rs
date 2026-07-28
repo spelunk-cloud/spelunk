@@ -81,8 +81,12 @@ pub(super) fn split_csv(s: Option<&str>) -> Vec<String> {
 // ── MemoryStore note methods ─────────────────────────────────────────────────
 
 impl MemoryStore {
-    /// Insert a note and return its id. Does not store an embedding —
-    /// call `insert_embedding` afterwards if the embedder is available.
+    /// Insert a note and return `(id, created)`. `created` is `true` when a
+    /// genuinely new row was inserted, `false` when the insert collided with
+    /// an existing row's `entity_id` (only possible once `idx_notes_entity_id`
+    /// has been promoted to UNIQUE, see `entity_id_migration.rs`) and that
+    /// existing row was reused instead. Does not store an embedding on a fresh
+    /// insert; call `insert_embedding` afterwards if the embedder is available.
     #[allow(clippy::too_many_arguments)]
     pub fn add_note(
         &self,
@@ -93,8 +97,9 @@ impl MemoryStore {
         linked_files: &[&str],
         source_ref: Option<&str>,
         valid_at: Option<i64>,
-    ) -> Result<i64> {
-        self.conn.execute(
+    ) -> Result<(i64, bool)> {
+        let entity_id = crate::storage::entity_id::entity_id(kind, title, body);
+        let result = self.conn.execute(
             "INSERT INTO notes \
              (kind, title, body, tags, linked_files, source_ref, valid_at, entity_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -106,10 +111,10 @@ impl MemoryStore {
                 linked_files.join(","),
                 source_ref,
                 valid_at,
-                crate::storage::entity_id::entity_id(kind, title, body),
+                entity_id,
             ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        );
+        self.recover_from_entity_id_collision(result, &entity_id, tags, linked_files)
     }
 
     /// Insert a note with an explicit `created_at` timestamp (unix epoch seconds).
@@ -117,6 +122,8 @@ impl MemoryStore {
     /// Used by `memory reconcile` to preserve the original creation timestamp
     /// from the source store. All other callers should use `add_note`, which
     /// defers to the SQLite `DEFAULT (unixepoch())`.
+    ///
+    /// Returns `(id, created)`, see `add_note` for what `created` means.
     #[allow(clippy::too_many_arguments)]
     pub fn add_note_with_created_at(
         &self,
@@ -128,8 +135,9 @@ impl MemoryStore {
         source_ref: Option<&str>,
         status: &str,
         created_at: i64,
-    ) -> Result<i64> {
-        self.conn.execute(
+    ) -> Result<(i64, bool)> {
+        let entity_id = crate::storage::entity_id::entity_id(kind, title, body);
+        let result = self.conn.execute(
             "INSERT INTO notes \
              (kind, title, body, tags, linked_files, source_ref, status, created_at, entity_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -142,23 +150,65 @@ impl MemoryStore {
                 source_ref,
                 status,
                 created_at,
-                crate::storage::entity_id::entity_id(kind, title, body),
+                entity_id,
             ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        );
+        self.recover_from_entity_id_collision(result, &entity_id, tags, linked_files)
     }
 
-    /// Return all notes for a project ordered by created_at ASC (used by reconcile
-    /// to compute the memory.db content-hash set).
+    /// Shared insert-then-recover tail for `add_note`/`add_note_with_created_at`.
+    /// A UNIQUE-constraint failure here can only be `idx_notes_entity_id`:
+    /// neither function populates `uuid` or `remote_id`, and both of those
+    /// indexes are partial (`WHERE ... IS NOT NULL`), so NULL never collides.
+    /// Recovers by merging `tags`/`linked_files` into the existing row
+    /// (add-wins, via `union_tags_and_files`) and returning its id with
+    /// `created = false`. Leaves `status`/`superseded_by` untouched, unlike
+    /// `dedupe.rs`'s fuller merge (that collapses two rows already diverged
+    /// in the store; this is one fresh insert colliding with one existing row).
+    /// Any other error propagates unchanged.
+    pub(super) fn recover_from_entity_id_collision(
+        &self,
+        insert_result: rusqlite::Result<usize>,
+        entity_id: &str,
+        tags: &[&str],
+        linked_files: &[&str],
+    ) -> Result<(i64, bool)> {
+        match insert_result {
+            Ok(_) => Ok((self.conn.last_insert_rowid(), true)),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation
+                    && err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                let existing_id: i64 = self.conn.query_row(
+                    "SELECT id FROM notes WHERE entity_id = ?1",
+                    rusqlite::params![entity_id],
+                    |r| r.get(0),
+                )?;
+                let owned_tags: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
+                let owned_files: Vec<String> = linked_files.iter().map(|s| s.to_string()).collect();
+                self.union_tags_and_files(existing_id, &owned_tags, &owned_files)?;
+                Ok((existing_id, false))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Return all notes ordered by created_at ASC, id ASC (used by reconcile
+    /// for the content-hash set, and by `dedupe_entity_ids` to pick each
+    /// group's survivor).
     ///
-    /// Returns all notes regardless of status so that archived entries also
-    /// participate in dedup (we must not re-import a note that was already
-    /// imported and then archived in memory.db).
+    /// Includes every status, including archived, so dedup doesn't re-import
+    /// a note that was already imported and then archived.
+    ///
+    /// `id ASC` is a deliberate tie-break: created_at can collide (e.g. a
+    /// batch import), and id increases with insertion order, so this pins
+    /// "earliest created, ties broken by first inserted" as the definition
+    /// every caller relies on.
     pub fn all_notes_for_dedup(&self) -> Result<Vec<Note>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, title, body, tags, linked_files, created_at, status, \
              superseded_by, source_ref, valid_at, invalid_at \
-             FROM notes ORDER BY created_at ASC",
+             FROM notes ORDER BY created_at ASC, id ASC",
         )?;
         let notes = stmt
             .query_map([], super::notes::row_to_note)?
@@ -212,12 +262,143 @@ impl MemoryStore {
         Ok(())
     }
 
-    pub fn insert_embedding(&self, note_id: i64, blob: &[u8]) -> Result<()> {
+    /// Clear an existing note's `superseded_by` link back to NULL. Used by
+    /// `memory dedupe`'s self-edge guard: a rewrite that would otherwise point
+    /// a row at itself drops the link instead.
+    pub fn clear_superseded_by(&self, note_id: i64) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO note_embeddings (note_id, embedding) VALUES (?1, ?2)",
-            rusqlite::params![note_id, blob],
+            "UPDATE notes SET superseded_by = NULL WHERE id = ?1",
+            rusqlite::params![note_id],
         )?;
         Ok(())
+    }
+
+    /// Ids of every row whose `superseded_by` points at `target_id`.
+    pub fn notes_pointing_at(&self, target_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM notes WHERE superseded_by = ?1")?;
+        let ids = stmt
+            .query_map(rusqlite::params![target_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
+    /// Used only by `memory dedupe`, after a duplicate-group loser's
+    /// tags/linked_files/superseded_by have been folded into the survivor
+    /// and any edges pointing at it rewritten.
+    pub fn delete_note(&self, note_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM notes WHERE id = ?1",
+            rusqlite::params![note_id],
+        )?;
+        Ok(())
+    }
+
+    /// No-op if absent. Used by `memory dedupe` when deleting a
+    /// duplicate-group loser: two vectors have no meaningful union, so the
+    /// embedding is dropped rather than merged; the survivor's own
+    /// embedding is untouched.
+    pub fn delete_note_embedding(&self, note_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM note_embeddings WHERE note_id = ?1",
+            rusqlite::params![note_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_embedding(&self, note_id: i64, blob: &[u8]) -> Result<()> {
+        // `note_embeddings` is a sqlite-vec `vec0` virtual table, which does not
+        // honour `INSERT OR REPLACE`/`ON CONFLICT` — a repeated `note_id` raises
+        // a hard UNIQUE-constraint error instead of overwriting. Emulate replace
+        // with an atomic delete-then-insert so re-embedding a note is genuine
+        // last-write-wins. When a caller already holds a transaction we join it
+        // rather than nesting a BEGIN, which vec0/SQLite would reject.
+        let write = |conn: &rusqlite::Connection| -> rusqlite::Result<()> {
+            conn.execute(
+                "DELETE FROM note_embeddings WHERE note_id = ?1",
+                rusqlite::params![note_id],
+            )?;
+            conn.execute(
+                "INSERT INTO note_embeddings (note_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![note_id, blob],
+            )?;
+            Ok(())
+        };
+        if self.conn.is_autocommit() {
+            let tx = self.conn.unchecked_transaction()?;
+            write(&tx)?;
+            tx.commit()?;
+        } else {
+            write(&self.conn)?;
+        }
+        Ok(())
+    }
+
+    /// Active notes (and archived ones too when `include_archived`) that have no
+    /// row in the `note_embeddings` vec0 table: the set `memory reindex`
+    /// backfills. Mirrors `Database::chunks_missing_embeddings` for the code
+    /// index and uses the same `LEFT JOIN <vec0> ... WHERE ... IS NULL` idiom,
+    /// which is proven to filter correctly against a vec0 virtual table.
+    ///
+    /// Returns `(note_id, title, body)`: exactly the fields the add-time embed
+    /// document (`title: {title} | text: {body}`) is rebuilt from, so a
+    /// backfilled vector matches an add-time one. `ORDER BY n.id` is
+    /// deterministic, so a resumed re-query is stable.
+    pub fn notes_missing_embeddings(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<(i64, String, String)>> {
+        // Only string literals are interpolated here; there are no user-supplied
+        // values in this query, so no bind params are needed.
+        let status_clause = if include_archived {
+            ""
+        } else {
+            "AND n.status = 'active'"
+        };
+        let sql = format!(
+            "SELECT n.id, n.title, n.body \
+             FROM notes n \
+             LEFT JOIN note_embeddings e ON e.note_id = n.id \
+             WHERE e.note_id IS NULL {status_clause} \
+             ORDER BY n.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Every active note (and archived too when `include_archived`), regardless
+    /// of whether it already has an embedding: the `--force` candidate set for
+    /// `memory reindex`. `insert_embedding`'s atomic delete-then-insert replaces
+    /// any existing vector in place, so re-embedding here is last-write-wins.
+    pub fn all_active_notes_for_reembed(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let status_clause = if include_archived {
+            ""
+        } else {
+            "WHERE status = 'active'"
+        };
+        let sql = format!("SELECT id, title, body FROM notes {status_clause} ORDER BY id");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// List notes, optionally filtered by kind, newest first.

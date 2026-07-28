@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-cli"
-version = "0.9.3"
+version = "0.9.5"
 edition = "2024"
 description = "spelunk — AI agent context retrieval CLI"
 license = "MIT"
@@ -41,11 +41,17 @@ indicatif = "0.18"
 futures-util = "0.3"
 ignore = "0.4"
 reqwest = { workspace = true }
+# Named directly so `capability.rs` can downcast a probe failure's error
+# chain to `rustls::Error`/`CertificateError` and classify TLS trust failures
+# separately from a transport-level unreachable. Same resolved version as
+# reqwest's own rustls-tls stack (workspace-pinned); no crypto operations of
+# our own, so features only need to satisfy the enum types compiling.
+rustls = { workspace = true }
 percent-encoding = "2.3"
 blake3 = "1"
 regex = { version = "1", default-features = false, features = ["std"] }
 dirs = { workspace = true }
-gix = { version = "0.85.0", default-features = false, features = [
+gix = { version = "0.86.0", default-features = false, features = [
     "sha1",
     "status",
 ] }
@@ -61,6 +67,27 @@ tempfile = { workspace = true }
 spelunk-core = { path = "../spelunk-core", features = ["test-support"] }
 assert_cmd = "2.2"
 predicates = "3.1"
+# Upgrade-corpus fixtures only. The captured databases are mostly the vec0
+# extension's preallocated vector chunk, which is zeros: gzip takes them from
+# megabytes to tens of kilobytes, small enough to check in. Already in the
+# lockfile as a transitive dependency, so this adds no new supply-chain surface.
+flate2 = "1"
+# Upgrade-corpus fixtures only: verifies each checked-in wing still hashes to
+# the artifact its recorded expectations were captured from. Same version
+# spelunk-core already depends on, so it adds nothing to the lockfile.
+sha2 = "0.11"
 wiremock = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
+# TLS-trust e2e test only: an in-test axum-server TLS listener plus rcgen-generated
+# CA/leaf certs, to exercise the CLI's real client path against a proper chain and
+# against the classic CA-cert-as-leaf misconfiguration.
+axum = { version = "0.8", features = ["macros"] }
+axum-server = { workspace = true }
+rcgen = "0.14"
+# ADR-037 P2 relay tests only: runs the real spelunk-server axum router
+# in-process (`spelunk_server::router`) to exercise `outbox.rs`'s local relay
+# client against the actual `/local/relay/push`/`/local/relay/poll` wire
+# shapes, not a hand-mocked stand-in. `default-features = false` skips the
+# native embedder (candle/hf-hub) build, irrelevant to these tests.
+spelunk-server = { path = "../spelunk-server", default-features = false }

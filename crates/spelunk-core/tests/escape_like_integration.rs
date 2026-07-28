@@ -19,7 +19,7 @@ use serial_test::serial;
 /// Insert a file + one chunk and return the file id.
 fn seed_file(db: &spelunk_core::storage::Database, path: &str) -> i64 {
     let file_id = db
-        .upsert_file(path, Some("rust"), "hash")
+        .upsert_file(path, Some("rust"), "hash", 0)
         .expect("upsert_file");
     db.insert_chunk(file_id, "function", Some("f"), 1, 5, "fn f() {}", None, 3)
         .expect("insert_chunk");

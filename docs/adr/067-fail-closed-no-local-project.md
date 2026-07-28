@@ -106,8 +106,8 @@ describing the global store as if it were the current project's.
 ## Scope and non-goals
 
 - **Broader UX direction is out of scope.** Whether spelunk should engineer true
-  zero-setup usage or lead with `init` is a separate product decision
-  (spelunk-oss^134). D1/D2/D3 are the minimal fail-closed correctness fix and
+  zero-setup usage or lead with `init` is a separate product decision.
+  D1/D2/D3 are the minimal fail-closed correctness fix and
   foreclose neither direction: a future zero-setup design can define its own
   scoped store, and a lead-with-init design already matches this behaviour.
 - **The global store is not deleted or migrated.** Existing data under
@@ -142,4 +142,4 @@ describing the global store as if it were the current project's.
 ## Status
 
 P0 data-isolation fix. Implementation is gated on founder approval of this ADR
-and tracked on spelunk-oss^131.
+and tracked separately.

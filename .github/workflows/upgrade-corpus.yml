@@ -1,0 +1,108 @@
+name: Upgrade corpus
+
+# Open every artifact in the checked-in upgrade corpus with the current build
+# and assert the upgrade preserves it. The corpus is real output from released
+# binaries, so this is the only job that tests migrations against what users
+# actually have on disk rather than against an old shape rebuilt by hand.
+#
+# Runs on release branches and tags, where an upgrade regression is about to
+# reach users, and on any change to the corpus, the suite that reads it, or the
+# migration code it exercises, so a break is caught at review rather than at
+# tag-push time.
+
+on:
+  push:
+    branches:
+      - "main"
+      - "release/**"
+    tags:
+      - "v*.*.*"
+  pull_request:
+    paths:
+      - "crates/spelunk-cli/tests/upgrade_corpus.rs"
+      - "crates/spelunk-cli/tests/fixtures/upgrade-corpus/**"
+      - "crates/spelunk-core/src/storage/**"
+      - "crates/spelunk-core/migrations/**"
+      # The registry has its own wing and its own schema init path.
+      - "crates/spelunk-core/src/registry.rs"
+      - "scripts/upgrade-corpus/**"
+      - ".github/workflows/upgrade-corpus.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The OS keychain is unavailable in headless runners and blocks indefinitely
+  # on macOS. This applies to the downloaded release binary too, which pre-dates
+  # the file-store default and would otherwise reach the keychain.
+  SPELUNK_SECRET_STORE: file
+
+jobs:
+  corpus:
+    name: Upgrade real 0.9.x artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 25
+    env:
+      CARGO_PROFILE_TEST_DEBUG: 0
+      # Pinned deliberately, not "latest": this leg asserts what a specific
+      # released binary does with a database the current build has upgraded,
+      # and that answer differs per release. Keep in step with
+      # scripts/upgrade-corpus/checksums.txt.
+      OLD_RELEASE_TAG: v0.9.3
+      OLD_RELEASE_SHA256: a32f311c4ebb66ceb2c1f00a7d44c07fc22bb001a7af66b69d677cd86b5c8508
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install libdbus (keyring sync-secret-service backend)
+        run: sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Install stable toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Reads the checked-in fixtures only. No release download, no server, no
+      # model: the corpus is self-contained so this leg cannot be broken by a
+      # network hiccup.
+      - name: Upgrade every wing and assert integrity
+        run: cargo test -p spelunk-cli --test upgrade_corpus
+
+      # The one check that genuinely needs an old binary: what a pinned release
+      # does when it opens a database the current build has already upgraded.
+      - name: Fetch the pinned release binary
+        run: |
+          set -euo pipefail
+          asset="spelunk-${OLD_RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p old-release
+          curl -fsSL -o "old-release/$asset" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${OLD_RELEASE_TAG}/${asset}"
+          echo "${OLD_RELEASE_SHA256}  old-release/$asset" | sha256sum -c -
+          tar xzf "old-release/$asset" -C old-release
+          old-release/spelunk --version
+
+      # `--exact` against a name that no longer exists runs nothing and exits 0,
+      # so the count is checked: renaming this test must break the job rather
+      # than quietly stop exercising the only leg that needs an old binary.
+      - name: Assert the old binary reads a current database without losing data
+        env:
+          SPELUNK_OLD_BINARY: ${{ github.workspace }}/old-release/spelunk
+        run: |
+          set -euo pipefail
+          cargo test -p spelunk-cli --test upgrade_corpus -- --ignored --exact \
+            a_pinned_old_binary_reads_a_current_database_cleanly_and_loses_no_data \
+            | tee old-binary.log
+          grep -q '^test result: ok. 1 passed' old-binary.log

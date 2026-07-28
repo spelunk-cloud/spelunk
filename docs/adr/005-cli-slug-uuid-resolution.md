@@ -3,7 +3,7 @@
 **Status:** Proposed  
 **Date:** 2026-06-19  
 **Deciders:** Architect  
-**Trigger:** ADR-037 P1 implementer flag #2 — cloud-api routes all projects by `Uuid` in path
+**Trigger:** cloud-api routes all projects by `Uuid` in path
 params (`/v1/projects/{project_id}`), but the CLI config carries a human slug
 (`project_id = "my-project"` in `.spelunk/config.toml`). The Founder cannot
 dogfood against `api.spelunk.cloud` without either (a) hand-pasting the UUID
@@ -68,6 +68,40 @@ No new cloud-api endpoint is needed.
 ---
 
 ## Decision
+
+> **Amendment: the resolution trigger below is retired for the memory-backend
+> path.** The Context above records the situation as it stood on 2026-06-19 and
+> is left as provenance. Its load-bearing premise, that cloud-api's
+> `{project_id}` path parameter is typed `Path<Uuid>` and therefore rejects a
+> slug, no longer holds: cloud-api `66fd265` made `POST /memory`, `GET /memory`,
+> `GET /memory/since`, `POST /memory/batch`, `/edges`, `/graph` and `/stream`
+> take `Path<String>` and accept a slug **or** a UUID. The self-hosted
+> spelunk-server has always accepted either.
+>
+> The two per-entry routes are the exception: `GET` and `DELETE
+> /memory/{entry_id}` are still `Path<(Uuid, Uuid)>`, so the project parameter
+> is UUID-only on those two. It does not affect the passthrough, which is why
+> they are absent from the list above, but it constrains any later work that
+> makes `cloud_first` serve memory against the hosted API.
+>
+> The mechanism was not merely redundant against the self-hosted peer, it was
+> breaking it: a self-hosted spelunk-server answers `GET /v1/projects` in a
+> shape the resolver cannot deserialize, so the documented `cloud_first` client
+> configuration failed at backend open and took every memory command with it.
+> Retiring the resolution is the repair, not a cleanup that followed one.
+>
+> With both peers slug-accepting, D1's "if it does not parse as a UUID, resolve
+> it" branch is never the correct thing to do, so D1 and D6's resolution
+> trigger, along with D2's `GET /v1/projects` lookup and D4's
+> `.spelunk/cloud-project-id.lock` cache, are gone. `Config.project_id` is now
+> passed through verbatim as the project path segment, percent-encoded into a
+> single segment, exactly as `CloudSyncClient` has always done. D5's raw-UUID
+> behaviour survives as a consequence of that passthrough rather than as a
+> special case. `SPELUNK_NO_SLUG_CACHE` no longer does anything.
+>
+> Live surface: `open_remote_memory_backend_with_bearer` in
+> `crates/spelunk-core/src/storage/mod.rs`, and `RemoteMemoryBackend::url` /
+> `encode_project_id` in `crates/spelunk-core/src/storage/remote/mod.rs`.
 
 ### D1. Slug detection and resolution trigger
 

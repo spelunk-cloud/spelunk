@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
 
+use super::color::cprintln;
 use super::memory::cross_project::collect_dep_cross_cutting;
 use super::memory::print_note_summary;
 use crate::storage::memory::Note;
@@ -178,6 +179,7 @@ pub async fn context(args: ContextArgs, cfg: Config) -> Result<()> {
 
     // Discovery nudge: warn once when unimported server.db notes exist.
     crate::cli::cmd::memory::reconcile::maybe_emit_nudge(&mem_path, &cfg);
+    crate::cli::cmd::memory::outbox::poll_and_apply(&cfg, &mem_path).await;
 
     let be = match args.backend.as_str() {
         "git-notes" => Some("git-notes"),
@@ -338,12 +340,12 @@ fn print_section_header(kind: &str) {
         "requirement" => "Requirements",
         other => other,
     };
-    println!("\x1b[1;34m── {label} \x1b[0m");
+    cprintln!("\x1b[1;34m── {label} \x1b[0m");
     println!();
 }
 
 fn print_conventions_section(records: &[crate::conventions::ConventionRecord]) {
-    println!("\x1b[1;34m── Conventions \x1b[0m");
+    cprintln!("\x1b[1;34m── Conventions \x1b[0m");
     println!();
 
     // Group by language for readability.
@@ -353,7 +355,7 @@ fn print_conventions_section(records: &[crate::conventions::ConventionRecord]) {
         by_lang.entry(r.language.as_str()).or_default().push(r);
     }
     for (lang, recs) in &by_lang {
-        println!("\x1b[1m{lang}\x1b[0m");
+        cprintln!("\x1b[1m{lang}\x1b[0m");
         for r in recs {
             println!(
                 "  [{:.0}%] {} — {}",

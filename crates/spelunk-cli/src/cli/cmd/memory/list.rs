@@ -30,6 +30,7 @@ pub(super) async fn memory_list(
     // Discovery nudge: warn once when unimported server.db notes exist.
     if !git_notes {
         super::reconcile::maybe_emit_nudge(mem_path, cfg);
+        super::outbox::poll_and_apply(cfg, mem_path).await;
     }
 
     let backend = open_memory_backend(cfg, mem_path, effective_override).await?;

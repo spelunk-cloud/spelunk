@@ -21,7 +21,7 @@
 //!      archived notes are excluded from list().
 
 mod plumbing_helpers;
-use plumbing_helpers::spelunk_bin_in;
+use plumbing_helpers::{register_sqlite_vec, spelunk_bin_in};
 
 use assert_cmd::Command;
 use rusqlite::Connection;
@@ -128,23 +128,10 @@ impl TestRegistry {
 
 // ── memory-db helpers ─────────────────────────────────────────────────────────
 
-/// Register the sqlite-vec extension once per test process (required for
-/// MemoryStore::open which creates the vec0 virtual table).
-fn register_sqlite_vec_once() {
-    use std::sync::OnceLock;
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| unsafe {
-        #[allow(clippy::missing_transmute_annotations)]
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
-    });
-}
-
 /// Open and migrate a `memory.db` at `path`, returning the raw `Connection`
 /// for direct seeding of test data.
 fn open_memory_db(path: &Path) -> Connection {
-    register_sqlite_vec_once();
+    register_sqlite_vec();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create memory db parent");
     }
@@ -221,7 +208,6 @@ fn write_config(dir: &Path, index_db: &Path) -> PathBuf {
         concat!(
             "db_path = {:?}\n",
             "api_base_url = \"http://127.0.0.1:1\"\n",
-            "embedding_model = \"none\"\n",
             "llm_model = \"none\"\n",
         ),
         index_db_c
@@ -1327,7 +1313,7 @@ fn sql_injection_in_dep_note_is_inert() {
 /// (the precondition for the dep-pass not surfacing archived entries).
 #[test]
 fn memory_store_list_excludes_archived_by_default() {
-    register_sqlite_vec_once();
+    register_sqlite_vec();
 
     use spelunk_core::storage::memory::MemoryStore;
     let store = MemoryStore::open(std::path::Path::new(":memory:")).expect("in-memory MemoryStore");
@@ -1335,7 +1321,7 @@ fn memory_store_list_excludes_archived_by_default() {
     store
         .add_note("decision", "Active note", "body", &[], &[], None, None)
         .expect("add active note");
-    let archived_id = store
+    let (archived_id, _) = store
         .add_note("decision", "Archived note", "body", &[], &[], None, None)
         .expect("add to-be-archived note");
     store.archive(archived_id).expect("archive note");
@@ -1355,7 +1341,7 @@ fn memory_store_list_excludes_archived_by_default() {
 /// that field is populated exclusively by the CLI dep-pass, not by the store.
 #[test]
 fn memory_store_notes_have_no_source_project_by_default() {
-    register_sqlite_vec_once();
+    register_sqlite_vec();
 
     use spelunk_core::storage::memory::MemoryStore;
     let store = MemoryStore::open(std::path::Path::new(":memory:")).expect("in-memory MemoryStore");

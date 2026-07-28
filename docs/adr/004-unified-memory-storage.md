@@ -134,3 +134,20 @@ This change *reduces* surface: note text for `memory search` no longer needs to 
 
 - Ops: confirm no production/team deployment relies on the auto-discovered loopback server holding authoritative memory (it should not — team memory is the explicit-`server_url` tier).
 - Coordinate ordering with ADR-003: ADR-003's cross-project pass reads each linked project's `memory.db`. Once this ADR lands, "the project's memory store" is unambiguously `memory.db` for every project, which is exactly the assumption ADR-003 already encodes (`dep.db_path.with_file_name("memory.db")`). The two ADRs are mutually reinforcing; no conflict.
+
+## Amendment (2026-07-19): store-of-record under team sync, and the local server's sync-relay role
+
+Two later refinements clarify the original decision without reversing it. Both concern behaviour that applies only once a team is syncing memory through a shared server. Neither changes the single-machine, no-team steady state above: `memory.db` remains the one canonical store for a solo project.
+
+**1. Store-of-record semantics for a synced team live in the project's sync/reconciliation design, not here.** Decision §3 rule 2 frames an explicit `server_url` as "memory lives on the shared server." That holds as the store of record only under the `cloud_first` sync mode. Under the default `local_first` mode (`SyncMode`, `crates/spelunk-core/src/config/sync_mode.rs`) each member's `memory.db` stays the local source of truth and the shared server is a *converging replica* reconciled to over time, not an authority the client reads through. The precise store-of-record and conflict semantics for a synced team are defined by the project's sync/reconciliation design; this ADR fixes only the single-store, single-machine model and defers team-sync store-of-record to that design.
+
+**2. The local server may relay sync traffic, but is still never a memory store.** Decision §2 demotes the auto-discovered loopback server to inference-only. That framing is *extended*, not reversed: under `local_first` the local server may also carry the network legs of reconciliation (the write-outbox and pull-cursor exchange with a team server) on the CLI's behalf. It still holds no authoritative memory. `memory.db` remains exclusively CLI-owned, and the loopback server is never a memory store; relaying sync bytes on the CLI's behalf is not the same as storing memory.
+
+## Amendment (2026-07-23): `local_first` never falls back to `server_url` for inference
+
+The Implementation checklist's chosen option (§ "Decouple inference routing from memory-store selection", option (a)) states that `inference_url` is consulted with a fallback to `server_url`. That fallback was unconditional: `Config::resolve_inference_url()` returned `inference_url.or(server_url)` regardless of sync mode. Combined with the 2026-07-19 amendment above (an explicit `server_url` is store-of-record only under `cloud_first`; under `local_first` it is a converging replica), this left inference routing inconsistent with memory routing: a `local_first` project with a `server_url` pointed its embed requests at that `server_url` — a memory sync replica with no `/index/embed` route — producing 404s instead of ever reaching the local embedder.
+
+This does not change the decision above; it makes the inference-routing implementation match the store-of-record rule the 2026-07-19 amendment already established for memory:
+
+- `local_first` (and `offline`): `resolve_inference_url()` returns `inference_url` only. It never falls back to `server_url` — consistent with `server_url` being a sync replica, not an authority, in this mode. `Tier::effective_config()` populates `inference_url` from a fresh loopback probe for this case, independent of whatever `server_url` is configured (`capability::get_inference_tier`, distinct from the general-purpose `get_tier` used for capability/status reporting).
+- `cloud_first`: unchanged — `resolve_inference_url()` still falls back to `server_url`, matching that mode's store-of-record semantics (an explicit remote owns both memory and inference there).

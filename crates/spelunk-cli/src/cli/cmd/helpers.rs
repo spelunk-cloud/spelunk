@@ -95,3 +95,52 @@ pub(crate) fn spawn_detached() -> Result<()> {
         .context("spawning detached background process")?;
     Ok(())
 }
+
+/// `O_NOFOLLOW`, which `std` does not expose. Defined here to avoid pulling in
+/// the `libc` crate for a single constant. `0` on platforms without the flag.
+#[cfg(unix)]
+pub(crate) fn libc_o_nofollow() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        0x0000_0100
+    }
+    #[cfg(target_os = "linux")]
+    {
+        0o400_000
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
+}
+
+/// Open `path` `0600` for writing, truncating, refusing to follow a symlink at
+/// `path`.
+///
+/// These files live at fixed, predictable locations; on a shared host an
+/// attacker could pre-create a symlink there pointing at an arbitrary file the
+/// spelunk user can write, turning a routine open into an overwrite primitive.
+/// `O_NOFOLLOW` (Unix) makes the open fail instead of following such a link.
+pub(crate) fn open_private_file_for_write(path: &std::path::Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc_o_nofollow())
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))
+    }
+}

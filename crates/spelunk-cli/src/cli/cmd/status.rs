@@ -1,3 +1,4 @@
+use super::color::cprintln;
 use anyhow::{Context, Result};
 use clap::Args;
 
@@ -20,7 +21,7 @@ use crate::{
     capability::{self, Tier},
     config::Config,
     registry::{Registry, resolve_project_context},
-    storage::{Database, open_memory_backend},
+    storage::{Database, MemoryStore, open_memory_backend},
 };
 
 /// Stable JSON schema for `spelunk status --format json` (issue #269).
@@ -45,12 +46,23 @@ use crate::{
 /// - `memory_backend` — stable identifier for the active memory backend:
 ///   `"sqlite"`, `"git-notes"`, or `"remote"` (see issue #308)
 ///
-/// Additional fields (`tier`, `server_url`, `capabilities`, `embedder_state`,
+/// Additional fields (`tier`, `mode`, `sync_pending`, `sync_last_synced_at`,
+/// `server_url`, `capabilities`, `embedder_state`, `embedding_count`,
+/// `embedding_pending`, `embed_worker_alive`, `embed_tokens`,
 /// `drift_candidates`, `usage_7d`) are present for backward compatibility and
 /// richer tooling; treat them as unstable extensions.
+///
+/// `sync_pending`/`sync_last_synced_at` (ADR-037 P2) are `null` unless `mode`
+/// is `"local_first"`: the outbox pending count and the local relay's last
+/// successful push-ack/pull-apply time (ISO-8601 UTC), or `null` when nothing
+/// has synced yet.
 /// `embedder_state` mirrors the server's `/v1/health` readiness
 /// (`"loading"`/`"ready"`/`"unavailable"`/`"disabled"`); it is `null` when
 /// offline or when the reachable server pre-dates the readiness field.
+/// `embedding_pending` is the chunk count still awaiting an embedding;
+/// `embed_worker_alive` and `embed_tokens` describe the recorded embed
+/// worker's liveness and token-weighted progress and are `null` when no embed
+/// work is pending.
 pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
     let fmt = crate::utils::effective_format(&args.format);
 
@@ -85,6 +97,32 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
             };
         let usage_map: std::collections::HashMap<&str, i64> =
             usage.iter().map(|(c, n)| (c.as_str(), *n)).collect();
+
+        // ADR-037 P2, item 35: additive-only JSON extensions. `null` under any
+        // mode other than `local_first` (item 38: `cloud_first` has no local
+        // write queue; `offline` has no sync configuration).
+        //
+        // Poll-and-apply BEFORE reading the pending count, not after: a poll
+        // in this same call can apply push-acks/pulls that reduce (or, for a
+        // pull, increase) what's actually outstanding. Reading pending first
+        // would report the pre-poll count next to a same-instant
+        // `last_synced_at`, understating how current the two fields actually
+        // are together.
+        let (sync_pending, sync_last_synced_at): (Option<i64>, Option<String>) =
+            if cfg.resolve_mode() == spelunk_core::config::SyncMode::LocalFirst {
+                let last_synced_at =
+                    crate::cli::cmd::memory::outbox::poll_and_apply(&cfg, &mem_path)
+                        .await
+                        .and_then(|p| p.last_synced_at)
+                        .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
+                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                let pending = MemoryStore::open(&mem_path)
+                    .ok()
+                    .and_then(|s| s.pending_sync_count().ok());
+                (pending, last_synced_at)
+            } else {
+                (None, None)
+            };
 
         // has_semantic_search: true only when a Server tier is reachable and it
         // advertises the search.semantic capability.
@@ -123,6 +161,23 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
             Some(s) => serde_json::Value::String(s.as_str().to_string()),
         };
 
+        // Embed-state extensions: worker liveness is read from the recorded
+        // pid (never inferred from counts) and only meaningful while work is
+        // pending; token sums carry their own denominators.
+        let pending_chunks = stats.chunk_count - stats.embedding_count;
+        let (embed_worker_alive_json, embed_tokens_json) = if pending_chunks > 0 {
+            let alive = super::embed_worker::worker_liveness(&db_path)
+                == super::embed_worker::WorkerLiveness::Alive;
+            let tokens = db
+                .embed_token_stats()
+                .ok()
+                .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null))
+                .unwrap_or(serde_json::Value::Null);
+            (serde_json::json!(alive), tokens)
+        } else {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        };
+
         // Serialize languages as [{name, file_count}, ...]
         let languages_json: Vec<serde_json::Value> = languages
             .iter()
@@ -152,10 +207,16 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
                 "memory_backend": memory_backend_kind,
                 // ── Extensions (backward-compat, may change) ─────────────────
                 "tier": tier_str,
+                "mode": cfg.resolve_mode().as_str(),
+                "sync_pending": sync_pending,
+                "sync_last_synced_at": sync_last_synced_at,
                 "server_url": tier_url,
                 "capabilities": caps_json,
                 "embedder_state": embedder_state_json,
                 "embedding_count": stats.embedding_count,
+                "embedding_pending": pending_chunks,
+                "embed_worker_alive": embed_worker_alive_json,
+                "embed_tokens": embed_tokens_json,
                 "drift_candidates": drift,
                 "usage_7d": {
                     "search": usage_map.get("search").copied().unwrap_or(0),
@@ -209,9 +270,9 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
         } else {
             // Detailed view per project
             for p in &projects {
-                println!("\x1b[1m{}\x1b[0m", p.root_path.display());
+                cprintln!("\x1b[1m{}\x1b[0m", p.root_path.display());
                 if !p.root_path.exists() {
-                    println!("  \x1b[31m[root path missing from disk]\x1b[0m");
+                    cprintln!("  \x1b[31m[root path missing from disk]\x1b[0m");
                 }
                 println!("  DB: {}", p.db_path.display());
                 println!("  Registered: {}", format_age(p.registered_at));
@@ -225,7 +286,7 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
                             println!("  Last indexed: {}", format_age(ts));
                         }
                     }
-                    Err(_) => println!("  \x1b[2m(no index yet)\x1b[0m"),
+                    Err(_) => cprintln!("  \x1b[2m(no index yet)\x1b[0m"),
                 }
                 let deps = reg.get_deps(p.id)?;
                 if !deps.is_empty() {
@@ -272,21 +333,43 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
     };
 
     // ── Capability tier section ───────────────────────────────────────────────
-    print_tier_section(tier, &cfg, &mem_label);
+    print_tier_section(tier, &cfg, &mem_label, &mem_path_text).await;
 
     if let Some(p) = &resolved.project {
-        println!("Project: \x1b[1m{}\x1b[0m", p.root_path.display());
+        cprintln!("Project: \x1b[1m{}\x1b[0m", p.root_path.display());
     }
     println!("Index:      {}", db_path.display());
     println!("Files:      {}", s.file_count);
     println!("Chunks:     {}", s.chunk_count);
     println!("Embeddings: {}", s.embedding_count);
-    // Surface an in-progress (or interrupted) embed pass: when chunks outnumber
-    // embeddings there is embedding work left, e.g. a detached `--detach-embed`
-    // run still working through batches, or an interrupted run to resume. This
-    // is the completion check for a backgrounded embed.
-    if let Some(line) = embedding_progress_line(s.chunk_count, s.embedding_count) {
-        println!("{line}");
+    // Surface remaining embed work from what the process actually knows: the
+    // worker's recorded pid liveness (not a guess from two integers), chunk
+    // coverage, and the token-weighted work fraction. Coverage and progress
+    // are two measures in two units under two names; on a real repo they
+    // diverge by 2x and that divergence is the fact being reported.
+    if s.chunk_count > s.embedding_count {
+        let tokens = db.embed_token_stats().ok();
+        let worker = super::embed_worker::worker_liveness(&db_path);
+        let worker_alive = worker == super::embed_worker::WorkerLiveness::Alive;
+        let eta = match (&tokens, worker_alive) {
+            (Some(t), true) => super::embed_worker::worker_eta(&db_path, t.pending_tokens),
+            _ => None,
+        };
+        let embedder_unavailable = matches!(
+            tier.embedder_state(),
+            Some(capability::EmbedderState::Unavailable)
+        );
+        if let Some(line) = embedding_state_line(
+            worker_alive,
+            embedder_unavailable,
+            s.chunk_count,
+            s.embedding_count,
+            tokens.as_ref().map(|t| t.total_tokens).unwrap_or(0),
+            tokens.as_ref().map(|t| t.pending_tokens).unwrap_or(0),
+            eta,
+        ) {
+            cprintln!("{line}");
+        }
     }
     if let Some(ts) = s.last_indexed {
         println!("Last index: {}", format_age(ts));
@@ -307,7 +390,7 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
     // Drift signals: files that haven't changed while the project has evolved
     let drift = db.drift_candidates(30, 5).unwrap_or_default();
     if !drift.is_empty() {
-        println!("\n\x1b[33mDrift signals\x1b[0m  (unchanged while project evolved):");
+        cprintln!("\n\x1b[33mDrift signals\x1b[0m  (unchanged while project evolved):");
         println!("  {:<6}  {:<8}  File", "Days", "Callers");
         println!("  {}", "─".repeat(60));
         for d in &drift {
@@ -318,7 +401,7 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
             };
             println!("  {:<6}  {:<8}  {}", d.days_behind, callers, d.path);
         }
-        println!(
+        cprintln!(
             "  \x1b[2mRun `spelunk search \"<topic>\"` to check if these are still relevant.\x1b[0m"
         );
     }
@@ -346,18 +429,34 @@ pub async fn status(args: StatusArgs, cfg: Config) -> Result<()> {
 
 /// `mem_label` is the resolved memory line (ADR-067 D3): derived from the opened
 /// backend's `backend_kind()`, never inferred from the capability tier.
-fn print_tier_section(tier: &Tier, cfg: &Config, mem_label: &str) {
+/// `mem_path` is the project's `memory.db` path, threaded through to
+/// [`sync_mode_line`] for the ADR-037 P2 pending/last-synced extension.
+async fn print_tier_section(
+    tier: &Tier,
+    cfg: &Config,
+    mem_label: &str,
+    mem_path: &std::path::Path,
+) {
     match tier {
         Tier::Offline => {
             let server_hint = if cfg.server_url.is_some() {
-                "  [unreachable]"
+                match capability::explicit_probe_failure() {
+                    Some(capability::ConnFailure::Tls(cause)) => format!("  [tls: {cause}]"),
+                    _ => "  [unreachable]".to_string(),
+                }
             } else {
-                "  [set server_url to enable semantic search]"
+                "  [set server_url to enable semantic search]".to_string()
             };
-            println!("Capability tier:  \x1b[33mOffline\x1b[0m");
+            cprintln!("Capability tier:  \x1b[33mOffline\x1b[0m");
+            if let Some(line) = sync_mode_line(cfg, mem_path).await {
+                println!("{line}");
+            }
             println!("  search          ast-grep + text{server_hint}");
             println!("  memory          {mem_label}");
-            println!("  explore         unavailable  [set server_url to enable]");
+            println!(
+                "  explore         unavailable{}",
+                explore_offline_hint(cfg.server_url.is_some())
+            );
         }
         Tier::Server {
             url,
@@ -371,7 +470,10 @@ fn print_tier_section(tier: &Tier, cfg: &Config, mem_label: &str) {
             } else {
                 url.clone()
             };
-            println!("Capability tier:  \x1b[32mServer\x1b[0m  \x1b[2m({url_label})\x1b[0m");
+            cprintln!("Capability tier:  \x1b[32mServer\x1b[0m  \x1b[2m({url_label})\x1b[0m");
+            if let Some(line) = sync_mode_line(cfg, mem_path).await {
+                println!("{line}");
+            }
             let search_label = if caps.search_semantic {
                 "ast-grep + text + semantic"
             } else {
@@ -380,8 +482,12 @@ fn print_tier_section(tier: &Tier, cfg: &Config, mem_label: &str) {
             println!("  search          {search_label}");
             // Embedder readiness: explain *why* semantic search isn't in the
             // search line yet when the server is up but the model isn't ready.
-            if let Some(line) = embedder_status_line(embedder_state) {
-                println!("{line}");
+            // Log hints must point at the probed server: `spelunk server logs`
+            // reads the local daemon's logs, which are the wrong place when the
+            // failing embedder lives on an explicit remote server_url.
+            let remote_url = (!*auto_discovered).then_some(url.as_str());
+            if let Some(line) = embedder_status_line(embedder_state, remote_url) {
+                cprintln!("{line}");
             }
             println!("  memory          {mem_label}");
             let explore_label = if caps.explore {
@@ -393,6 +499,85 @@ fn print_tier_section(tier: &Tier, cfg: &Config, mem_label: &str) {
         }
     }
     println!();
+}
+
+/// The `mode` line for `spelunk status`: a neutral one-word sync-mode
+/// indicator. `None` on the solo default (no `server_url`, no explicit mode):
+/// there is no sync configuration to surface. No call to action: the background
+/// reconciler owns convergence, so status must not pre-teach a manual `spelunk
+/// sync` workflow.
+///
+/// ADR-037 P2: under `local_first`, this same line additionally carries a
+/// quiet pending-count / last-synced clause (item 31) — never a second,
+/// separate line. `cloud_first` and `offline` render the bare mode word only
+/// (items 37/38): `cloud_first` has no local write queue to report on, and
+/// `offline` has no sync configuration to poll.
+async fn sync_mode_line(cfg: &Config, mem_path: &std::path::Path) -> Option<String> {
+    if cfg.server_url.is_none() && cfg.mode.is_none() {
+        return None;
+    }
+    let mode = cfg.resolve_mode();
+    let mut line = format!("  {:<16}{}", "mode", mode.as_str());
+    if mode == spelunk_core::config::SyncMode::LocalFirst
+        && let Some(suffix) = sync_status_suffix(cfg, mem_path).await
+    {
+        line.push_str(&suffix);
+    }
+    Some(line)
+}
+
+/// The pending-count / last-synced clause appended to [`sync_mode_line`]
+/// under `local_first`. `None` when there is nothing worth reporting yet (no
+/// pending rows and no recorded sync ever) — a fresh project stays silent
+/// rather than printing a hollow "up to date".
+///
+/// Polls and applies the local relay's buffered state first (item 33: that
+/// state lives in the separate, longer-running `spelunk-server` process, so a
+/// fresh poll here is what makes "last synced" current on this invocation),
+/// and only then reads the pending count: a poll applied in this same call
+/// can itself change what's outstanding, so reading pending first would
+/// report the pre-poll count alongside a same-instant "last synced", making
+/// the two fields inconsistent with each other for this one invocation. The
+/// poll itself is best-effort: with no local relay reachable, `pending` still
+/// comes from the always-available local `pending_sync_count` and "last
+/// synced" is simply omitted.
+async fn sync_status_suffix(cfg: &Config, mem_path: &std::path::Path) -> Option<String> {
+    let store = MemoryStore::open(mem_path).ok()?;
+    let poll = crate::cli::cmd::memory::outbox::poll_and_apply(cfg, mem_path).await;
+    let pending = store.pending_sync_count().ok()?;
+    let last_synced_at = poll.as_ref().and_then(|p| p.last_synced_at);
+    // item 19: a relay-side failure (e.g. an expired-and-unrefreshable bearer)
+    // surfaces here rather than crashing or silently dropping.
+    let last_error = poll.and_then(|p| p.last_error);
+
+    if pending == 0 && last_synced_at.is_none() && last_error.is_none() {
+        return None;
+    }
+    let pending_clause = if pending > 0 {
+        format!("{pending} pending")
+    } else {
+        "up to date".to_string()
+    };
+    let mut clause = match last_synced_at {
+        Some(ts) => format!("{pending_clause}, last synced {}", format_age(ts)),
+        None => pending_clause,
+    };
+    if let Some(err) = last_error {
+        let truncated: String = err.chars().take(80).collect();
+        clause.push_str(&format!(", sync error: {truncated}"));
+    }
+    Some(format!("  \u{b7}  {clause}"))
+}
+
+/// Hint for the `explore` line when the tier is Offline. With a configured
+/// `server_url` the fix is never "set server_url" (it already is); the truthful
+/// hint is that the configured server could not be reached.
+fn explore_offline_hint(server_url_configured: bool) -> &'static str {
+    if server_url_configured {
+        "  [configured server unreachable]"
+    } else {
+        "  [set server_url to enable]"
+    }
 }
 
 /// Human-readable label for a resolved memory `backend_kind()` (ADR-067 D3).
@@ -410,20 +595,34 @@ fn memory_backend_label(kind: &str) -> &str {
 /// server-side readiness state, or `None` when there is nothing useful to show
 /// (an older server that never reported readiness). Pure so it can be unit
 /// tested without capturing stdout.
-fn embedder_status_line(state: &capability::EmbedderState) -> Option<String> {
+///
+/// `remote_url` is `Some` when the probed server came from an explicit
+/// `server_url` (not loopback auto-discovery). The failure-hint must then point
+/// at that server's own logs: `spelunk server logs` only reads the local
+/// daemon's log file, so with a healthy local daemon it shows clean logs for a
+/// failure that lives elsewhere.
+fn embedder_status_line(
+    state: &capability::EmbedderState,
+    remote_url: Option<&str>,
+) -> Option<String> {
     use capability::EmbedderState;
     let line = match state {
         EmbedderState::Loading => {
             "  embedder        \x1b[33mloading\x1b[0m  [model warming up — retry shortly]"
                 .to_string()
         }
-        EmbedderState::Unavailable => {
-            "  embedder        \x1b[31munavailable\x1b[0m  [model failed to load — see `spelunk server logs`]"
-                .to_string()
-        }
+        EmbedderState::Unavailable => match remote_url {
+            Some(url) => format!(
+                "  embedder        \x1b[31munavailable\x1b[0m  [model failed to load on team \
+                 server {url}; check that server's own logs]"
+            ),
+            None => "  embedder        \x1b[31munavailable\x1b[0m  [model failed to load; \
+                 see `spelunk server logs`]"
+                .to_string(),
+        },
         EmbedderState::Ready => "  embedder        ready".to_string(),
         EmbedderState::Disabled => {
-            "  embedder        disabled  [external embedding backend]".to_string()
+            "  embedder        disabled  [server built without a native embedder]".to_string()
         }
         // Older server without the readiness field: stay quiet rather than
         // print a confusing "unknown".
@@ -432,21 +631,82 @@ fn embedder_status_line(state: &capability::EmbedderState) -> Option<String> {
     Some(line)
 }
 
-/// Render the "embedding in progress" line for `spelunk status` when the index
-/// has more chunks than embeddings, i.e. an embed pass is still running (e.g. a
-/// detached `--detach-embed` subprocess) or was interrupted and can be resumed.
-/// Returns `None` when every chunk is embedded (or the index is empty), so a
-/// fully-embedded index prints nothing extra. Pure so it can be unit tested.
-fn embedding_progress_line(chunk_count: i64, embedding_count: i64) -> Option<String> {
+/// Integer percentage with an explicit denominator; `None` when the
+/// denominator is empty (the caller omits the clause rather than printing a
+/// made-up number).
+fn labelled_pct(done: i64, total: i64) -> Option<u64> {
+    (done.max(0) as u64)
+        .saturating_mul(100)
+        .checked_div(u64::try_from(total).ok().filter(|t| *t > 0)?)
+}
+
+/// `~54 min left` style rendering for the status ETA.
+fn humanize_eta(eta: std::time::Duration) -> String {
+    let secs = eta.as_secs();
+    if secs < 60 {
+        format!("~{secs}s left")
+    } else if secs < 3600 {
+        format!("~{} min left", secs.div_ceil(60))
+    } else {
+        format!("~{}h{:02}m left", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Render the embedding-state line for `spelunk status` when the index has
+/// more chunks than embeddings. Pure so the state matrix is unit testable.
+///
+/// The line reports what the process knows, never a guess:
+/// - a live recorded worker: `Embedding in progress`
+/// - no live worker but pending work: `Embedding incomplete` plus the resume
+///   command (or, when the embedder is unavailable, a pointer at the server
+///   logs instead, since resuming cannot help until the server is fixed)
+///
+/// Two measures, two units, two names: `searchable` is chunk coverage (what
+/// KNN can see), `of work done` is token-weighted progress (how much of the
+/// wait is behind you). They are supposed to diverge; a single unlabelled
+/// percentage serving both questions is the defect this replaces. On an index
+/// whose token counts are not backfilled (total 0) the work clause is omitted
+/// rather than fabricated.
+fn embedding_state_line(
+    worker_alive: bool,
+    embedder_unavailable: bool,
+    chunk_count: i64,
+    embedding_count: i64,
+    total_tokens: i64,
+    pending_tokens: i64,
+    eta: Option<std::time::Duration>,
+) -> Option<String> {
     if chunk_count <= 0 || embedding_count >= chunk_count {
         return None;
     }
-    let pending = chunk_count - embedding_count;
-    Some(format!(
-        "  \x1b[33mEmbedding in progress\x1b[0m  {embedding_count}/{chunk_count} embedded \
-         ({pending} pending) \x1b[2m(a background embed may be running; re-run \
-         `spelunk index` to resume if not)\x1b[0m"
-    ))
+    let coverage = labelled_pct(embedding_count, chunk_count).unwrap_or(0);
+    let searchable = format!("searchable {embedding_count}/{chunk_count} chunks ({coverage}%)");
+
+    let mut progress = match labelled_pct(
+        (total_tokens - pending_tokens).clamp(0, total_tokens),
+        total_tokens,
+    ) {
+        Some(work) => format!("{work}% of work done"),
+        None => "work remaining unknown (run `spelunk index --recount` to backfill token counts)"
+            .to_string(),
+    };
+    if worker_alive && let Some(eta) = eta {
+        progress = format!("{progress}, {}", humanize_eta(eta));
+    }
+
+    Some(if worker_alive {
+        format!("  \x1b[33mEmbedding in progress\x1b[0m   {searchable}  \u{00b7}  {progress}")
+    } else if embedder_unavailable {
+        format!(
+            "  \x1b[33mEmbedding incomplete\x1b[0m   {searchable}  \u{00b7}  {progress}; \
+             the embedder is unavailable, see `spelunk server logs`"
+        )
+    } else {
+        format!(
+            "  \x1b[33mEmbedding incomplete\x1b[0m   {searchable}  \u{00b7}  {progress}; \
+             resume with `spelunk index .`"
+        )
+    })
 }
 
 pub(crate) fn format_age(unix_ts: i64) -> String {
@@ -475,60 +735,611 @@ mod tests {
 
     #[test]
     fn embedder_line_loading_advises_warmup() {
-        let line = embedder_status_line(&EmbedderState::Loading).expect("loading renders a line");
+        let line =
+            embedder_status_line(&EmbedderState::Loading, None).expect("loading renders a line");
         assert!(line.contains("loading"));
         assert!(line.contains("warming up"));
     }
 
     #[test]
-    fn embedder_line_unavailable_points_at_logs() {
-        let line =
-            embedder_status_line(&EmbedderState::Unavailable).expect("unavailable renders a line");
+    fn embedder_line_unavailable_loopback_points_at_local_logs() {
+        // Loopback auto-discovery: the failing embedder IS the local daemon, so
+        // `spelunk server logs` is the right place to look.
+        let line = embedder_status_line(&EmbedderState::Unavailable, None)
+            .expect("unavailable renders a line");
         assert!(line.contains("unavailable"));
         assert!(line.contains("failed to load"));
         assert!(line.contains("spelunk server logs"));
     }
 
     #[test]
+    fn embedder_line_unavailable_remote_points_at_that_server_never_local_logs() {
+        // Explicit server_url: `spelunk server logs` reads the LOCAL daemon's
+        // log, which is clean when the failure lives on the team server. The
+        // hint must name the probed server instead.
+        let line = embedder_status_line(
+            &EmbedderState::Unavailable,
+            Some("https://team.example:7777"),
+        )
+        .expect("unavailable renders a line");
+        assert!(line.contains("unavailable"));
+        assert!(line.contains("https://team.example:7777"), "got: {line}");
+        assert!(
+            !line.contains("spelunk server logs"),
+            "must not point a remote failure at local logs: {line}"
+        );
+    }
+
+    #[test]
     fn embedder_line_ready_is_plain() {
-        let line = embedder_status_line(&EmbedderState::Ready).expect("ready renders a line");
+        let line = embedder_status_line(&EmbedderState::Ready, None).expect("ready renders a line");
         assert!(line.contains("ready"));
     }
 
     #[test]
-    fn embedder_line_disabled_notes_external_backend() {
-        let line = embedder_status_line(&EmbedderState::Disabled).expect("disabled renders a line");
+    fn embedder_line_disabled_notes_no_native_embedder() {
+        // `Disabled` now means only one thing: this server binary was built
+        // without the `embed-native` feature. The external-relocation
+        // backend this line used to describe no longer exists, so the line
+        // must not claim it does.
+        let line =
+            embedder_status_line(&EmbedderState::Disabled, None).expect("disabled renders a line");
         assert!(line.contains("disabled"));
-        assert!(line.contains("external"));
+        assert!(
+            !line.contains("external"),
+            "the external embedding backend concept no longer exists: {line}"
+        );
+        assert!(line.contains("native embedder"), "got: {line}");
     }
 
     #[test]
     fn embedder_line_unknown_renders_nothing() {
         // Older server without the readiness field: no line rather than a
         // confusing "unknown".
-        assert!(embedder_status_line(&EmbedderState::Unknown).is_none());
+        assert!(embedder_status_line(&EmbedderState::Unknown, None).is_none());
+        assert!(embedder_status_line(&EmbedderState::Unknown, Some("https://t:1")).is_none());
     }
 
-    // ── embedding_progress_line: detached / interrupted embed signal ────────────
+    // ── explore_offline_hint: truthful in both offline states ───────────────────
 
     #[test]
-    fn embedding_progress_shown_when_chunks_outnumber_embeddings() {
-        let line = embedding_progress_line(100, 40).expect("partial embed shows a line");
+    fn explore_hint_without_server_url_suggests_setting_it() {
+        assert!(explore_offline_hint(false).contains("set server_url"));
+    }
+
+    #[test]
+    fn explore_hint_with_server_url_says_unreachable_not_set_it() {
+        // server_url is already set; telling the operator to set it implies the
+        // config is missing and hides the real problem (server unreachable).
+        let hint = explore_offline_hint(true);
+        assert!(hint.contains("unreachable"), "got: {hint}");
+        assert!(!hint.contains("set server_url"), "got: {hint}");
+    }
+
+    // ── sync_mode_line: "local by design" vs "local because broken" ─────────────
+
+    fn clear_no_server_env() {
+        // SAFETY: serialised via #[serial] on every test that calls this, so no
+        // other test reads/writes this env var concurrently.
+        unsafe { std::env::remove_var("SPELUNK_NO_SERVER") };
+    }
+
+    /// A path that opens as an empty, ephemeral SQLite DB — fine for the mode
+    /// branches that never reach `sync_status_suffix` (cloud_first / offline
+    /// / no-config), which never actually query it.
+    fn unused_mem_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(":memory:")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(spelunk_no_server_env)]
+    async fn mode_line_absent_on_solo_default() {
+        clear_no_server_env();
+        // No server_url, no explicit mode: nothing to explain, output unchanged.
+        let cfg = crate::config::Config::default();
+        assert!(sync_mode_line(&cfg, &unused_mem_path()).await.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(spelunk_no_server_env, server_state_dir_env)]
+    async fn mode_line_local_first_is_neutral_mode_word_without_call_to_action() {
+        clear_no_server_env();
+        // Isolate from any real local spelunk-server daemon on this machine:
+        // the local_first branch polls the local relay via `SPELUNK_STATE_DIR`.
+        let prev_state_dir = std::env::var_os("SPELUNK_STATE_DIR");
+        let tmp_state = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("SPELUNK_STATE_DIR", tmp_state.path()) };
+
+        let cfg = crate::config::Config {
+            server_url: Some("https://team.example:7777".to_string()),
+            ..Default::default()
+        };
+        let line = sync_mode_line(&cfg, &unused_mem_path())
+            .await
+            .expect("server_url set renders a mode line");
+
+        // SAFETY: serialised via #[serial(server_state_dir_env)] against every
+        // other test touching this var.
+        unsafe {
+            match prev_state_dir {
+                Some(v) => std::env::set_var("SPELUNK_STATE_DIR", v),
+                None => std::env::remove_var("SPELUNK_STATE_DIR"),
+            }
+        }
+
+        assert!(line.contains("local_first"), "got: {line}");
+        // Neutral indicator only: no manual-sync imperative (the background
+        // reconciler owns convergence).
+        assert!(!line.contains("spelunk sync"), "got: {line}");
+        // item 32: a fresh, empty memory.db with nothing pending and nothing
+        // ever synced renders no suffix clause at all (no hollow "up to date").
+        assert!(!line.contains("pending"), "got: {line}");
+    }
+
+    // ── items 31/32: pending-count clause, purely from the local outbox ─────
+    // (no relay reachable — the clause must not depend on it for `pending`,
+    // only for `last synced`).
+
+    fn register_sqlite_vec_for_status_tests() {
+        use std::sync::OnceLock;
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            #[allow(clippy::missing_transmute_annotations)]
+            unsafe {
+                rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                    sqlite_vec::sqlite3_vec_init as *const (),
+                )));
+            }
+        });
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(spelunk_no_server_env, server_state_dir_env)]
+    async fn mode_line_local_first_shows_pending_count_from_local_outbox_alone() {
+        clear_no_server_env();
+        register_sqlite_vec_for_status_tests();
+        let prev_state_dir = std::env::var_os("SPELUNK_STATE_DIR");
+        // Empty state dir: no local relay reachable, so this must come from
+        // `pending_sync_count()` alone, never a poll.
+        let tmp_state = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("SPELUNK_STATE_DIR", tmp_state.path()) };
+
+        let tmp_mem = tempfile::TempDir::new().unwrap();
+        let mem_path = tmp_mem.path().join("memory.db");
+        {
+            let store = crate::storage::MemoryStore::open(&mem_path).unwrap();
+            store
+                .add_note("decision", "One", "b", &[], &[], None, None)
+                .unwrap();
+            store
+                .add_note("decision", "Two", "b", &[], &[], None, None)
+                .unwrap();
+        }
+
+        let cfg = crate::config::Config {
+            server_url: Some("https://team.example:7777".to_string()),
+            ..Default::default()
+        };
+        let line = sync_mode_line(&cfg, &mem_path).await.expect("mode line");
+
+        unsafe {
+            match prev_state_dir {
+                Some(v) => std::env::set_var("SPELUNK_STATE_DIR", v),
+                None => std::env::remove_var("SPELUNK_STATE_DIR"),
+            }
+        }
+
+        assert!(line.contains("local_first"), "got: {line}");
+        assert!(line.contains("2 pending"), "got: {line}");
+        // item 36: never a manual-action suggestion, even with pending rows.
+        assert!(!line.contains("spelunk sync"), "got: {line}");
+        // item 33: nothing has synced yet (no relay reachable) — no "last
+        // synced" clause fabricated.
+        assert!(!line.contains("last synced"), "got: {line}");
+    }
+
+    // ── item 33: "last synced" renders once the relay has actually synced ──
+
+    #[tokio::test]
+    #[serial_test::serial(spelunk_no_server_env, server_state_dir_env)]
+    async fn mode_line_shows_last_synced_after_a_real_relay_round_trip() {
+        clear_no_server_env();
+        register_sqlite_vec_for_status_tests();
+
+        let team_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/projects/proj/memory/batch"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(207).set_body_json(serde_json::json!({
+                    "created": 1, "skipped": 0, "failed": 0, "results": []
+                })),
+            )
+            .mount(&team_server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/projects/proj/memory/since"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "entries": [], "count": 0
+                })),
+            )
+            .mount(&team_server)
+            .await;
+
+        // A real spelunk-server, in its LOCAL relay role, on an ephemeral port.
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db =
+            spelunk_server::db::ServerDb::open(&db_dir.path().join("server.db"), 4, "test-model")
+                .unwrap();
+        let instance_id = db.get_or_create_instance_id().unwrap();
+        let state = spelunk_server::AppState {
+            db: std::sync::Arc::new(tokio::sync::Mutex::new(db)),
+            auth: std::sync::Arc::new(spelunk_server::auth::ApiKeyAuth::new(None)),
+            conflict_threshold: spelunk_server::default_conflict_threshold(),
+            embedder: spelunk_server::EmbedderSlot::disabled(),
+            embed_admission: spelunk_server::EmbedAdmission::new(
+                spelunk_server::EMBED_QUEUE_CAPACITY,
+                spelunk_server::EMBED_BUSY_RETRY_AFTER_SECS,
+            ),
+            llm: None,
+            max_tokens_ceiling: 8192,
+            rate_limiter: std::sync::Arc::new(spelunk_server::rate_limiter::RateLimiter::new(
+                1000, 60,
+            )),
+            instance_id,
+            started_by: None,
+            relay: spelunk_server::relay::RelayRegistry::new(),
+        };
+        let app = spelunk_server::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let prev_state_dir = std::env::var_os("SPELUNK_STATE_DIR");
+        let tmp_state = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("SPELUNK_STATE_DIR", tmp_state.path()) };
+        std::fs::write(
+            tmp_state.path().join("server.port"),
+            format!("{relay_port}\n"),
+        )
+        .unwrap();
+
+        let tmp_mem = tempfile::TempDir::new().unwrap();
+        let mem_path = tmp_mem.path().join("memory.db");
+        {
+            let store = crate::storage::MemoryStore::open(&mem_path).unwrap();
+            store
+                .add_note("decision", "One", "b", &[], &[], None, None)
+                .unwrap();
+        }
+
+        let cfg = crate::config::Config {
+            server_url: Some(team_server.uri()),
+            project_id: Some("proj".to_string()),
+            ..Default::default()
+        };
+
+        // Poll until the relay has actually synced (its own detached push
+        // task needs a moment), then read the status line.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut line = None;
+        while std::time::Instant::now() < deadline {
+            let candidate = sync_mode_line(&cfg, &mem_path).await;
+            if candidate
+                .as_deref()
+                .is_some_and(|l| l.contains("last synced"))
+            {
+                line = candidate;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+
+        unsafe {
+            match prev_state_dir {
+                Some(v) => std::env::set_var("SPELUNK_STATE_DIR", v),
+                None => std::env::remove_var("SPELUNK_STATE_DIR"),
+            }
+        }
+
+        let line = line.expect("status line must show 'last synced' after the relay syncs");
+        assert!(line.contains("local_first"), "got: {line}");
+        assert!(line.contains("last synced"), "got: {line}");
+        assert!(!line.contains("spelunk sync"), "got: {line}");
+    }
+
+    // ── pending must reflect the SAME call's own poll, not the pre-poll state ─
+    //
+    // `sync_status_suffix` polls (which can apply a push-ack) and reads
+    // `pending_sync_count` in the same call. Reading pending before the poll
+    // would report a stale, pre-apply count next to a same-instant "last
+    // synced" — e.g. "1 pending, last synced 0s ago" for a row that this very
+    // call just finished stamping. This pins the fix: the first call whose
+    // poll actually lands the ack must already show the post-apply count.
+
+    #[tokio::test]
+    #[serial_test::serial(spelunk_no_server_env, server_state_dir_env)]
+    async fn mode_line_pending_count_reflects_the_same_calls_own_poll_not_the_stale_pre_poll_state()
+    {
+        clear_no_server_env();
+        register_sqlite_vec_for_status_tests();
+
+        let team_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/projects/proj/memory/since"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "entries": [], "count": 0
+                })),
+            )
+            .mount(&team_server)
+            .await;
+
+        // A real spelunk-server, in its LOCAL relay role, on an ephemeral port.
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db =
+            spelunk_server::db::ServerDb::open(&db_dir.path().join("server.db"), 4, "test-model")
+                .unwrap();
+        let instance_id = db.get_or_create_instance_id().unwrap();
+        let state = spelunk_server::AppState {
+            db: std::sync::Arc::new(tokio::sync::Mutex::new(db)),
+            auth: std::sync::Arc::new(spelunk_server::auth::ApiKeyAuth::new(None)),
+            conflict_threshold: spelunk_server::default_conflict_threshold(),
+            embedder: spelunk_server::EmbedderSlot::disabled(),
+            embed_admission: spelunk_server::EmbedAdmission::new(
+                spelunk_server::EMBED_QUEUE_CAPACITY,
+                spelunk_server::EMBED_BUSY_RETRY_AFTER_SECS,
+            ),
+            llm: None,
+            max_tokens_ceiling: 8192,
+            rate_limiter: std::sync::Arc::new(spelunk_server::rate_limiter::RateLimiter::new(
+                1000, 60,
+            )),
+            instance_id,
+            started_by: None,
+            relay: spelunk_server::relay::RelayRegistry::new(),
+        };
+        let app = spelunk_server::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let prev_state_dir = std::env::var_os("SPELUNK_STATE_DIR");
+        let tmp_state = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("SPELUNK_STATE_DIR", tmp_state.path()) };
+        std::fs::write(
+            tmp_state.path().join("server.port"),
+            format!("{relay_port}\n"),
+        )
+        .unwrap();
+
+        let tmp_mem = tempfile::TempDir::new().unwrap();
+        let mem_path = tmp_mem.path().join("memory.db");
+        let uuid = {
+            let store = crate::storage::MemoryStore::open(&mem_path).unwrap();
+            store
+                .add_note("decision", "One", "b", &[], &[], None, None)
+                .unwrap();
+            store.rows_for_sync(false).unwrap()[0].uuid.clone()
+        };
+        // Mounted with this note's actual uuid so the push handler's ack
+        // round-trips onto the real row (matching `poll_and_apply`'s
+        // `note_id_for_uuid` lookup).
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/projects/proj/memory/batch"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(207).set_body_json(serde_json::json!({
+                    "created": 1, "skipped": 0, "failed": 0,
+                    "results": [{"status": "created", "external_id": uuid, "id": "cloud-1"}]
+                })),
+            )
+            .mount(&team_server)
+            .await;
+
+        let cfg = crate::config::Config {
+            server_url: Some(team_server.uri()),
+            project_id: Some("proj".to_string()),
+            ..Default::default()
+        };
+
+        // Poll `sync_mode_line` directly (not through a prior nudge) so the
+        // very first call that observes "last synced" is also the call whose
+        // own poll applied the ack: exactly the window the ordering bug lived
+        // in.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut line = None;
+        while std::time::Instant::now() < deadline {
+            let candidate = sync_mode_line(&cfg, &mem_path).await;
+            if candidate
+                .as_deref()
+                .is_some_and(|l| l.contains("last synced"))
+            {
+                line = candidate;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        unsafe {
+            match prev_state_dir {
+                Some(v) => std::env::set_var("SPELUNK_STATE_DIR", v),
+                None => std::env::remove_var("SPELUNK_STATE_DIR"),
+            }
+        }
+
+        let line = line.expect("status line must show 'last synced' after the relay syncs");
+        assert!(
+            line.contains("up to date"),
+            "the call that first reports 'last synced' must already reflect its OWN \
+             poll's apply, not a stale pre-poll pending count: got {line}"
+        );
+        assert!(
+            !line.contains("1 pending"),
+            "must never show a pending count for a row this same call just stamped: got {line}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(spelunk_no_server_env)]
+    async fn mode_line_cloud_first_is_neutral_mode_word() {
+        clear_no_server_env();
+        let cfg = crate::config::Config {
+            server_url: Some("https://team.example:7777".to_string()),
+            mode: Some(crate::config::SyncMode::CloudFirst),
+            ..Default::default()
+        };
+        let line = sync_mode_line(&cfg, &unused_mem_path())
+            .await
+            .expect("mode line");
+        assert!(line.contains("cloud_first"), "got: {line}");
+        // item 38: cloud_first has no local write queue to report on.
+        assert!(!line.contains("pending"), "got: {line}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(spelunk_no_server_env)]
+    async fn mode_line_explicit_offline_shown_even_without_server_url() {
+        clear_no_server_env();
+        // An explicit mode is sync configuration worth surfacing on its own.
+        let cfg = crate::config::Config {
+            mode: Some(crate::config::SyncMode::Offline),
+            ..Default::default()
+        };
+        let line = sync_mode_line(&cfg, &unused_mem_path())
+            .await
+            .expect("explicit mode renders a line");
+        assert!(line.contains("offline"), "got: {line}");
+        // item 37: offline has no sync configuration to poll.
+        assert!(!line.contains("pending"), "got: {line}");
+    }
+
+    // ── embedding_state_line: what status knows about its own worker (no guessing) ──
+
+    /// Numbers mirroring the recorded field repro: 42% of chunks searchable
+    /// while only 21% of the token-weighted work is done.
+    fn skewed_line(worker_alive: bool, embedder_unavailable: bool) -> Option<String> {
+        embedding_state_line(
+            worker_alive,
+            embedder_unavailable,
+            27_734,
+            11_813,
+            10_000_000,
+            7_900_000,
+            None,
+        )
+    }
+
+    #[test]
+    fn live_worker_reports_in_progress_with_both_labelled_measures() {
+        let line = skewed_line(true, false).expect("pending work renders a line");
         assert!(line.contains("Embedding in progress"));
-        assert!(line.contains("40/100"));
-        assert!(line.contains("60 pending"));
+        assert!(
+            line.contains("searchable 11813/27734 chunks (42%)"),
+            "coverage stays chunk-shaped and labelled: {line}"
+        );
+        assert!(
+            line.contains("21% of work done"),
+            "progress is token-weighted and labelled: {line}"
+        );
+        assert!(
+            !line.contains("may be running"),
+            "the hedging parenthetical is deleted, not reworded: {line}"
+        );
+        assert!(
+            !line.contains("resume"),
+            "a live worker needs no resume advice: {line}"
+        );
     }
 
     #[test]
-    fn embedding_progress_hidden_when_fully_embedded() {
-        assert!(embedding_progress_line(100, 100).is_none());
+    fn no_worker_with_pending_work_reports_incomplete_and_the_resume_command() {
+        let line = skewed_line(false, false).expect("pending work renders a line");
+        assert!(
+            line.contains("Embedding incomplete"),
+            "a dead worker is not 'in progress': {line}"
+        );
+        assert!(!line.contains("Embedding in progress"));
+        assert!(
+            line.contains("spelunk index ."),
+            "must name the resume command: {line}"
+        );
+        assert!(!line.contains("may be running"));
+    }
+
+    #[test]
+    fn unavailable_embedder_points_at_server_logs_instead_of_resume() {
+        let line = skewed_line(false, true).expect("pending work renders a line");
+        assert!(line.contains("Embedding incomplete"));
+        assert!(line.contains("unavailable"), "must say so: {line}");
+        assert!(
+            line.contains("spelunk server logs"),
+            "must point at the server logs: {line}"
+        );
+        assert!(
+            !line.contains("resume with"),
+            "resuming cannot help while the embedder is unavailable: {line}"
+        );
+    }
+
+    #[test]
+    fn coverage_and_progress_percentages_diverge_and_are_never_bare() {
+        // The two measures answer different questions and must be rendered
+        // under their own names; the field repro diverges 2x.
+        let line = skewed_line(true, false).unwrap();
+        assert!(line.contains("(42%)") && line.contains("21%"));
+        assert!(line.contains("searchable") && line.contains("of work done"));
+    }
+
+    #[test]
+    fn live_worker_line_carries_the_measured_eta_when_available() {
+        let line = embedding_state_line(
+            true,
+            false,
+            27_734,
+            11_813,
+            10_000_000,
+            7_900_000,
+            Some(std::time::Duration::from_secs(54 * 60)),
+        )
+        .unwrap();
+        assert!(line.contains("~54 min left"), "got: {line}");
+    }
+
+    #[test]
+    fn pre_backfill_index_omits_the_work_clause_instead_of_fabricating_it() {
+        // total_tokens == 0: no denominator to weight work by, so the clause
+        // is omitted (with the backfill hint), never rendered as a fake 0/100%.
+        let line = embedding_state_line(false, false, 100, 40, 0, 0, None).unwrap();
+        assert!(line.contains("searchable 40/100 chunks (40%)"));
+        assert!(!line.contains("% of work done"));
+        assert!(line.contains("--recount"), "hint at the backfill: {line}");
+    }
+
+    #[test]
+    fn embedding_state_hidden_when_fully_embedded() {
+        assert!(embedding_state_line(true, false, 100, 100, 10, 0, None).is_none());
         // Defensive: never render a negative pending count.
-        assert!(embedding_progress_line(100, 120).is_none());
+        assert!(embedding_state_line(true, false, 100, 120, 10, 0, None).is_none());
     }
 
     #[test]
-    fn embedding_progress_hidden_for_empty_index() {
-        assert!(embedding_progress_line(0, 0).is_none());
+    fn embedding_state_hidden_for_empty_index() {
+        assert!(embedding_state_line(false, false, 0, 0, 0, 0, None).is_none());
+    }
+
+    // ── humanize_eta ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn humanize_eta_scales_units() {
+        use std::time::Duration;
+        assert_eq!(humanize_eta(Duration::from_secs(30)), "~30s left");
+        assert_eq!(humanize_eta(Duration::from_secs(54 * 60)), "~54 min left");
+        assert_eq!(humanize_eta(Duration::from_secs(3_300)), "~55 min left");
+        assert_eq!(humanize_eta(Duration::from_secs(6_000)), "~1h40m left");
     }
 
     // ── memory_backend_label: resolved-backend memory line (ADR-067 D3) ─────────

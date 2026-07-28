@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use super::super::color::{color_enabled, cprintln};
 use super::super::status::format_age;
 use super::MemoryShowArgs;
 use crate::{config::Config, storage::open_memory_backend};
@@ -10,14 +11,16 @@ pub(super) async fn memory_show(
     cfg: &Config,
     backend_override: Option<&str>,
 ) -> Result<()> {
+    super::outbox::poll_and_apply(cfg, mem_path).await;
+
     let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     match backend.get(args.id).await? {
         None => anyhow::bail!("No memory entry with id {}.", args.id),
         Some(n) => match crate::utils::effective_format(&args.format) {
             "json" => println!("{}", serde_json::to_string_pretty(&n)?),
             _ => {
-                println!("\x1b[1m#{} [{}] {}\x1b[0m", n.id, n.kind, n.title);
-                println!("\x1b[2m{}\x1b[0m", format_age(n.created_at));
+                cprintln!("\x1b[1m#{} [{}] {}\x1b[0m", n.id, n.kind, n.title);
+                cprintln!("\x1b[2m{}\x1b[0m", format_age(n.created_at));
                 let effective_valid_at = n.valid_at.unwrap_or(n.created_at);
                 if n.valid_at.is_some() || effective_valid_at != n.created_at {
                     println!("valid_at:   {}", format_age(effective_valid_at));
@@ -35,7 +38,10 @@ pub(super) async fn memory_show(
                 }
                 if let Some(ref sha) = n.source_ref {
                     let short = &sha[..sha.len().min(8)];
-                    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                    // Two genuinely different strings (not just colored vs.
+                    // plain), so this branches on the centralized color
+                    // decision directly instead of going through `cprintln!`.
+                    if color_enabled() {
                         println!(
                             "source:  \x1b[36mgit show {sha}\x1b[0m  \x1b[2m(SHA: {short})\x1b[0m"
                         );
@@ -49,7 +55,7 @@ pub(super) async fn memory_show(
                 let (outgoing, incoming) = backend.get_edges(n.id).await?;
                 if !outgoing.is_empty() || !incoming.is_empty() {
                     println!();
-                    println!("\x1b[2m── relationships ──\x1b[0m");
+                    cprintln!("\x1b[2m── relationships ──\x1b[0m");
                     for e in &outgoing {
                         let label = match e.kind.as_str() {
                             "supersedes" => "\x1b[33m→ supersedes\x1b[0m",
@@ -62,7 +68,7 @@ pub(super) async fn memory_show(
                             .await?
                             .map(|n| n.title)
                             .unwrap_or_else(|| "(deleted)".to_string());
-                        println!("  {label}  #{} {target_title}", e.to_id);
+                        cprintln!("  {label}  #{} {target_title}", e.to_id);
                     }
                     for e in &incoming {
                         let label = match e.kind.as_str() {
@@ -76,7 +82,7 @@ pub(super) async fn memory_show(
                             .await?
                             .map(|n| n.title)
                             .unwrap_or_else(|| "(deleted)".to_string());
-                        println!("  {label}  #{} {src_title}", e.from_id);
+                        cprintln!("  {label}  #{} {src_title}", e.from_id);
                     }
                 }
             }

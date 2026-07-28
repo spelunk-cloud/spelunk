@@ -6,13 +6,26 @@ on:
     - cron: "0 9 * * 1"
   workflow_dispatch:
 
+# Deny by default; the job below only checks out and uploads its own crash
+# artifacts on failure, neither of which needs write access to the repo.
+permissions: {}
+
 jobs:
   fuzz-parser:
     name: cargo-fuzz fuzz_parser
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+
+      # The fuzz targets link spelunk-core, which pulls keyring's
+      # sync-secret-service backend (libdbus-sys); without this its build script
+      # fails when pkg-config can't find dbus-1. Every Linux job in ci.yml
+      # installs the same package for this reason.
+      - name: Install libdbus (keyring sync-secret-service backend)
+        run: sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Install Rust nightly
         run: |

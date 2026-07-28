@@ -186,7 +186,7 @@ Backward-compatibility rules, uniform across all three surfaces:
   consumer exists today; D1 only fixes the existing manual `--backend git-notes`
   read/write and the write-through append, and D2 only adds a field.
 - **No new identity minting policy.** How and when `remote_id` is assigned on
-  sync is already defined by migration 020 / ADR-037 and is unchanged. This ADR
+  sync is already defined by migration 020 and the project's sync/reconciliation design, and is unchanged. This ADR
   only carries the existing column onto the distributed formats.
 - **No semantic-search or graph capability** is added to `GitNotesBackend`; its
   unsupported methods stay unsupported.

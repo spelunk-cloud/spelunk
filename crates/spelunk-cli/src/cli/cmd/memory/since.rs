@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use super::super::color::cprintln;
 use super::MemorySinceArgs;
 use crate::{capability, config::Config};
 
@@ -47,7 +48,8 @@ pub(super) async fn memory_since(
         let mut req = client
             .get(&url)
             .query(&[("t", args.since.to_string()), ("limit", limit.to_string())]);
-        if let Some(key) = cfg.server_key.as_deref() {
+        let bearer = cfg.bearer_for(base_url)?;
+        if let Some(key) = bearer.as_deref() {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
         let notes: Vec<NoteResponse> = req
@@ -123,19 +125,19 @@ fn print_notes(notes: &[NoteResponse], format: &str) {
                 } else {
                     ""
                 };
-                println!(
+                cprintln!(
                     "\x1b[1m#{id}\x1b[0m  \x1b[33m[{kind}]\x1b[0m  {title}{archived}{dist}",
                     id = n.id,
                     kind = n.kind,
                     title = n.title,
                     archived = archived_badge,
                 );
-                println!(
+                cprintln!(
                     "     \x1b[2m{}\x1b[0m",
                     super::super::status::format_age(n.created_at)
                 );
                 if let Some(sup) = n.superseded_by {
-                    println!("     \x1b[2msuperseded by #{sup}\x1b[0m");
+                    cprintln!("     \x1b[2msuperseded by #{sup}\x1b[0m");
                 }
                 if !n.tags.is_empty() {
                     println!("     tags: {}", n.tags.join(", "));
@@ -145,10 +147,10 @@ fn print_notes(notes: &[NoteResponse], format: &str) {
                 }
                 let preview: Vec<&str> = n.body.lines().take(2).collect();
                 for line in &preview {
-                    println!("     \x1b[2m{line}\x1b[0m");
+                    cprintln!("     \x1b[2m{line}\x1b[0m");
                 }
                 if n.body.lines().count() > 2 {
-                    println!("     \x1b[2m…\x1b[0m");
+                    cprintln!("     \x1b[2m…\x1b[0m");
                 }
                 println!();
             }

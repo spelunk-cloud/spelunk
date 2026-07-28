@@ -10,13 +10,16 @@
 //!
 //! ## State directory
 //!
-//! All runtime state lives under `~/.local/state/spelunk/`:
+//! All runtime state lives under `~/.local/state/spelunk/` (or
+//! `SPELUNK_STATE_DIR` when set; see `capability::spelunk_state_dir`, the
+//! single resolver every reader and writer of this directory shares):
 //! - `server.pid`  — PID of the running daemon process
-//! - `server.port` — TCP port the daemon is listening on (read by `capability.rs`)
+//! - `server.port`: TCP port the daemon is listening on (read by `capability/probe.rs`)
 //! - `server.log`  — stdout + stderr of the daemon process
 //!
-//! The port file is read by `capability.rs` for loopback auto-discovery
-//! (spelunk#316).  The writer here **must** use the same path.
+//! The port file is read by `capability/probe.rs` for loopback auto-discovery
+//! (spelunk#316).  The writer here **must** use the same path, enforced by
+//! both going through the shared resolver rather than each defining their own.
 //!
 //! ## Spawned-binary resolution (PATH vs. sibling/absolute)
 //!
@@ -42,20 +45,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::color::cprintln;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
-// ── State dir helpers ─────────────────────────────────────────────────────────
+use crate::capability::spelunk_state_dir;
 
-/// `~/.local/state/spelunk/` on all platforms.
-///
-/// Mirrors `spelunk_state_dir()` in `capability.rs` — both reader and writer
-/// must use the same path.
-pub fn spelunk_state_dir() -> Result<PathBuf> {
-    dirs::home_dir()
-        .map(|h| h.join(".local").join("state").join("spelunk"))
-        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
-}
+// ── State dir helpers ─────────────────────────────────────────────────────────
 
 fn pid_path(state_dir: &Path) -> PathBuf {
     state_dir.join("server.pid")
@@ -70,7 +66,7 @@ fn log_path(state_dir: &Path) -> PathBuf {
 /// Create `dir` (and parents) with `0700` permissions on Unix so only the
 /// owner can read the PID/port/log files inside it. A no-op permission
 /// tightening on platforms without Unix perms.
-fn create_state_dir(dir: &Path) -> Result<()> {
+pub(super) fn create_state_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating state dir {}", dir.display()))?;
     #[cfg(unix)]
@@ -82,63 +78,12 @@ fn create_state_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Open `path` for a full-content (truncating) write, refusing to follow a
-/// symlink and creating the file `0600` (owner-only) on Unix.
-///
-/// State files (`server.pid`, `server.port`) live in a fixed, predictable
-/// location (`~/.local/state/spelunk/`); on a shared host an attacker could
-/// pre-create a symlink there pointing at an arbitrary file the spelunk user
-/// can write, turning a routine `server start` into an overwrite primitive.
-/// `O_NOFOLLOW` (Unix) makes the open fail instead of following such a link.
-fn open_state_file_for_write(path: &Path) -> Result<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc_o_nofollow())
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))
-    }
-}
-
-/// `O_NOFOLLOW` — not exposed by `std`, so defined locally to avoid pulling
-/// in the `libc` crate for a single constant. Value is stable across Linux
-/// and macOS (both define it as `0o400000`, i.e. `0x0100`... — actual
-/// per-platform values below).
-#[cfg(unix)]
-fn libc_o_nofollow() -> i32 {
-    #[cfg(target_os = "macos")]
-    {
-        0x0000_0100 // O_NOFOLLOW on macOS/BSD
-    }
-    #[cfg(target_os = "linux")]
-    {
-        0o400_000 // O_NOFOLLOW on Linux
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        0
-    }
-}
-
 /// Write `contents` to a state file, creating it `0600` and refusing to
-/// follow an existing symlink at `path` (see [`open_state_file_for_write`]).
-fn write_state_file(path: &Path, contents: &str) -> Result<()> {
+/// follow an existing symlink at `path` (see
+/// [`super::helpers::open_private_file_for_write`]).
+pub(super) fn write_state_file(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
-    let mut f = open_state_file_for_write(path)?;
+    let mut f = super::helpers::open_private_file_for_write(path)?;
     f.write_all(contents.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
@@ -154,7 +99,7 @@ fn open_log_file_for_append(path: &Path) -> Result<std::fs::File> {
             .create(true)
             .append(true)
             .mode(0o600)
-            .custom_flags(libc_o_nofollow())
+            .custom_flags(super::helpers::libc_o_nofollow())
             .open(path)
             .with_context(|| format!("opening {}", path.display()))
     }
@@ -183,7 +128,7 @@ fn read_port(state_dir: &Path) -> Option<u16> {
 }
 
 /// Return `true` when `pid` names a currently-running process.
-fn pid_is_alive(pid: u32) -> bool {
+pub(super) fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // kill(pid, 0) checks existence without sending a signal.
@@ -477,6 +422,21 @@ pub async fn server(args: ServerArgs) -> Result<()> {
 }
 
 // ── Public bootstrap API ──────────────────────────────────────────────────────
+
+/// Probe for an already-running local spelunk-server daemon (the one
+/// `spelunk server start`/[`ensure_server_running`] manages), without
+/// starting one. Returns its port if `/v1/health` responds.
+///
+/// This is the non-starting half of ADR-037 P2's D6 auto-start gate: a
+/// `local_first` write nudges the reconciler only if this returns `Some`, or
+/// (when interactive) after first calling [`ensure_server_running`] itself —
+/// this function never spawns anything on its own.
+pub(crate) async fn probe_local_relay_port() -> Option<u16> {
+    let state_dir = spelunk_state_dir().ok()?;
+    let port = read_port(&state_dir)?;
+    probe_health(port).await?;
+    Some(port)
+}
 
 /// Ensure a local spelunk-server is running.
 ///
@@ -944,7 +904,7 @@ async fn cmd_status() -> Result<()> {
 
     match (pid, port) {
         (Some(pid), Some(port)) if pid_is_alive(pid) => {
-            println!("spelunk-server  \x1b[32mrunning\x1b[0m");
+            cprintln!("spelunk-server  \x1b[32mrunning\x1b[0m");
             println!("  PID:   {pid}");
             println!("  Port:  {port}");
             println!("  Log:   {}", log_path(&state_dir).display());
@@ -961,20 +921,20 @@ async fn cmd_status() -> Result<()> {
                     }
                 }
                 None => {
-                    println!("  URL:   http://127.0.0.1:{port}  \x1b[31m(unreachable)\x1b[0m");
+                    cprintln!("  URL:   http://127.0.0.1:{port}  \x1b[31m(unreachable)\x1b[0m");
                 }
             }
         }
         (Some(pid), _) if pid_is_alive(pid) => {
-            println!("spelunk-server  \x1b[33mrunning\x1b[0m (port unknown)");
+            cprintln!("spelunk-server  \x1b[33mrunning\x1b[0m (port unknown)");
             println!("  PID: {pid}");
         }
         (Some(pid), _) => {
-            println!("spelunk-server  \x1b[31mstopped\x1b[0m (stale pid={pid})");
+            cprintln!("spelunk-server  \x1b[31mstopped\x1b[0m (stale pid={pid})");
             println!("  Run `spelunk server start` to start.");
         }
         (None, _) => {
-            println!("spelunk-server  \x1b[31mnot started\x1b[0m");
+            cprintln!("spelunk-server  \x1b[31mnot started\x1b[0m");
             println!("  Run `spelunk server start` to start.");
         }
     }
@@ -1044,6 +1004,7 @@ mod tests {
     // ── spelunk_state_dir ────────────────────────────────────────────────────
 
     #[test]
+    #[serial(server_state_dir_env)]
     fn state_dir_contains_spelunk() {
         let dir = spelunk_state_dir().expect("state dir");
         assert!(
@@ -1130,10 +1091,13 @@ mod tests {
         }
     }
 
-    // NOTE: both `which_spelunk_server_*` tests mutate the process-global `PATH`.
-    // Cargo runs unit tests multi-threaded by default, so they are pinned to the
-    // same `#[serial(path_env)]` group to keep them from racing each other (and
-    // any future PATH-touching test in this crate).
+    // NOTE: both `which_spelunk_server_*` tests mutate the process-global `PATH`,
+    // including setting it to "" entirely. Cargo runs unit tests multi-threaded
+    // by default, so they are pinned to the `path_env` serial group, along with
+    // every test that spawns a `DummyProc::graceful()`/`ignores_sigterm()`
+    // subprocess: those resolve the bare command name "sleep" via PATH, so an
+    // empty PATH from a concurrently-running sibling makes the spawn itself
+    // fail with ENOENT, not just the assertion under test.
 
     #[test]
     #[serial(path_env)]
@@ -1295,6 +1259,73 @@ mod tests {
         );
     }
 
+    // ── probe_local_relay_port: non-starting local-daemon detection (D6) ─────
+
+    /// Restores `SPELUNK_STATE_DIR` on drop, so a panic mid-test can't leak a
+    /// mutated env var into other tests. Mirrors `PathGuard` above.
+    struct StateDirGuard(Option<std::ffi::OsString>);
+    impl StateDirGuard {
+        fn set(dir: &Path) -> Self {
+            let prev = std::env::var_os("SPELUNK_STATE_DIR");
+            unsafe { std::env::set_var("SPELUNK_STATE_DIR", dir) };
+            Self(prev)
+        }
+    }
+    impl Drop for StateDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: `#[serial(server_state_dir_env)]` on every test using
+            // this guard serialises against all others touching the var.
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("SPELUNK_STATE_DIR", v),
+                    None => std::env::remove_var("SPELUNK_STATE_DIR"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial(server_state_dir_env)]
+    async fn probe_local_relay_port_none_when_no_state_dir_at_all() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = StateDirGuard::set(&tmp.path().join("nonexistent"));
+        // No port file written at all: must return None without any network call.
+        assert_eq!(probe_local_relay_port().await, None);
+    }
+
+    #[tokio::test]
+    #[serial(server_state_dir_env)]
+    async fn probe_local_relay_port_none_when_port_file_present_but_unhealthy() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = StateDirGuard::set(tmp.path());
+        // A stale port file (nothing listening) must not be reported as running.
+        std::fs::write(port_path(tmp.path()), b"19999\n").unwrap();
+        assert_eq!(probe_local_relay_port().await, None);
+    }
+
+    #[tokio::test]
+    #[serial(server_state_dir_env)]
+    async fn probe_local_relay_port_some_when_health_responds() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"instance_id": "x"})),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let _guard = StateDirGuard::set(tmp.path());
+        let port = server.address().port();
+        std::fs::write(port_path(tmp.path()), format!("{port}\n")).unwrap();
+
+        assert_eq!(probe_local_relay_port().await, Some(port));
+    }
+
     // ── classify_running_server (PID-reuse + hung-server handling) ───────────
 
     /// A PID with no recorded port and no matching process command classifies
@@ -1391,13 +1422,36 @@ mod tests {
 
     // ── start lock (single-instance guard) ───────────────────────────────────
 
+    /// Polls `acquire_start_lock` until it succeeds or `timeout` elapses,
+    /// returning the last `Result`. `cargo test` compiles every `#[cfg(test)]`
+    /// module in the crate into one binary, so a `fork()` in an unrelated,
+    /// untagged test elsewhere in that binary can transiently duplicate this
+    /// process's fd table (including an already-released lock fd) and delay
+    /// when `flock`'s refcount actually reaches zero. That window is bounded
+    /// (milliseconds), so a short bounded retry reflects the lock's real
+    /// contract without requiring crate-wide serialization.
+    #[cfg(unix)]
+    fn retry_acquire_start_lock(state_dir: &Path, timeout: Duration) -> Result<StartLock> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match acquire_start_lock(state_dir) {
+                Ok(lock) => return Ok(lock),
+                Err(e) if std::time::Instant::now() >= deadline => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
     /// A second `acquire_start_lock` on the same state dir must fail while the
     /// first guard is still held (serialises concurrent `server start`).
     ///
     /// `#[serial(server_start_lock)]`: this test asserts on `flock` release
     /// timing, which a concurrent `fork()+exec()` in another test can delay (a
     /// forked child transiently inherits the lock fd until it execs). Grouped
-    /// with the process-spawning tests below so they never overlap.
+    /// with the process-spawning tests below so they never overlap each
+    /// other, though untagged subprocess-spawning tests elsewhere in the
+    /// crate's single test binary can still race this one; see
+    /// `retry_acquire_start_lock`.
     #[cfg(unix)]
     #[test]
     #[serial(server_start_lock)]
@@ -1409,8 +1463,26 @@ mod tests {
             "second lock must fail while the first is held"
         );
         drop(first);
-        // Released — a fresh acquire now succeeds.
-        assert!(acquire_start_lock(tmp.path()).is_ok(), "lock frees on drop");
+        // Released, but tolerate the bounded fork-fd race documented above
+        // instead of asserting success on the very first attempt.
+        assert!(
+            retry_acquire_start_lock(tmp.path(), Duration::from_millis(500)).is_ok(),
+            "lock frees on drop"
+        );
+    }
+
+    /// `retry_acquire_start_lock` must still report failure when the lock
+    /// genuinely never frees, not silently pass once the timeout elapses.
+    #[cfg(unix)]
+    #[test]
+    #[serial(server_start_lock)]
+    fn retry_acquire_start_lock_fails_when_lock_never_frees() {
+        let tmp = TempDir::new().unwrap();
+        let _held = acquire_start_lock(tmp.path()).expect("first lock acquires");
+        assert!(
+            retry_acquire_start_lock(tmp.path(), Duration::from_millis(50)).is_err(),
+            "must fail when the lock genuinely never frees within the timeout"
+        );
     }
 
     // ── state file / dir permissions (unix-gated) ───────────────────────────
@@ -1664,7 +1736,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial(server_start_lock)]
+    #[serial(server_start_lock, path_env)]
     fn process_matches_server_false_for_unrelated_process() {
         let proc = DummyProc::graceful();
         assert!(
@@ -1699,7 +1771,7 @@ mod tests {
     /// happen.
     #[cfg(unix)]
     #[tokio::test]
-    #[serial(server_start_lock)]
+    #[serial(server_start_lock, path_env)]
     async fn wait_for_exit_false_for_live_process() {
         let proc = DummyProc::graceful();
         assert!(
@@ -1712,7 +1784,7 @@ mod tests {
     /// reported stopped once the PID is confirmed gone.
     #[cfg(unix)]
     #[tokio::test]
-    #[serial(server_start_lock)]
+    #[serial(server_start_lock, path_env)]
     async fn terminate_and_wait_stops_graceful_process() {
         let proc = DummyProc::graceful();
         assert!(pid_is_alive(proc.pid));
@@ -1726,7 +1798,7 @@ mod tests {
     /// falls back to for a wedged daemon.
     #[cfg(unix)]
     #[tokio::test]
-    #[serial(server_start_lock)]
+    #[serial(server_start_lock, path_env)]
     async fn force_kill_reaps_sigterm_ignoring_process() {
         let proc = DummyProc::ignores_sigterm();
         assert!(pid_is_alive(proc.pid));
@@ -1750,7 +1822,7 @@ mod tests {
     /// behaviour the fix is about — previously only exercised by hand.
     #[cfg(unix)]
     #[tokio::test]
-    #[serial(server_start_lock)]
+    #[serial(server_start_lock, path_env)]
     async fn terminate_and_wait_escalates_when_sigterm_ignored() {
         let proc = DummyProc::ignores_sigterm();
         assert!(pid_is_alive(proc.pid));

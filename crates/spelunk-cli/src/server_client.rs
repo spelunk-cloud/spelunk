@@ -109,6 +109,13 @@ pub struct ServerInferenceClient {
     client: reqwest::Client,
     base_url: String,
     project_id: String,
+    /// `true` when `base_url` came from an explicitly configured team
+    /// `server_url` rather than loopback auto-discovery (which populates
+    /// `inference_url` while leaving `server_url` unset, ADR-004). An
+    /// inference error against an explicit remote must name `base_url`
+    /// instead of pointing at `spelunk server logs`, which only reads the
+    /// local auto-daemon's log.
+    is_explicit_remote: bool,
     /// Current bearer token + refresh state. `RwLock`-free `Mutex` is fine:
     /// contention is nil (refresh happens at most once per request) and the
     /// critical section is a cheap clone / swap.
@@ -127,7 +134,7 @@ struct BearerState {
 
 /// State needed to rotate an expired/rejected WorkOS access token.
 ///
-/// Refresh now goes DIRECTLY to WorkOS (ADR-047), so the WorkOS base URL and the
+/// Refresh now goes DIRECTLY to WorkOS, so the WorkOS base URL and the
 /// embedded public `client_id` are carried here alongside the rotating tokens.
 struct RefreshState {
     tokens: AuthTokens,
@@ -147,11 +154,42 @@ impl ServerInferenceClient {
     /// loopback server sets `inference_url` while leaving `server_url` unset, so
     /// inference reaches the server even though memory stays local. An explicit
     /// team `server_url` is used for both.
+    ///
+    /// The bearer is resolved per-origin via `Config::bearer_for` (ADR-071
+    /// D2): a self-hosted server never receives a cloud `[auth]` token meant
+    /// for a different origin, and vice versa.
     pub fn from_config(cfg: &Config) -> Option<Self> {
         let base_url = cfg
             .resolve_inference_url()?
             .trim_end_matches('/')
             .to_string();
+        let bearer = cfg
+            .bearer_for(&base_url)
+            .expect("resolving per-server bearer credential");
+        Some(Self::build(cfg, base_url, bearer))
+    }
+
+    /// Same as [`from_config`](Self::from_config) but with an injected
+    /// [`SecretStore`](spelunk_core::config::secret_store::SecretStore), so
+    /// in-process tests can exercise bearer resolution without touching the
+    /// real default secret store.
+    #[cfg(test)]
+    fn from_config_with_store(
+        cfg: &Config,
+        store: &dyn spelunk_core::config::secret_store::SecretStore,
+    ) -> Option<Self> {
+        let base_url = cfg
+            .resolve_inference_url()?
+            .trim_end_matches('/')
+            .to_string();
+        let bearer = cfg
+            .bearer_for_with_store(&base_url, store)
+            .expect("resolving per-server bearer credential");
+        Some(Self::build(cfg, base_url, bearer))
+    }
+
+    /// Shared construction once `base_url` and `bearer` are resolved.
+    fn build(cfg: &Config, base_url: String, bearer: Option<String>) -> Self {
         if let Err(msg) = spelunk_core::config::validate_transport_url(&base_url) {
             // Fail loudly and immediately: the alternative is silently sending a
             // bearer token in the clear. No opt-out: the fix is always "use
@@ -169,15 +207,16 @@ impl ServerInferenceClient {
         .build()
         .expect("building HTTP client for server inference");
 
-        // Carry WorkOS refresh state only when the bearer comes from `[auth]`
-        // (i.e. `server_key` was resolved from the access token). A bare
-        // `server_key` / env token is not refreshable here. Refresh targets
-        // WorkOS directly (ADR-047): the WorkOS base URL and the embedded public
-        // client_id (derived from the default cloud host) are captured here.
+        // Carry WorkOS refresh state only when the resolved bearer came from
+        // `[auth]`, i.e. `base_url`'s origin is the cloud kind (ADR-071 D2).
+        // A self-hosted server-key / env token is not refreshable here.
+        // Refresh targets WorkOS directly: the WorkOS base URL and the
+        // embedded public client_id (derived from the default cloud host)
+        // are captured here.
         let refresh = cfg
             .auth
             .as_ref()
-            .filter(|a| Some(a.access_token.as_str()) == cfg.server_key.as_deref())
+            .filter(|a| Some(a.access_token.as_str()) == bearer.as_deref())
             .map(|tokens| RefreshState {
                 tokens: tokens.clone(),
                 workos_url: auth_api::workos_url(),
@@ -185,15 +224,21 @@ impl ServerInferenceClient {
                 config_path: None,
             });
 
-        Some(Self {
+        Self {
             client,
             base_url,
             project_id,
-            auth: Mutex::new(BearerState {
-                bearer: cfg.server_key.clone(),
-                refresh,
-            }),
-        })
+            // Mirrors `Config::resolve_inference_url`'s own fallback exactly:
+            // `base_url` came from `server_url` iff `inference_url` was unset.
+            // Since the 2026-07-23 ADR-004 revision,
+            // `effective_config` CAN set `inference_url` even when
+            // `server_url` is ALSO set (the `local_first` case: an explicit
+            // `server_url` there is a sync replica only, never the inference
+            // target) — so `cfg.server_url.is_some()` alone is no longer a
+            // reliable signal of "base_url is the explicit remote".
+            is_explicit_remote: cfg.inference_url.is_none() && cfg.server_url.is_some(),
+            auth: Mutex::new(BearerState { bearer, refresh }),
+        }
     }
 
     /// Test-only constructor wiring an explicit base URL, bearer, and refresh
@@ -210,6 +255,7 @@ impl ServerInferenceClient {
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             project_id: project_id.to_string(),
+            is_explicit_remote: false,
             auth: Mutex::new(BearerState {
                 bearer,
                 // `workos_url` is the second tuple element (tests point it at a
@@ -222,6 +268,15 @@ impl ServerInferenceClient {
                 }),
             }),
         }
+    }
+
+    /// Mark this test client as reached via an explicit remote `server_url`
+    /// (not loopback auto-discovery), for tests covering the scoped
+    /// inference-error hint.
+    #[cfg(test)]
+    fn with_explicit_remote(mut self) -> Self {
+        self.is_explicit_remote = true;
+        self
     }
 
     /// Current bearer token, if any.
@@ -252,18 +307,19 @@ impl ServerInferenceClient {
     }
 
     /// Rotate the WorkOS access token DIRECTLY via WorkOS `/authenticate`
-    /// (refresh grant, ADR-047), persist the rotated tokens, and update the
+    /// (refresh grant), persist the rotated tokens, and update the
     /// in-memory bearer.
     ///
     /// Returns `Ok(true)` when a refresh was performed, `Ok(false)` when there
     /// is no refresh state (a bare `server_key` — nothing to refresh). Errors
     /// carry a clear "re-run `spelunk login`" message.
     async fn refresh_access_token(&self) -> Result<bool> {
-        let (refresh_token, workos_url, client_id, config_path) = {
+        let (refresh_token, org_id, workos_url, client_id, config_path) = {
             let guard = self.auth.lock().expect("auth mutex poisoned");
             match &guard.refresh {
                 Some(r) => (
                     r.tokens.refresh_token.clone(),
+                    r.tokens.org_id.clone(),
                     r.workos_url.clone(),
                     r.client_id.clone(),
                     r.config_path.clone(),
@@ -272,12 +328,20 @@ impl ServerInferenceClient {
             }
         };
 
-        let rotated =
-            auth_api::refresh_token(&self.client, &workos_url, &client_id, &refresh_token, None)
-                .await
-                .map_err(|e| {
-                    e.context("session expired and token refresh failed — re-run `spelunk login`")
-                })?;
+        // Re-send the active org so a prior `org switch` survives rotation
+        // instead of reverting to the account's default org (see auth_api::
+        // ensure_fresh_token, which has the same requirement).
+        let rotated = auth_api::refresh_token(
+            &self.client,
+            &workos_url,
+            &client_id,
+            &refresh_token,
+            auth_api::org_id_for_refresh(&org_id),
+        )
+        .await
+        .map_err(|e| {
+            e.context("session expired and token refresh failed — re-run `spelunk login`")
+        })?;
         let new_tokens = rotated.into_auth_tokens();
 
         // Persist rotated tokens so the next process starts authenticated.
@@ -458,7 +522,11 @@ impl ServerInferenceClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{}", server_inference_error("/index/embed", status, &text));
+            let remote_url = self.is_explicit_remote.then_some(self.base_url.as_str());
+            anyhow::bail!(
+                "{}",
+                server_inference_error("/index/embed", status, &text, remote_url)
+            );
         }
         let bytes = resp
             .bytes()
@@ -579,7 +647,18 @@ impl spelunk_core::llm::LlmBackend for ServerLlmAdapter {
 /// embedder (state `loading`/`unavailable`). `reqwest::error_for_status` throws
 /// that body away and yields a bare "HTTP status 503", so we parse it here and
 /// append a next-step hint.
-fn server_inference_error(endpoint: &str, status: reqwest::StatusCode, body: &str) -> String {
+///
+/// `remote_url` is `Some` when this client reached the server via an explicit
+/// `server_url` (not loopback auto-discovery). The `unavailable` hint must
+/// then name that server instead of pointing at `spelunk server logs`, which
+/// only reads the local auto-daemon's log and would show clean logs for a
+/// failure that lives on the remote server.
+fn server_inference_error(
+    endpoint: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    remote_url: Option<&str>,
+) -> String {
     let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
     let field = |k: &str| {
         parsed
@@ -590,9 +669,12 @@ fn server_inference_error(endpoint: &str, status: reqwest::StatusCode, body: &st
     };
     let reason = field("detail").or_else(|| field("error"));
     let hint = match field("state") {
-        Some("loading") => " Retry shortly (`spelunk server status`).",
-        Some("unavailable") => " See `spelunk server logs`.",
-        _ => "",
+        Some("loading") => " Retry shortly (`spelunk server status`).".to_string(),
+        Some("unavailable") => match remote_url {
+            Some(url) => format!(" Check the logs for team server {url}."),
+            None => " See `spelunk server logs`.".to_string(),
+        },
+        _ => String::new(),
     };
     match reason {
         Some(reason) => format!("spelunk-server {endpoint} returned {status}: {reason}.{hint}"),
@@ -616,7 +698,7 @@ pub fn harvest_requires_server() -> anyhow::Error {
 mod tests {
     use super::*;
     use spelunk_core::config::AuthTokens;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn expiring_tokens(expires_at: i64) -> AuthTokens {
@@ -678,7 +760,7 @@ mod tests {
             .mount(&inference)
             .await;
 
-        // The WorkOS refresh exchange rotates the tokens (ADR-047).
+        // The WorkOS refresh exchange rotates the tokens.
         Mock::given(method("POST"))
             .and(path("/user_management/authenticate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -740,8 +822,11 @@ mod tests {
 
         let at_fresh = jwt("fresh", "org_1", 5_000_000_000);
 
+        // The refresh request must carry the stored `org_1` scope, so it never
+        // silently reverts to the account's default org on rotation.
         Mock::given(method("POST"))
             .and(path("/user_management/authenticate"))
+            .and(body_string_contains("organization_id=org_1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": at_fresh,
                 "refresh_token": "rt-fresh",
@@ -856,7 +941,9 @@ mod tests {
     }
 
     /// `from_config` carries refresh state ONLY when the bearer was resolved from
-    /// the `[auth]` access token — so a `spelunk login` session can refresh.
+    /// the `[auth]` access token, so a `spelunk login` session can refresh. That
+    /// only happens for a cloud-origin target (ADR-071 D2); a self-hosted origin
+    /// never resolves to the cloud token, whatever `[auth]` holds.
     #[test]
     #[serial_test::serial]
     fn from_config_attaches_refresh_state_for_auth_token_bearer() {
@@ -873,14 +960,12 @@ mod tests {
         };
         spelunk_core::config::save_auth_tokens_to(&tokens, &path).unwrap();
 
-        let mut cfg = crate::config::Config::load_with_store(
-            Some(&path),
-            &spelunk_core::config::secret_store::MemoryStore::default(),
-        )
-        .unwrap();
-        // from_config needs an inference URL to build a client at all.
-        cfg.inference_url = Some("http://127.0.0.1:7777".into());
-        let client = ServerInferenceClient::from_config(&cfg).expect("client builds");
+        let store = spelunk_core::config::secret_store::MemoryStore::default();
+        let mut cfg = crate::config::Config::load_with_store(Some(&path), &store).unwrap();
+        // The cloud kind only applies for the cloud origin (ADR-071 D2).
+        cfg.inference_url = Some(auth_api::DEFAULT_CLOUD_URL.to_string());
+        let client =
+            ServerInferenceClient::from_config_with_store(&cfg, &store).expect("client builds");
 
         let guard = client.auth.lock().unwrap();
         assert!(
@@ -904,13 +989,11 @@ mod tests {
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "server_key = \"sk-legacy\"\n").unwrap();
 
-        let mut cfg = crate::config::Config::load_with_store(
-            Some(&path),
-            &spelunk_core::config::secret_store::MemoryStore::default(),
-        )
-        .unwrap();
+        let store = spelunk_core::config::secret_store::MemoryStore::default();
+        let mut cfg = crate::config::Config::load_with_store(Some(&path), &store).unwrap();
         cfg.inference_url = Some("http://127.0.0.1:7777".into());
-        let client = ServerInferenceClient::from_config(&cfg).expect("client builds");
+        let client =
+            ServerInferenceClient::from_config_with_store(&cfg, &store).expect("client builds");
 
         let guard = client.auth.lock().unwrap();
         assert!(
@@ -918,6 +1001,137 @@ mod tests {
             "a bare legacy server_key must not be treated as refreshable"
         );
         assert_eq!(guard.bearer.as_deref(), Some("sk-legacy"));
+    }
+
+    // `is_explicit_remote` keys off whether `base_url` resolved from
+    // `server_url` (never off what host it resolves to): an explicitly
+    // configured `server_url = http://127.0.0.1:PORT` is still "explicit"
+    // even though the host is loopback. `spelunk server logs` only ever
+    // reads the fixed auto-daemon log path and cannot tell this loopback
+    // address was hand-configured, so the inference-error hint must still
+    // name it. Mirrors
+    // `capability::tier::tests::tier_explicit_remote_url_is_explicit_even_when_host_is_loopback`,
+    // which pins the same invariant on the `Tier` side of this contract.
+    //
+    // `mode: CloudFirst` is required here since the 2026-07-23 ADR-004
+    // revision: `resolve_inference_url` only falls back to
+    // `server_url` in `cloud_first` (in `local_first`, the default this test
+    // used to rely on, a bare `server_url` no longer resolves to any
+    // inference `base_url` at all — see
+    // `from_config_local_first_with_only_server_url_set_has_no_inference_target`
+    // below for that regression).
+    #[test]
+    #[serial_test::serial]
+    fn from_config_is_explicit_remote_true_for_explicitly_configured_loopback_url() {
+        unsafe {
+            std::env::remove_var("SPELUNK_SERVER_KEY");
+        }
+        let cfg = crate::config::Config {
+            server_url: Some("http://127.0.0.1:9797".to_string()),
+            project_id: Some("proj".to_string()),
+            mode: Some(spelunk_core::config::SyncMode::CloudFirst),
+            ..Default::default()
+        };
+        // Inject an in-memory secret store so this test never touches the
+        // real OS keychain (DI; cf. the `refresh_on_401_retries_once_and_persists`
+        // comment above and config.rs tests). This test previously called
+        // the production `from_config` entry point directly, which resolves
+        // the bearer via `Config::bearer_for` against the *real* default
+        // secret store; on macOS in a headless session that keychain
+        // lookup blocks indefinitely instead of failing fast, which is what
+        // made this test (and the whole module) appear to hang "even in
+        // isolation" without `SPELUNK_SECRET_STORE=file` set in the
+        // environment.
+        let store = spelunk_core::config::secret_store::MemoryStore::default();
+        let client =
+            ServerInferenceClient::from_config_with_store(&cfg, &store).expect("client builds");
+        assert!(
+            client.is_explicit_remote,
+            "an explicitly configured server_url must count as explicit even when it is loopback"
+        );
+    }
+
+    /// Regression guard: with only `server_url` set (no
+    /// `inference_url`) and no explicit `mode`, the config defaults to
+    /// `local_first`, and `local_first` must NOT resolve any inference
+    /// `base_url` from `server_url`. `from_config` must return `None` rather
+    /// than silently building a client aimed at `server_url` (which is what
+    /// produced 404s against a cloud `server_url`'s nonexistent
+    /// `/index/embed` route).
+    #[test]
+    #[serial_test::serial]
+    fn from_config_local_first_with_only_server_url_set_has_no_inference_target() {
+        unsafe {
+            std::env::remove_var("SPELUNK_SERVER_KEY");
+        }
+        let cfg = crate::config::Config {
+            server_url: Some("https://api.spelunk.cloud".to_string()),
+            project_id: Some("proj".to_string()),
+            mode: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_mode(),
+            spelunk_core::config::SyncMode::LocalFirst
+        );
+        let store = spelunk_core::config::secret_store::MemoryStore::default();
+        assert!(
+            ServerInferenceClient::from_config_with_store(&cfg, &store).is_none(),
+            "local_first must not build an inference client aimed at a bare server_url"
+        );
+    }
+
+    /// End-to-end regression test for the founder's own manual repro
+    /// (2026-07-23): `local_first`, `server_url` set to a
+    /// cloud host, no explicit `mode` → embedding must reach the LOCAL
+    /// loopback embedder, never the configured `server_url`. Modelled at this
+    /// layer by setting `inference_url` directly to a mocked loopback server
+    /// (what `Tier::effective_config` does once it has probed one, tested
+    /// separately in `capability::tier`) alongside a `server_url` pointed at
+    /// an address nothing mounts anything on: an accidental fallback would
+    /// surface as a hard connection error here, never a silent pass.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn embed_text_local_first_uses_loopback_not_configured_server_url() {
+        unsafe {
+            std::env::remove_var("SPELUNK_SERVER_KEY");
+        }
+        let loopback = MockServer::start().await;
+        let dim = spelunk_core::embeddings::EMBEDDING_DIM;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/index/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(spelunk_core::embeddings::vec_to_blob(&vec![0.25_f32; dim])),
+            )
+            .mount(&loopback)
+            .await;
+
+        let cfg = crate::config::Config {
+            inference_url: Some(loopback.uri()),
+            server_url: Some("https://cloud.invalid.example:1".to_string()),
+            project_id: Some("proj".to_string()),
+            mode: None, // defaults to local_first because server_url is set
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_mode(),
+            spelunk_core::config::SyncMode::LocalFirst
+        );
+
+        let store = spelunk_core::config::secret_store::MemoryStore::default();
+        let client = ServerInferenceClient::from_config_with_store(&cfg, &store)
+            .expect("client must build from inference_url (the loopback server)");
+        assert!(
+            !client.is_explicit_remote,
+            "base_url resolved from inference_url, not server_url"
+        );
+
+        let vec = client.embed_text("hello").await.expect(
+            "embedding must reach the local loopback server, not the unroutable \
+             cloud server_url",
+        );
+        assert_eq!(vec.len(), dim);
     }
 
     /// `derive_local_fallback` produces `local/<blake3-hex>` slugs — the `/`
@@ -980,7 +1194,7 @@ mod tests {
     // `from_config` hard-exits the process on an invalid (non-loopback http://)
     // inference URL, so the exit path itself isn't exercised in-process here
     // (that would kill the test binary). These tests instead cover the pure
-    // validator directly (used identically by `capability.rs::probe_url`) and
+    // validator directly (used identically by `capability::probe::probe_url`) and
     // confirm `from_config` still builds normally for every URL shape the
     // validator accepts.
 
@@ -1000,14 +1214,11 @@ mod tests {
         }
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        let mut cfg = crate::config::Config::load_with_store(
-            Some(&path),
-            &spelunk_core::config::secret_store::MemoryStore::default(),
-        )
-        .unwrap();
+        let store = spelunk_core::config::secret_store::MemoryStore::default();
+        let mut cfg = crate::config::Config::load_with_store(Some(&path), &store).unwrap();
         cfg.inference_url = Some("http://127.0.0.1:7777".into());
         assert!(
-            ServerInferenceClient::from_config(&cfg).is_some(),
+            ServerInferenceClient::from_config_with_store(&cfg, &store).is_some(),
             "loopback http:// inference URL must be accepted"
         );
     }
@@ -1020,14 +1231,11 @@ mod tests {
         }
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        let mut cfg = crate::config::Config::load_with_store(
-            Some(&path),
-            &spelunk_core::config::secret_store::MemoryStore::default(),
-        )
-        .unwrap();
+        let store = spelunk_core::config::secret_store::MemoryStore::default();
+        let mut cfg = crate::config::Config::load_with_store(Some(&path), &store).unwrap();
         cfg.inference_url = Some("https://team-server:7777".into());
         assert!(
-            ServerInferenceClient::from_config(&cfg).is_some(),
+            ServerInferenceClient::from_config_with_store(&cfg, &store).is_some(),
             "https:// inference URL (any host) must be accepted"
         );
     }
@@ -1046,6 +1254,7 @@ mod tests {
             "/index/embed",
             reqwest::StatusCode::SERVICE_UNAVAILABLE,
             &body,
+            None,
         );
         assert!(msg.contains("downloading model (42%)"), "got: {msg}");
         assert!(msg.contains("spelunk server status"), "got: {msg}");
@@ -1054,7 +1263,9 @@ mod tests {
     }
 
     #[test]
-    fn inference_error_surfaces_unavailable_points_at_logs() {
+    fn inference_error_surfaces_unavailable_loopback_points_at_logs() {
+        // Loopback auto-discovery: the failing embedder IS the local daemon,
+        // so `spelunk server logs` is the right place to look.
         let body = serde_json::json!({
             "error": "embedder unavailable",
             "state": "unavailable",
@@ -1065,9 +1276,35 @@ mod tests {
             "/index/embed",
             reqwest::StatusCode::SERVICE_UNAVAILABLE,
             &body,
+            None,
         );
         assert!(msg.contains("OOM loading GGUF"), "got: {msg}");
         assert!(msg.contains("spelunk server logs"), "got: {msg}");
+    }
+
+    #[test]
+    fn inference_error_surfaces_unavailable_remote_names_that_server_never_local_logs() {
+        // Explicit server_url: `spelunk server logs` reads the LOCAL daemon's
+        // log, which is clean when the failure lives on the team server. The
+        // error must name the probed server instead.
+        let body = serde_json::json!({
+            "error": "embedder unavailable",
+            "state": "unavailable",
+            "detail": "OOM loading GGUF",
+        })
+        .to_string();
+        let msg = server_inference_error(
+            "/index/embed",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            &body,
+            Some("https://team.example:7777"),
+        );
+        assert!(msg.contains("OOM loading GGUF"), "got: {msg}");
+        assert!(msg.contains("https://team.example:7777"), "got: {msg}");
+        assert!(
+            !msg.contains("spelunk server logs"),
+            "must not point a remote failure at local logs: {msg}"
+        );
     }
 
     #[test]
@@ -1077,6 +1314,7 @@ mod tests {
             "/index/embed",
             reqwest::StatusCode::BAD_GATEWAY,
             "<html>502</html>",
+            None,
         );
         assert!(msg.contains("/index/embed"), "got: {msg}");
         assert!(msg.contains("502"), "got: {msg}");
@@ -1106,6 +1344,38 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("loading F2LLM weights"), "got: {msg}");
         assert!(msg.contains("spelunk server status"), "got: {msg}");
+    }
+
+    /// End-to-end: a 503 `unavailable` from `/index/embed` against an
+    /// explicit team `server_url` must name that server, never `spelunk
+    /// server logs` (which would read a healthy local daemon's log instead).
+    #[tokio::test]
+    async fn embed_text_remote_names_that_server_never_local_logs() {
+        let inference = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/index/embed"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": "embedder unavailable",
+                "state": "unavailable",
+                "detail": "OOM loading GGUF",
+            })))
+            .mount(&inference)
+            .await;
+
+        let client =
+            ServerInferenceClient::for_test(&inference.uri(), "proj", Some("sk".into()), None)
+                .with_explicit_remote();
+        let err = client
+            .embed_text("hello")
+            .await
+            .expect_err("503 must surface as an error");
+        let msg = err.to_string();
+        assert!(msg.contains("OOM loading GGUF"), "got: {msg}");
+        assert!(msg.contains(&inference.uri()), "got: {msg}");
+        assert!(
+            !msg.contains("spelunk server logs"),
+            "must not point a remote failure at local logs: {msg}"
+        );
     }
 
     /// `/v1/health`-style probes aside, inference requests built via

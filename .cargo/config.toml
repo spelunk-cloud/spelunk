@@ -1,0 +1,14 @@
+[env]
+# Local `cargo test`/`cargo run` invoked from within this workspace default to
+# the file-backed secret store, mirroring `SPELUNK_SECRET_STORE: file` in
+# .github/workflows/ci.yml. Without this, any code path that resolves a
+# bearer via `Config::bearer_for` (e.g. `server_client.rs`'s
+# `ServerInferenceClient::from_config`, or `index/embed_phase.rs`'s
+# `run_embed_phase`) reaches the real OS keychain on first run. On macOS in a
+# headless/non-interactive session (CI runners, sandboxed agent shells) that
+# keychain access blocks indefinitely waiting for an authorisation prompt
+# that will never appear, surfacing as a "hung" test rather than a failure.
+# `force = false` (the default for a plain string) lets a developer still
+# opt into the real keychain by exporting SPELUNK_SECRET_STORE=keychain in
+# their own shell; this only supplies a default.
+SPELUNK_SECRET_STORE = "file"

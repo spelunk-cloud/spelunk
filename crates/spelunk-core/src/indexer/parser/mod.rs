@@ -144,7 +144,9 @@ impl SourceParser {
             return Ok(text::parse_markdown(source, file_path));
         }
         if language == "text" {
-            return Ok(sliding_window(source, file_path, language, 120, 15));
+            return Ok(sliding_window(
+                source, file_path, language, None, None, None,
+            ));
         }
         if language == "notebook" {
             return Ok(text::parse_notebook(source, file_path));
@@ -160,7 +162,9 @@ impl SourceParser {
                 "{file_path}: input too large ({} bytes > {MAX_PARSE_BYTES}), using sliding window",
                 source.len()
             );
-            return Ok(sliding_window(source, file_path, language, 120, 15));
+            return Ok(sliding_window(
+                source, file_path, language, None, None, None,
+            ));
         }
 
         let ts_lang = ts_walker::ts_language(language)?;
@@ -190,7 +194,9 @@ impl SourceParser {
                 tracing::warn!(
                     "{file_path}: tree-sitter parse exceeded time budget, using sliding window"
                 );
-                return Ok(sliding_window(source, file_path, language, 120, 15));
+                return Ok(sliding_window(
+                    source, file_path, language, None, None, None,
+                ));
             }
         };
 
@@ -207,8 +213,9 @@ impl SourceParser {
 
         if chunks.is_empty() {
             tracing::debug!("{file_path}: no semantic nodes found, using sliding window");
-            // 120-line window fits comfortably in EmbeddingGemma's 2048-token budget.
-            return Ok(sliding_window(source, file_path, language, 120, 15));
+            return Ok(sliding_window(
+                source, file_path, language, None, None, None,
+            ));
         }
 
         Ok(chunks)

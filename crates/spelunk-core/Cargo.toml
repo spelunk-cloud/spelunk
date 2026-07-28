@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-core"
-version = "0.9.3"
+version = "0.9.5"
 edition = "2024"
 description = "Core library for spelunk — storage, indexer, search, embeddings"
 license = "MIT"
@@ -37,7 +37,7 @@ dirs = { workspace = true }
 # adds it), so registry paths match the plain paths the lookup side derives via gix.
 dunce = "1"
 
-gix = { version = "0.85.0", default-features = false, features = [
+gix = { version = "0.86.0", default-features = false, features = [
     "sha1",
     "status",
 ] }
@@ -51,9 +51,9 @@ tree-sitter = "0.26"
 # python, ruby, rust, scala, solidity, swift, tsx, typescript, yaml). One crate
 # to bump instead of 13 hand-pinned grammars; kept ABI-aligned to the same
 # tree-sitter 0.26 runtime by the ast-grep team. See ts_walker::ts_language.
-ast-grep-language = "0.44"
+ast-grep-language = "0.45"
 # In-process structural search fallback (replaces the external `ast-grep` binary).
-ast-grep-core = "0.44"
+ast-grep-core = "0.45"
 # proto + sql grammars are not shipped by ast-grep-language — kept standalone.
 tree-sitter-proto = "0.4"
 tree-sitter-sequel = "0.3"
@@ -61,7 +61,7 @@ tree-sitter-sequel = "0.3"
 uuid = { workspace = true }
 regex = { version = "1", default-features = false, features = ["std"] }
 blake3 = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 ignore = "0.4"
 indicatif = "0.18"
@@ -76,3 +76,7 @@ tempfile = { workspace = true }
 wiremock = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
+# Only for the chunk_quality_eval example: an independent tokenizer-exact
+# token count for the Recall@token-budget metric (avoids reintroducing the
+# chars/4 `estimate_tokens` bias the embed_bench harness exists to fix).
+tokenizers = { workspace = true }

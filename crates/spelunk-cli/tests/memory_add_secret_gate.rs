@@ -13,7 +13,7 @@
 //! check the error/SQLite side can use a plain temp dir.
 
 mod plumbing_helpers;
-use plumbing_helpers::spelunk_bin;
+use plumbing_helpers::{init_git_repo, spelunk_bin};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -133,34 +133,8 @@ fn clean_input_writes_sqlite_row_and_git_note() {
     let tmp = TempDir::new().unwrap();
 
     // Initialise a real git repo so `append_to_git_notes` has somewhere to write.
-    std::process::Command::new("git")
-        .arg("init")
-        .current_dir(tmp.path())
-        .output()
-        .expect("git init");
-    std::process::Command::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("git config email");
-    std::process::Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("git config name");
-    // Create an initial commit so HEAD exists (required for git notes).
-    let readme = tmp.path().join("README.md");
-    std::fs::write(&readme, "# test").unwrap();
-    std::process::Command::new("git")
-        .args(["add", "README.md"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("git add");
-    std::process::Command::new("git")
-        .args(["commit", "-m", "init"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("git commit");
+    // Creates the initial commit HEAD that git notes require.
+    init_git_repo(tmp.path());
 
     let mem_db = tmp.path().join("memory.db");
     // store_in_git_notes = true (default)

@@ -5,6 +5,7 @@ use tempfile::tempdir;
 mod plumbing_helpers;
 use plumbing_helpers::{
     FIXTURE_PROJECT_ID, IndexEmbedResponder, spelunk_bin, spelunk_bin_in, write_config_with_server,
+    write_project_server_config,
 };
 
 #[test]
@@ -187,23 +188,27 @@ async fn test_index_and_status() {
     fs::write(
         &config_path,
         format!(
-            concat!(
-                "db_path = {:?}\n",
-                "embedding_model = \"test-model\"\n",
-                "llm_model = \"test-chat-model\"\n",
-                "server_url = {:?}\n",
-                "project_id = {:?}\n",
-            ),
+            concat!("db_path = {:?}\n", "llm_model = \"test-chat-model\"\n",),
             db_path,
-            mock_server.uri(),
-            project_id,
         ),
     )
     .unwrap();
+    // `server_url`/`project_id` only take effect from project-level
+    // `.spelunk/config.toml` (or env), never from the `--config` global file.
+    write_project_server_config(&project_dir, &mock_server.uri(), project_id);
+
+    // Under the default `local_first` mode a bare `server_url` never routes
+    // embedding/search to it (that's a loopback-only inference path); this
+    // test exists to exercise the mock server's `/index/embed` and `/search`
+    // endpoints, so it opts into `cloud_first` explicitly on every command,
+    // the same way a real user would to keep this behavior.
+    const CLOUD_FIRST: (&str, &str) = ("SPELUNK_MODE", "cloud_first");
 
     // 1. Index the project
     let mut cmd = spelunk_bin();
-    cmd.arg("--config")
+    cmd.current_dir(&project_dir)
+        .env(CLOUD_FIRST.0, CLOUD_FIRST.1)
+        .arg("--config")
         .arg(&config_path)
         .arg("index")
         .arg(&project_dir)
@@ -213,6 +218,7 @@ async fn test_index_and_status() {
     // 2. Check status
     let mut cmd = spelunk_bin();
     cmd.current_dir(&project_dir)
+        .env(CLOUD_FIRST.0, CLOUD_FIRST.1)
         .arg("--config")
         .arg(&config_path)
         .arg("status")
@@ -226,6 +232,7 @@ async fn test_index_and_status() {
     // 3. Search for the function (semantic search via server embedding)
     let mut cmd = spelunk_bin();
     cmd.current_dir(&project_dir)
+        .env(CLOUD_FIRST.0, CLOUD_FIRST.1)
         .arg("--config")
         .arg(&config_path)
         .arg("search")
@@ -295,22 +302,29 @@ async fn test_index_encodes_project_id_with_slashes_as_single_segment() {
         fs::write(
             &config_path,
             format!(
-                concat!(
-                    "db_path = {:?}\n",
-                    "embedding_model = \"test-model\"\n",
-                    "llm_model = \"test-chat-model\"\n",
-                    "server_url = {:?}\n",
-                    "project_id = {:?}\n",
-                ),
+                concat!("db_path = {:?}\n", "llm_model = \"test-chat-model\"\n",),
                 db_path,
-                mock_server.uri(),
-                project_id,
             ),
         )
         .unwrap();
 
+        // `server_url` only loads from project-level `.spelunk/config.toml` (or
+        // env), never the personal global config: see `Config::load_with_store`.
+        write_project_server_config(&project_dir, &mock_server.uri(), project_id);
+
         // Index the project — must reach the embedding phase without a 404.
+        //
+        // This test's purpose is the project_id slash-encoding in the embed
+        // request path, not local-vs-remote embed routing, so it needs an
+        // explicit `server_url` to legitimately serve embedding. Under the
+        // default `local_first` mode that routing is now correctly refused
+        // (see the `get_inference_tier` routing fix), so force `cloud_first`
+        // here: `.spelunk/config.toml` doesn't recognize a `mode` key (see
+        // `write_project_server_config`), so this must go through the env
+        // var.
         spelunk_bin()
+            .current_dir(&project_dir)
+            .env("SPELUNK_MODE", "cloud_first")
             .arg("--config")
             .arg(&config_path)
             .arg("index")
@@ -390,7 +404,7 @@ async fn test_status_shows_offline_tier() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -453,10 +467,12 @@ async fn test_status_shows_server_tier() {
         &db_path,
         &mock_server.uri(),
         &mock_server.uri(),
+        &project_dir,
     );
 
     let mut cmd = spelunk_bin();
-    cmd.arg("--config")
+    cmd.current_dir(&project_dir)
+        .arg("--config")
         .arg(&config_path)
         .arg("index")
         .arg(&project_dir)
@@ -514,10 +530,12 @@ async fn test_status_json_includes_tier_fields() {
         &db_path,
         &mock_server.uri(),
         &mock_server.uri(),
+        &project_dir,
     );
 
     let mut cmd = spelunk_bin();
-    cmd.arg("--config")
+    cmd.current_dir(&project_dir)
+        .arg("--config")
         .arg(&config_path)
         .arg("index")
         .arg(&project_dir)
@@ -547,6 +565,10 @@ async fn test_status_json_includes_tier_fields() {
     // never surface in user-facing status JSON.
     assert!(body["capabilities"]["plan"].is_null());
     assert!(!body["capabilities"]["explore"].as_bool().unwrap());
+    // With an explicit server_url and no `mode` override, the default is
+    // local_first even though the tier probe found the server
+    // reachable: tier and sync mode are independent axes.
+    assert_eq!(body["mode"], "local_first", "got: {body}");
 }
 
 /// Validate the *stable* JSON schema introduced by issue #269.
@@ -583,7 +605,7 @@ async fn test_status_json_stable_schema() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = {:?}\nembedding_model = \"test-model\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = {:?}\nllm_model = \"test\"\n",
             db_path,
             mock_server.uri()
         ),
@@ -680,6 +702,98 @@ async fn test_status_json_stable_schema() {
         body["memory_entries"].as_i64().is_some(),
         "memory_entries must be an integer"
     );
+    // mode: additive field (no server_url configured -> resolve_mode() is
+    // offline, the same default as pre-existing behaviour).
+    assert_eq!(body["mode"], "offline", "got: {body}");
+}
+
+/// Locks the top-level key set of `status --format json` so a future change
+/// cannot silently rename, drop, or add a field outside the documented
+/// "additive extensions only" contract (issue #269 doc comment above
+/// `status()`). `mode` (this story) is the newest addition.
+#[tokio::test]
+async fn test_status_json_top_level_keys_are_exactly_the_documented_set() {
+    let temp = tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+    fs::write(project_dir.join("main.rs"), "fn main() {}").unwrap();
+
+    let db_path = temp.path().join("index.db");
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nllm_model = \"test\"\n",
+            db_path
+        ),
+    )
+    .unwrap();
+
+    spelunk_bin()
+        .env("SPELUNK_NO_SERVER", "1")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("index")
+        .arg(&project_dir)
+        .assert()
+        .success();
+
+    let output = spelunk_bin()
+        .env("SPELUNK_NO_SERVER", "1")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("status")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let body: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    let mut got: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    got.sort_unstable();
+
+    let mut want = vec![
+        "version",
+        "project",
+        "db_path",
+        "indexed_files",
+        "file_count",
+        "total_chunks",
+        "languages",
+        "embedding_dim",
+        "has_semantic_search",
+        "last_indexed_at",
+        "memory_entries",
+        "memory_backend",
+        "tier",
+        "mode",
+        // ADR-037 P2 item 35: additive-only pending-count/last-synced fields.
+        "sync_pending",
+        "sync_last_synced_at",
+        "server_url",
+        "capabilities",
+        "embedder_state",
+        "embedding_count",
+        "embedding_pending",
+        "embed_worker_alive",
+        "embed_tokens",
+        "drift_candidates",
+        "usage_7d",
+    ];
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "status --format json top-level key set changed; if this is an \
+         intentional additive field, add it to `want` here and to the doc \
+         comment on `status()`"
+    );
 }
 
 #[tokio::test]
@@ -713,10 +827,12 @@ async fn test_check_reports_server_reachable() {
         &db_path,
         &mock_server.uri(),
         &mock_server.uri(),
+        &project_dir,
     );
 
     let mut cmd = spelunk_bin();
-    cmd.arg("--config")
+    cmd.current_dir(&project_dir)
+        .arg("--config")
         .arg(&config_path)
         .arg("index")
         .arg(&project_dir)
@@ -748,14 +864,16 @@ async fn test_check_reports_server_unreachable() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = {:?}\nembedding_model = \"test\"\nllm_model = \"test\"\nserver_url = {:?}\nproject_id = {:?}\n",
-            db_path, bad_url, bad_url, FIXTURE_PROJECT_ID
+            "db_path = {:?}\napi_base_url = {:?}\nllm_model = \"test\"\n",
+            db_path, bad_url
         ),
     )
     .unwrap();
+    write_project_server_config(&project_dir, bad_url, FIXTURE_PROJECT_ID);
 
     let mut cmd = spelunk_bin();
-    cmd.arg("--config")
+    cmd.current_dir(&project_dir)
+        .arg("--config")
         .arg(&config_path)
         .arg("index")
         .arg(&project_dir)
@@ -773,7 +891,13 @@ async fn test_check_reports_server_unreachable() {
         .stdout(predicate::str::contains("unreachable"));
 }
 
+// Investigation found no shared server/port/filesystem state this test could
+// race on (SPELUNK_NO_SERVER short-circuits before any is touched); flakes
+// under the parallel runner are attributed to generic child-process
+// spawn/stdio contention on a loaded runner, not CLI logic. Named group so
+// this doesn't serialize against unrelated tests.
 #[tokio::test]
+#[serial_test::serial(e2e_process_spawn_sensitive)]
 async fn test_index_prints_note_when_no_server_configured() {
     let temp = tempdir().unwrap();
     let project_dir = temp.path().join("project");
@@ -785,14 +909,17 @@ async fn test_index_prints_note_when_no_server_configured() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
     .unwrap();
 
     let mut cmd = spelunk_bin();
+    // Run in the temp project like the sibling tests, else the project-config walk-up
+    // reaches the repo's own .spelunk/config.toml (server_url set) and suppresses the notice.
     cmd.env("SPELUNK_NO_SERVER", "1") // ensure offline even if a local server is running
+        .current_dir(&project_dir)
         .arg("--config")
         .arg(&config_path)
         .arg("index")
@@ -816,7 +943,7 @@ fn test_status_json_offline_tier() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -873,7 +1000,7 @@ fn test_search_no_index_falls_back_to_ast_grep_or_clean_message() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -917,7 +1044,7 @@ fn test_search_index_but_no_embedder_falls_back_to_ast_grep() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -964,7 +1091,7 @@ fn test_search_explicit_hybrid_no_embedder_falls_back_to_text() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -983,6 +1110,7 @@ fn test_search_explicit_hybrid_no_embedder_falls_back_to_text() {
     // (ADR-004: inference-only routing; fallback is resolved at capability detection,
     // no per-query notice is emitted).
     spelunk_bin()
+        .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
         .current_dir(&project_dir)
         .arg("--config")
         .arg(&config_path)
@@ -1135,7 +1263,7 @@ fn test_init_non_tty_prints_skip_notice() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "server not running — semantic search skipped",
+            "server not running - semantic search skipped",
         ));
 }
 
@@ -1235,7 +1363,7 @@ fn test_init_leaves_existing_claude_md_untouched() {
 // These tests reproduce the auto-discovery path end-to-end: NO `server_url` in
 // config, `SPELUNK_NO_SERVER` unset, and a mock server reachable on loopback —
 // discovered via `~/.local/state/spelunk/server.port` (the same file
-// `spelunk server start` writes; see `capability.rs` step 3a). We redirect
+// `spelunk server start` writes; see `capability/probe.rs` step 3a). We redirect
 // `HOME` to an isolated temp dir and pre-write that port file so the probe
 // finds our `wiremock` instance deterministically, without depending on the
 // real default port 7777 (which may be occupied — or unoccupied — on the test
@@ -1349,7 +1477,7 @@ async fn test_memory_add_then_search_round_trip_on_local_store_with_auto_discove
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -1427,6 +1555,91 @@ async fn test_memory_add_then_search_round_trip_on_local_store_with_auto_discove
         ));
 }
 
+/// Founder's own manual repro (2026-07-23): `local_first`
+/// (no explicit `mode`, reached because `server_url` is set), an explicit
+/// `server_url` pointed at an address nothing mounts anything on, and a
+/// loopback server auto-discovered via the port file. `memory add` must embed
+/// via the loopback server (never the unroutable `server_url`), and `memory
+/// search` must return the local semantic result rather than erroring: before
+/// the fix, `resolve_inference_url()` returned the explicit `server_url`
+/// unconditionally, and the query embed 404'd against it (`{server_url}` has
+/// no `/index/embed` route in the cloud case this reproduces).
+#[tokio::test]
+async fn test_memory_add_then_search_round_trip_local_first_with_explicit_server_url() {
+    let mock_server = MockServer::start().await;
+    mount_auto_discovery_inference_endpoints(&mock_server).await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let state_dir = write_server_port_file(&home, port_from_uri(&mock_server.uri()));
+
+    let project_dir = temp.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+    fs::write(project_dir.join("main.rs"), "fn main() {}").unwrap();
+
+    // `server_url` set, no `mode` key: resolves to `local_first`. Deliberately
+    // an address nothing mounts anything on (mirrors the founder's
+    // `https://api.spelunk.cloud`): an accidental fallback to it for
+    // inference would surface as a connection error, never a silent pass.
+    let config_path = temp.path().join("config.toml");
+    let db_path = temp.path().join("index.db");
+    fs::write(
+        &config_path,
+        format!(
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nllm_model = \"test\"\nserver_url = \"https://cloud.invalid.example:1\"\nproject_id = \"team/proj\"\n",
+            db_path
+        ),
+    )
+    .unwrap();
+
+    spelunk_bin()
+        .env("HOME", &home)
+        .env("SPELUNK_NO_SERVER", "1")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("index")
+        .arg(&project_dir)
+        .assert()
+        .success();
+
+    spelunk_bin()
+        .env("HOME", &home)
+        .env("SPELUNK_STATE_DIR", &state_dir)
+        .env_remove("SPELUNK_NO_SERVER")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "Local first with cloud server_url",
+            "--body",
+            "server_url is a sync replica only; inference stays on loopback.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Stored [decision]"));
+
+    spelunk_bin()
+        .env("HOME", &home)
+        .env("SPELUNK_STATE_DIR", &state_dir)
+        .env_remove("SPELUNK_NO_SERVER")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .args(["memory", "search", "local first cloud server_url"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Local first with cloud server_url",
+        ))
+        .stdout(predicate::str::contains("[decision]"));
+}
+
 /// `memory timeline` against an auto-discovered loopback server returns notes
 /// from the LOCAL `memory.db` (the server only embeds the query). Companion to
 /// the add→search round-trip above; guards that `timeline` does not regress to
@@ -1450,7 +1663,7 @@ async fn test_memory_timeline_reads_local_store_with_auto_discovered_server() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -1513,9 +1726,10 @@ async fn test_memory_timeline_reads_local_store_with_auto_discovered_server() {
 // re-run imports nothing (dedup by the same content key as `memory reconcile`).
 
 /// Init a git repo at `dir` with a committer identity AND one commit, so
-/// `refs/notes/spelunk` can be attached — git notes hang off a commit object,
+/// `refs/notes/spelunk` can be attached - git notes hang off a commit object,
 /// so the no-commit `git_init_repo` helper above is not enough here.
 fn git_init_repo_with_commit(dir: &std::path::Path) {
+    plumbing_helpers::isolate_git_config();
     for args in [
         &["init", "-q"][..],
         &["config", "user.email", "test@test.com"][..],
@@ -1680,4 +1894,442 @@ fn test_init_without_git_repo_skips_notes_import() {
         .assert()
         .success()
         .stdout(predicate::str::contains("from git notes").not());
+}
+
+// ── ADR-070 D3/D4: warmup contract + status honesty (adversarial pass) ────────
+
+/// Build an offline-indexed project (chunks stored, zero embeddings, no
+/// recorded worker) under `home`, returning `(project_dir, config_path)`.
+/// The index DB lands at `<project_dir>/.spelunk/index.db` - the same path
+/// `status`/`search` resolve via the project walk, and the one the embed
+/// worker's state files are keyed on.
+fn offline_indexed_project(home: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let project_dir = home.join("project");
+    fs::create_dir(&project_dir).unwrap();
+    fs::write(
+        project_dir.join("lib.rs"),
+        "pub fn compute(x: i32) -> i32 { x * 2 }\npub fn helper() -> i32 { 7 }\n",
+    )
+    .unwrap();
+    let config_path = home.join("config.toml");
+    fs::write(
+        &config_path,
+        "api_base_url = \"http://127.0.0.1:19999\"\nllm_model = \"test\"\n",
+    )
+    .unwrap();
+    spelunk_bin_in(home)
+        .env("SPELUNK_NO_SERVER", "1")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("index")
+        .arg(&project_dir)
+        .assert()
+        .success();
+    (project_dir, config_path)
+}
+
+/// Path of the embed worker's pid state file for `db_path` under a given
+/// state directory, replicating the worker's own keying (blake3 of the
+/// canonicalised index path, first 16 hex chars). Deliberately duplicated
+/// here: if the writer's keying ever drifts from this, the reader/writer
+/// pair drifts too, and this test fails loudly.
+fn embed_worker_pid_file_in(
+    state_dir: &std::path::Path,
+    db_path: &std::path::Path,
+) -> std::path::PathBuf {
+    let canonical = spelunk_core::utils::canonicalize(db_path);
+    let key = blake3::hash(canonical.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string();
+    state_dir.join(format!("embed-worker-{}.pid", &key[..16]))
+}
+
+/// Same as [`embed_worker_pid_file_in`], for the default (no
+/// `SPELUNK_STATE_DIR`) state dir derived from `home`.
+fn embed_worker_pid_file(home: &std::path::Path, db_path: &std::path::Path) -> std::path::PathBuf {
+    embed_worker_pid_file_in(&home.join(".local").join("state").join("spelunk"), db_path)
+}
+
+/// ADR-070 D4: the `status --format json` embed-state extensions are additive
+/// and truthful. On an offline-built index (pending work, no worker) the new
+/// fields must report pending counts, a non-alive worker, and token sums with
+/// their own denominators - while the stable #269 schema keys survive intact.
+#[test]
+fn test_status_json_embed_state_extensions_when_pending() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (project_dir, config_path) = offline_indexed_project(home.path());
+
+    let output = spelunk_bin_in(home.path())
+        .env("SPELUNK_NO_SERVER", "1")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .args(["status", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+
+    // Stable schema keys must survive the extension (additive-only contract).
+    for key in [
+        "version",
+        "db_path",
+        "indexed_files",
+        "total_chunks",
+        "languages",
+        "embedding_dim",
+        "has_semantic_search",
+        "memory_entries",
+        "memory_backend",
+        "tier",
+        "embedding_count",
+    ] {
+        assert!(
+            body.get(key).is_some(),
+            "stable/extension key `{key}` missing from status JSON"
+        );
+    }
+
+    let total_chunks = body["total_chunks"].as_i64().unwrap();
+    assert!(total_chunks > 0, "fixture must produce chunks");
+    assert_eq!(body["embedding_count"].as_i64(), Some(0));
+    assert_eq!(
+        body["embedding_pending"].as_i64(),
+        Some(total_chunks),
+        "everything is pending on an offline-built index"
+    );
+    assert_eq!(
+        body["embed_worker_alive"].as_bool(),
+        Some(false),
+        "no recorded worker must read as alive=false, never a guess"
+    );
+    let tokens = &body["embed_tokens"];
+    assert!(
+        tokens.is_object(),
+        "embed_tokens must be an object: {tokens}"
+    );
+    let total_tokens = tokens["total_tokens"].as_i64().unwrap();
+    let pending_tokens = tokens["pending_tokens"].as_i64().unwrap();
+    assert!(total_tokens > 0, "token counts are written at parse time");
+    assert_eq!(
+        pending_tokens, total_tokens,
+        "zero embeddings means every token is pending"
+    );
+}
+
+/// ADR-070 D4: with pending work and no recorded worker, text `status` says
+/// `Embedding incomplete` plus the resume command - never `in progress`, and
+/// the deleted hedging parenthetical must not resurface.
+#[test]
+fn test_status_reports_incomplete_when_no_worker_is_recorded() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (project_dir, config_path) = offline_indexed_project(home.path());
+
+    spelunk_bin_in(home.path())
+        .env("SPELUNK_NO_SERVER", "1")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Embedding incomplete"))
+        .stdout(predicate::str::contains("resume with `spelunk index .`"))
+        .stdout(predicate::str::contains("Embedding in progress").not())
+        .stdout(predicate::str::contains("may be running").not());
+}
+
+/// ADR-070 D4: a worker that crashed without cleanup leaves a pid file behind;
+/// the next `status` must classify the dead pid as not-running (never
+/// `in progress`) and remove the stale record so it cannot be re-read later.
+#[cfg(unix)]
+#[test]
+fn test_status_cleans_stale_dead_worker_pid_and_reports_incomplete() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (project_dir, config_path) = offline_indexed_project(home.path());
+    let db_path = project_dir.join(".spelunk").join("index.db");
+    assert!(db_path.exists(), "offline index must exist");
+
+    // A pid that was real and is now certainly dead: spawn and reap a child.
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+
+    let pid_file = embed_worker_pid_file(home.path(), &db_path);
+    fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+    fs::write(&pid_file, format!("{dead_pid}\n")).unwrap();
+    fs::write(pid_file.with_extension("baseline"), "0 1000\n").unwrap();
+
+    spelunk_bin_in(home.path())
+        .env("SPELUNK_NO_SERVER", "1")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Embedding incomplete"))
+        .stdout(predicate::str::contains("Embedding in progress").not());
+
+    assert!(
+        !pid_file.exists(),
+        "a dead worker's stale pid record must be cleaned up on read"
+    );
+}
+
+/// ADR-070 D4: a pid recycled by an unrelated live process (here: this test
+/// process itself - alive, but its command line is not a spelunk index run)
+/// must never be reported as a live embed worker, and the foreign record is
+/// cleaned up like a dead one.
+#[cfg(unix)]
+#[test]
+fn test_status_foreign_pid_reuse_never_reads_as_live_worker() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (project_dir, config_path) = offline_indexed_project(home.path());
+    let db_path = project_dir.join(".spelunk").join("index.db");
+
+    // This test process is definitely alive, and its `ps` command line (the
+    // e2e test binary plus a test-name filter) is not a spelunk index run.
+    let foreign_pid = std::process::id();
+
+    let pid_file = embed_worker_pid_file(home.path(), &db_path);
+    fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+    fs::write(&pid_file, format!("{foreign_pid}\n")).unwrap();
+
+    spelunk_bin_in(home.path())
+        .env("SPELUNK_NO_SERVER", "1")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Embedding in progress").not())
+        .stdout(predicate::str::contains("Embedding incomplete"));
+
+    assert!(
+        !pid_file.exists(),
+        "a foreign (recycled) pid record must be cleaned up on read"
+    );
+}
+
+/// Regression: writer and reader of runtime state must agree on
+/// `SPELUNK_STATE_DIR`. `HOME` and `SPELUNK_STATE_DIR` are pointed at two
+/// *different* directories; the embed worker's pid file is written only into
+/// the override directory (as the writer does once it honours the override),
+/// never under `HOME`. `status` - the reader - must resolve the same
+/// override to find and clean it up. Before the fix, `status`'s read path
+/// (`cli/cmd/embed_worker.rs` -> `cli/cmd/server.rs::spelunk_state_dir()`)
+/// ignored `SPELUNK_STATE_DIR` and only ever looked under `HOME`, so a file
+/// written to the override would never be found.
+#[cfg(unix)]
+#[test]
+fn test_status_honors_state_dir_override_for_embed_worker_pid() {
+    let home = tempfile::TempDir::new().unwrap();
+    let state_override = tempfile::TempDir::new().unwrap();
+    let (project_dir, config_path) = offline_indexed_project(home.path());
+    let db_path = project_dir.join(".spelunk").join("index.db");
+    assert!(db_path.exists(), "offline index must exist");
+
+    // A pid that was real and is now certainly dead.
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+
+    // Write directly into the override dir - NOT `<home>/.local/state/spelunk`.
+    let pid_file = embed_worker_pid_file_in(state_override.path(), &db_path);
+    fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+    fs::write(&pid_file, format!("{dead_pid}\n")).unwrap();
+    fs::write(pid_file.with_extension("baseline"), "0 1000\n").unwrap();
+
+    // Sanity: nothing was written under the HOME-derived default location.
+    let home_pid_file = embed_worker_pid_file(home.path(), &db_path);
+    assert!(
+        !home_pid_file.exists(),
+        "fixture bug: pid file must only exist under the override"
+    );
+
+    spelunk_bin_in(home.path())
+        .env("SPELUNK_NO_SERVER", "1")
+        .env("SPELUNK_STATE_DIR", state_override.path())
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Embedding incomplete"))
+        .stdout(predicate::str::contains("Embedding in progress").not());
+
+    assert!(
+        !pid_file.exists(),
+        "the reader must resolve SPELUNK_STATE_DIR (not HOME) to find and clean up the stale pid record"
+    );
+}
+
+/// ADR-070 D3, zero-coverage auto cell, end to end: an offline-built index has
+/// chunks but no embeddings; `search` in auto mode must fall back to the live
+/// search with a stderr notice naming warmup - never a bare `No results
+/// found.` over a corpus KNN never saw.
+#[test]
+fn test_search_auto_zero_coverage_falls_back_with_warmup_notice() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (project_dir, config_path) = offline_indexed_project(home.path());
+
+    spelunk_bin_in(home.path())
+        .env("SPELUNK_NO_SERVER", "1")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .args(["search", "compute"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("semantic search is warming up"))
+        .stderr(predicate::str::contains("0/"))
+        .stderr(predicate::str::contains("ast-grep"));
+}
+
+/// ADR-070 D3, zero-coverage explicit cell, end to end: with a reachable
+/// server but an index whose embeddings have not been built yet, an explicit
+/// `--mode semantic` search must be an actionable error naming warmup and the
+/// resume command - never `No results found.`.
+#[tokio::test]
+async fn test_search_explicit_semantic_zero_coverage_is_actionable_error() {
+    let mock = MockServer::start().await;
+    plumbing_helpers::mount_health(&mock).await;
+
+    let home = tempfile::TempDir::new().unwrap();
+    let (project_dir, _config_path) = offline_indexed_project(home.path());
+
+    // Same project, but a config that names the (mock) server, so the search
+    // runs at Tier 1 and reaches the coverage gate instead of the Tier-0
+    // text fallback. Under the default `local_first` a bare `server_url`
+    // never serves inference (that's a loopback-only path), so this test
+    // opts into `cloud_first` explicitly to keep exercising the mock's
+    // `/v1/health`, the same way `test_index_and_status` does.
+    let db_ignored = home.path().join("unused.db");
+    let server_config = write_config_with_server(
+        home.path(),
+        &db_ignored,
+        &mock.uri(),
+        &mock.uri(),
+        &project_dir,
+    );
+
+    let assert = spelunk_bin_in(home.path())
+        .current_dir(&project_dir)
+        .env("SPELUNK_MODE", "cloud_first")
+        .arg("--config")
+        .arg(&server_config)
+        .args(["search", "--mode", "semantic", "compute"])
+        .assert()
+        .failure();
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("warming up"),
+        "error must name warmup, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("spelunk index ."),
+        "error must name the resume command, got stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("No results found"),
+        "never the empty-result claim over an unsearched corpus, got stdout: {stdout}"
+    );
+}
+
+/// ADR-070 D3, partial-coverage cell, end to end: embed everything, then add a
+/// file and re-index offline so coverage is partial. An auto search must emit
+/// the one-line stderr warmup notice carrying the coverage AND its
+/// front-loaded shape, while `--format json` stdout stays machine-clean.
+#[tokio::test]
+async fn test_search_auto_partial_coverage_emits_warmup_notice_on_stderr() {
+    let mock = MockServer::start().await;
+    plumbing_helpers::mount_health(&mock).await;
+    plumbing_helpers::mount_index_embed(&mock).await;
+
+    let home = tempfile::TempDir::new().unwrap();
+    let project_dir = home.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+    fs::write(
+        project_dir.join("lib.rs"),
+        "pub fn compute(x: i32) -> i32 { x * 2 }\n",
+    )
+    .unwrap();
+    let db_ignored = home.path().join("unused.db");
+    let config_path = write_config_with_server(
+        home.path(),
+        &db_ignored,
+        &mock.uri(),
+        &mock.uri(),
+        &project_dir,
+    );
+
+    // Pass 1: embed everything via the mock server (full coverage).
+    //
+    // This test's purpose is the partial-vs-zero coverage warmup notice, not
+    // local-vs-remote embed routing, so it needs an explicit `server_url` to
+    // legitimately serve embedding here. Under the default `local_first`
+    // mode that routing is now correctly refused (see the `get_inference_tier`
+    // routing fix) in favor of the local loopback embedder, which this test
+    // does not configure - so force `cloud_first` via env (a project-level
+    // `.spelunk/config.toml`, which `write_config_with_server` writes to,
+    // silently drops a `mode` key; see `write_project_server_config`).
+    spelunk_bin_in(home.path())
+        .env("SPELUNK_MODE", "cloud_first")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("index")
+        .arg(&project_dir)
+        .assert()
+        .success();
+
+    // Pass 2: add a file and re-index offline - its chunks are stored but not
+    // embedded, so coverage drops below 100%.
+    fs::write(
+        project_dir.join("extra.rs"),
+        "pub fn extra_helper() -> i32 { 41 }\npub fn another_helper() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    spelunk_bin_in(home.path())
+        .env("SPELUNK_NO_SERVER", "1")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("index")
+        .arg(&project_dir)
+        .assert()
+        .success();
+
+    // Auto search with no reachable embedder: the partial-coverage warmup
+    // notice must land on stderr (percentage + shape + pointer at status),
+    // and the JSON on stdout must stay parseable.
+    let output = spelunk_bin_in(home.path())
+        .env("SPELUNK_NO_SERVER", "1")
+        .current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .args(["search", "compute", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warmup: searchable"),
+        "partial coverage must emit the warmup notice, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("front-loaded by importance and recency"),
+        "the notice must name the prefix shape, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("spelunk status"),
+        "the notice must be actionable, got stderr: {stderr}"
+    );
+    let _: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("stdout must stay machine-clean JSON with all notices on stderr");
 }

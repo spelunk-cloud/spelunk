@@ -816,14 +816,14 @@ fn failed_pre_init_carry_is_fatal_and_writes_nothing() {
     );
 }
 
-// ── the notes lock must not weaponize the fatal carry (ADR-069 D6 x D3) ────────
+// ── a contended notes lock fails the writer, loudly (ADR-069 D8) ──────────────
 
 /// The wait budget the carrier allows before giving up on a contended notes
 /// lock. Mirrors `LOCK_WAIT_BUDGET` in `storage/git_notes/lock.rs`.
 const LOCK_WAIT_BUDGET: Duration = Duration::from_secs(5);
 
 /// `<git-common-dir>/spelunk-notes.lock` — the file the carrier locks, resolved
-/// the way the production code resolves it.
+/// the way the production code resolves it, canonicalization included.
 fn notes_lock_path(repo: &Path) -> std::path::PathBuf {
     let raw = git_stdout(repo, &["rev-parse", "--git-common-dir"]);
     let raw = raw.trim();
@@ -833,26 +833,25 @@ fn notes_lock_path(repo: &Path) -> std::path::PathBuf {
     } else {
         repo.join(raw)
     };
+    let common_dir = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
     common_dir.join("spelunk-notes.lock")
 }
 
-/// A contended notes lock must never turn a working `memory add` into a failure.
+/// A pre-`init` `memory add` that cannot take a contended notes lock fails,
+/// visibly, and writes nothing (ADR-069 D8).
 ///
-/// Case 7 above makes a failed pre-`init` carry fatal: there is no SQLite
-/// primary to absorb it. The carrier's lock (ADR-069 D6) is therefore bounded
-/// and non-fatal by design — on contention it warns and writes unlocked. If it
-/// ever returned an `Err` instead, contention alone would break `memory add` on
-/// exactly the path that has nowhere to fall back to.
+/// This inverts the pre-D8 pin that stood here: contention used to warn and
+/// write unlocked, which is the unserialized read-modify-write that silently
+/// erases a concurrent writer's entry (#185). An error the user can see and
+/// retry costs a command; the silent clobber costs the record.
 ///
 /// Deterministic: this test holds the lock across the child's whole run, from a
 /// separate process, so the child is guaranteed to exhaust its budget.
 #[test]
-fn contended_notes_lock_does_not_fail_the_fatal_pre_init_carry() {
+fn contended_notes_lock_fails_the_pre_init_carry_and_writes_nothing() {
     let home = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();
     init_git_repo_with_commit(repo.path());
-
-    let title = "contended-lock-still-stored";
 
     let held = std::fs::OpenOptions::new()
         .read(true)
@@ -867,11 +866,20 @@ fn contended_notes_lock_does_not_fail_the_fatal_pre_init_carry() {
     let started = Instant::now();
     bin(home.path(), repo.path())
         .args([
-            "memory", "add", "--kind", "note", "--title", title, "--body", "b",
+            "memory",
+            "add",
+            "--kind",
+            "note",
+            "--title",
+            "contended-lock-must-not-store",
+            "--body",
+            "b",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Stored [note]"));
+        .failure()
+        // No false success line, and the error tells the user what to do.
+        .stdout(predicate::str::contains("Stored").not())
+        .stderr(predicate::str::contains("notes lock").and(predicate::str::contains("Retry")));
     let took = started.elapsed();
 
     drop(held);
@@ -886,16 +894,494 @@ fn contended_notes_lock_does_not_fail_the_fatal_pre_init_carry() {
         notes_lock_path(repo.path()).display()
     );
 
-    // The whole point: the entry is still there, written unlocked.
+    // The whole point: nothing may be written without the lock.
+    let lines = spelunk_note_lines(repo.path());
+    assert!(
+        lines.is_empty(),
+        "a contended carry must write nothing; got: {lines:?}"
+    );
+}
+
+/// D8's one kept degradation must be **visible**, not merely traced: an
+/// unusable lock file makes the write proceed unserialized, and the user must
+/// be told on stderr even with `RUST_LOG` unset, because a warning routed only
+/// through `tracing` reaches nobody in the shipped binary.
+///
+/// A directory planted at the lock path makes the open fail deterministically
+/// on every platform (EISDIR on unix, access-denied on Windows).
+#[test]
+fn unusable_notes_lock_degradation_is_visible_without_rust_log() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_git_repo_with_commit(repo.path());
+
+    std::fs::create_dir_all(notes_lock_path(repo.path()))
+        .expect("plant a directory at the notes lock path");
+
+    bin(home.path(), repo.path())
+        .env_remove("RUST_LOG")
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "note",
+            "--title",
+            "unusable-lock-still-stores",
+            "--body",
+            "b",
+        ])
+        .assert()
+        // The write itself proceeds: failing every write on a lock-hostile
+        // filesystem would make spelunk unusable there (ADR-069 D8).
+        .success()
+        .stdout(predicate::str::contains("Stored [note]"))
+        // And the degradation is surfaced, not swallowed.
+        .stderr(predicate::str::contains("without the cross-process lock"));
+
+    let lines = spelunk_note_lines(repo.path());
+    assert!(
+        lines.len() == 1 && lines[0].contains("unusable-lock-still-stores"),
+        "the degraded write must still land exactly one record; got: {lines:?}"
+    );
+}
+
+// ── ADR-068 A6 retrofit: supersede edges travel via the carrier ───────────────
+//
+// Both `memory add --supersedes` and `memory supersede` archive the OLD entry
+// in the SQLite primary already; what was missing is carrying that edge to
+// git notes too, via a second, appended record for OLD (never a rewrite of
+// its original line — see `append_state_update`'s doc in
+// `storage/git_notes/mod.rs`). The gap this closes: `add.rs` already passed
+// `--supersedes` through to the SQLite backend, then wrote
+// `superseded_by_entity_id: None` on the write-through record regardless, so
+// the edge was silently dropped even when explicitly requested.
+
+/// A JSON-Lines record's `title` and `status`, read together since several
+/// assertions below need both to pick the right line out of a note with more
+/// than one record for the same title (the OLD entity's original record and
+/// its later state-update).
+fn title_and_status(line: &str) -> (String, String) {
+    (record_field(line, "title"), record_field(line, "status"))
+}
+
+/// `memory add --supersedes OLD` must carry OLD's edge to git notes, not just
+/// write the NEW entry: OLD's original record stays untouched (append-only),
+/// and a second record for OLD lands with `status: archived` and
+/// `superseded_by_entity_id` pointing at NEW's `entity_id` — never the other
+/// way around.
+#[test]
+fn post_init_add_supersedes_carries_edge_for_old_entry() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_git_repo_with_commit(repo.path());
+    std::fs::create_dir_all(repo.path().join(".spelunk")).unwrap();
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "old-decision",
+            "--body",
+            "b1",
+        ])
+        .assert()
+        .success();
+    let old_lines = spelunk_note_lines(repo.path());
+    assert_eq!(old_lines.len(), 1, "setup: OLD's own add");
+    let old_id = record_field(&old_lines[0], "id");
+    let old_entity_id = record_field(&old_lines[0], "entity_id");
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "new-decision",
+            "--body",
+            "b2",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .success();
+
     let lines = spelunk_note_lines(repo.path());
     assert_eq!(
         lines.len(),
-        1,
-        "a contended carry must still write exactly one record; got: {lines:?}"
+        3,
+        "OLD's untouched original, NEW's record, and OLD's state-update; got: {lines:?}"
+    );
+
+    let new_line = lines
+        .iter()
+        .find(|l| title_and_status(l) == ("new-decision".to_string(), "active".to_string()))
+        .unwrap_or_else(|| panic!("no active new-decision record in {lines:?}"));
+    let new_entity_id = record_field(new_line, "entity_id");
+    assert!(
+        !new_line.contains("superseded_by_entity_id"),
+        "the edge must never land on NEW's record; got: {new_line}"
+    );
+
+    let old_original = lines
+        .iter()
+        .find(|l| title_and_status(l) == ("old-decision".to_string(), "active".to_string()))
+        .unwrap_or_else(|| {
+            panic!("OLD's original active record must survive untouched: {lines:?}")
+        });
+    assert_eq!(
+        record_field(old_original, "entity_id"),
+        old_entity_id,
+        "OLD's original record must be byte-identical in identity, never rewritten"
+    );
+
+    let old_update = lines
+        .iter()
+        .find(|l| title_and_status(l) == ("old-decision".to_string(), "archived".to_string()))
+        .unwrap_or_else(|| panic!("OLD's state-update record is missing: {lines:?}"));
+    assert_eq!(
+        record_field(old_update, "entity_id"),
+        old_entity_id,
+        "the state-update record must carry OLD's own entity_id, not NEW's"
+    );
+    assert_eq!(
+        record_field(old_update, "superseded_by_entity_id"),
+        new_entity_id,
+        "the edge must point at NEW's entity_id"
     );
     assert!(
-        lines[0].contains(title),
-        "the record must be the entry we added; got: {:?}",
-        lines[0]
+        !record_field(old_update, "invalid_at").is_empty(),
+        "the state-update record must set invalid_at"
+    );
+}
+
+/// `memory supersede OLD NEW` carries the same edge, via the same shared
+/// carrier helper, when both entries already exist as separate `add`s.
+#[test]
+fn post_init_supersede_command_carries_edge_to_git_notes() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_git_repo_with_commit(repo.path());
+    std::fs::create_dir_all(repo.path().join(".spelunk")).unwrap();
+
+    let add = |title: &str, body: &str| {
+        bin(home.path(), repo.path())
+            .args([
+                "memory", "add", "--kind", "decision", "--title", title, "--body", body,
+            ])
+            .assert()
+            .success();
+    };
+    add("old-via-supersede", "b1");
+    add("new-via-supersede", "b2");
+
+    let seeded = spelunk_note_lines(repo.path());
+    assert_eq!(seeded.len(), 2, "setup: two independent adds");
+    let old_id = record_field(&seeded[0], "id");
+    let new_id = record_field(&seeded[1], "id");
+    let new_entity_id = record_field(&seeded[1], "entity_id");
+
+    bin(home.path(), repo.path())
+        .args(["memory", "supersede", &old_id, &new_id])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Archived #").and(predicate::str::contains("superseded by #")),
+        );
+
+    let lines = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines.len(),
+        3,
+        "OLD's untouched original, NEW's record, and OLD's state-update; got: {lines:?}"
+    );
+
+    let old_update = lines
+        .iter()
+        .find(|l| title_and_status(l) == ("old-via-supersede".to_string(), "archived".to_string()))
+        .unwrap_or_else(|| panic!("OLD's state-update record is missing: {lines:?}"));
+    assert_eq!(
+        record_field(old_update, "superseded_by_entity_id"),
+        new_entity_id,
+        "the edge must point at NEW's entity_id"
+    );
+
+    let new_line = lines
+        .iter()
+        .find(|l| title_and_status(l) == ("new-via-supersede".to_string(), "active".to_string()))
+        .unwrap_or_else(|| panic!("NEW's record is missing: {lines:?}"));
+    assert!(
+        !new_line.contains("superseded_by_entity_id"),
+        "the edge must never land on NEW's record; got: {new_line}"
+    );
+}
+
+/// `memory add --supersedes OLD` run entirely **pre-`init`** (no `.spelunk/`,
+/// carrier-only, as in `memory_add_list_round_trips_via_git_notes_fallback`
+/// above): both OLD and NEW exist only via the git-notes carrier, since there
+/// is no SQLite primary yet. The edge-carry block in `add.rs` ("Carry the OLD
+/// entity's supersede edge too") only runs when a primary backend handle was
+/// opened (`primary_backend.as_ref()`), which is never the case pre-init —
+/// so today the edge is silently dropped: no state-update record is
+/// appended, and no warning is printed, even though the command prints a
+/// plain "Stored" success line as if the `--supersedes` request succeeded.
+///
+/// This currently fails, pinning the gap: `spelunk memory add --supersedes`
+/// pre-init drops the edge exactly the way the pre-fix post-init path used
+/// to (the case this whole task exists to close), just on the other half of
+/// the carrier's supported command surface (ADR-068 D3).
+#[test]
+fn pre_init_add_supersedes_carries_edge_for_old_entry() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_git_repo_with_commit(repo.path());
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "pre-init-old",
+            "--body",
+            "b1",
+        ])
+        .assert()
+        .success();
+    let old_lines = spelunk_note_lines(repo.path());
+    assert_eq!(old_lines.len(), 1, "setup: OLD's own pre-init add");
+    let old_id = record_field(&old_lines[0], "id");
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "pre-init-new",
+            "--body",
+            "b2",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .success();
+
+    let lines = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected OLD's untouched original, NEW's record, and a state-update \
+         archiving OLD (mirroring the post-init behaviour proven above); got \
+         only {lines:?} — pre-init, the `--supersedes` edge is being \
+         silently dropped while the command still reports plain success"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| title_and_status(l) == ("pre-init-old".to_string(), "archived".to_string())),
+        "OLD must gain an archived state-update record even pre-init; got: {lines:?}"
+    );
+}
+
+// ── ADR-068 amendment E4: re-supersede of an already-archived OLD is rejected ──
+//
+// `add_note_superseding`'s archive-OLD UPDATE used to silently no-op when OLD
+// was already archived, and neither it nor `add.rs` inspected that outcome —
+// unlike `memory supersede`, which already rejects a stale OLD. These pin the
+// fix: `memory add --supersedes OLD` against an already-archived OLD must now
+// fail the whole command, before any write, on both storage paths.
+
+/// Post-`init` (SQLite primary + git-notes carrier): a second
+/// `--supersedes OLD` against an OLD already archived by a first
+/// `--supersedes OLD` call must fail loudly, write no new note, and leave the
+/// git-notes carrier exactly as the first (successful) call left it — no
+/// orphaned successor record, no second conflicting state-update for OLD.
+#[test]
+fn post_init_add_supersedes_rejects_already_archived_old() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_git_repo_with_commit(repo.path());
+    std::fs::create_dir_all(repo.path().join(".spelunk")).unwrap();
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "old-decision",
+            "--body",
+            "b1",
+        ])
+        .assert()
+        .success();
+    let old_lines = spelunk_note_lines(repo.path());
+    let old_id = record_field(&old_lines[0], "id");
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "successor-a",
+            "--body",
+            "b2",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .success();
+
+    let lines_after_first_supersede = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines_after_first_supersede.len(),
+        3,
+        "setup: OLD's original, successor A's record, OLD's state-update"
+    );
+
+    // Re-supersede the now-archived OLD with a second, different successor.
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "successor-b",
+            "--body",
+            "b3",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "No active memory entry with id {old_id} (old)"
+        )));
+
+    // No new SQLite row: `memory list --archived` still shows only the two
+    // entries from the first (successful) supersede.
+    let list_output = bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "list",
+            "--format",
+            "jsonl",
+            "--archived",
+            "--limit",
+            "100",
+        ])
+        .output()
+        .unwrap();
+    assert!(list_output.status.success());
+    let stdout = String::from_utf8_lossy(&list_output.stdout);
+    let entry_count = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(
+        entry_count, 2,
+        "a rejected --supersedes must not create an orphaned new note row; got: {stdout}"
+    );
+
+    // No new git-notes carrier record either: still exactly the 3 lines the
+    // first, successful supersede produced.
+    let lines_after_rejected_supersede = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines_after_rejected_supersede.len(),
+        3,
+        "a rejected --supersedes must write neither a new-entry record nor a \
+         second conflicting state-update for OLD; got: {lines_after_rejected_supersede:?}"
+    );
+}
+
+/// Pre-`init` (git-notes-only, no SQLite primary): the same rejection, and the
+/// same "write nothing" contract — critically, the new entry's *own*
+/// git-notes record must never be written either, since the pre-flight check
+/// runs before it.
+#[test]
+fn pre_init_add_supersedes_rejects_already_archived_old() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_git_repo_with_commit(repo.path());
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "pre-init-old",
+            "--body",
+            "b1",
+        ])
+        .assert()
+        .success();
+    let old_lines = spelunk_note_lines(repo.path());
+    let old_id = record_field(&old_lines[0], "id");
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "pre-init-successor-a",
+            "--body",
+            "b2",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .success();
+
+    let lines_after_first_supersede = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines_after_first_supersede.len(),
+        3,
+        "setup: OLD's original, successor A's record, OLD's state-update"
+    );
+
+    bin(home.path(), repo.path())
+        .args([
+            "memory",
+            "add",
+            "--kind",
+            "decision",
+            "--title",
+            "pre-init-successor-b",
+            "--body",
+            "b3",
+            "--supersedes",
+            &old_id,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "No active memory entry with id {old_id} (old)"
+        )));
+
+    let lines_after_rejected_supersede = spelunk_note_lines(repo.path());
+    assert_eq!(
+        lines_after_rejected_supersede.len(),
+        3,
+        "a rejected pre-init --supersedes must not write successor B's own \
+         record, nor a second state-update for OLD; got: {lines_after_rejected_supersede:?}"
+    );
+    assert!(
+        !lines_after_rejected_supersede
+            .iter()
+            .any(|l| l.contains("pre-init-successor-b")),
+        "successor B's record must never be written when the pre-flight check \
+         rejects the supersede; got: {lines_after_rejected_supersede:?}"
     );
 }

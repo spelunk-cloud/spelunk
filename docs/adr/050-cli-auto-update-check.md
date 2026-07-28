@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-28  
 **Deciders:** Architect  
-**Trigger:** spelunk-oss^27 — users on the curl/PowerShell installer have no way to
+**Trigger:** Users on the curl/PowerShell installer have no way to
 learn that a newer release exists; they keep running an old `spelunk` until they
 happen to re-run the install one-liner. We want a lightweight, opt-out update
 *notification* that respects package-manager- and MDM-managed installs.
@@ -17,12 +17,12 @@ The CLI is distributed through several channels:
   `spelunk` + `spelunk-server` into `/usr/local/bin` or `~/.local/bin` and
   downloads `spelunk-${VERSION}-${TARGET}.tar.gz` from
   `https://github.com/spelunk-cloud/spelunk/releases`.
-- Package managers (Homebrew is live; winget is planned in spelunk-oss^31). These
+- Package managers (Homebrew is live; winget is planned). These
   own the binary, place it under a manager-controlled prefix (Homebrew Cellar,
   `/opt/homebrew`, `/usr/local/Cellar`, …), and expect the user to upgrade
   *through the manager* (`brew upgrade`). The binary is often on a read-only or
   manager-owned path.
-- IT/MDM provisioning (spelunk-oss^28 will ship an MDM example), where the
+- IT/MDM provisioning (an MDM example is planned), where the
   endpoint is centrally managed and the user must not self-mutate it.
 
 Current facts the design builds on:
@@ -47,7 +47,7 @@ Current facts the design builds on:
   parse error must never delay or fail `spelunk search`, `spelunk index`, etc.
 - **Cheap to maintain.** The founder's intent is explicitly "doesn't have to be
   advanced." We want the smallest thing that is useful and safe.
-- **Forward-compatible disable surface.** spelunk-oss^28 (MDM) and ^31 (winget)
+- **Forward-compatible disable surface.** The planned MDM and winget paths
   both need a single, well-known way to turn this off. That mechanism is the
   load-bearing part of this ADR.
 
@@ -188,7 +188,7 @@ Concrete names to implement:
   tokens; written with `0600` for tidiness.
 - **MDM/managed honour.** Auto-detection (D2.3) plus the env/config disables
   ensure a centrally managed endpoint is never told to self-upgrade. This is the
-  acceptance-critical security property for spelunk-oss^28.
+  acceptance-critical security property for the MDM path.
 - This ADR introduces a new outbound network call (CLI → api.github.com) and a
   new state file; update `docs/security/THREAT-MODEL.md` accordingly during
   implementation.
@@ -197,10 +197,10 @@ Concrete names to implement:
 
 ## Consequences
 
-- spelunk-oss^28 (MDM example) documents `SPELUNK_NO_UPDATE_CHECK=1` (and/or
+- The MDM example documents `SPELUNK_NO_UPDATE_CHECK=1` (and/or
   `[update] check = false`) as the managed-install opt-out; auto-detection is a
   belt-and-braces backstop.
-- spelunk-oss^31 (winget) relies on the same disable surface + the winget path
+- The winget path relies on the same disable surface + the winget path
   heuristic in D2.3 so winget-managed installs don't self-nag.
 - A future `spelunk self-update` subcommand can reuse D4's release lookup and the
   asset `digest` (`sha256:<hex>`) for verified, explicit, opt-in upgrades — but

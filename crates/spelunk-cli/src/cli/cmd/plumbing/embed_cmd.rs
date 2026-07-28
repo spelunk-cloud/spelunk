@@ -21,7 +21,9 @@ pub(super) async fn embed_cmd(cfg: &Config, query_mode: bool) -> Result<()> {
     }
 
     let client = require_server_client(cfg, "plumbing embed")?;
-    let model = cfg.embedding_model.clone();
+    // The pinned model id, not a config value: the effective embedding model
+    // is fixed product-wide and is never selected by `config.toml`.
+    let model = spelunk_core::embeddings::MODEL_ID.to_string();
 
     let stdin = std::io::stdin();
     for (idx, line) in stdin.lock().lines().enumerate() {

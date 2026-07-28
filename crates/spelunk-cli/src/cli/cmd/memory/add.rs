@@ -7,8 +7,8 @@ use crate::{
     indexer::secrets::contains_secret,
     server_client::ServerInferenceClient,
     storage::{
-        NoteInput, NoteRecord, RewriteRefStatus, append_to_git_notes, now_millis, now_secs,
-        open_memory_backend,
+        GitNotesBackend, MemoryBackend, NoteInput, NoteRecord, RewriteRefStatus,
+        append_state_update, append_to_git_notes, now_millis, now_secs, open_memory_backend,
     },
 };
 
@@ -37,7 +37,12 @@ pub(super) async fn memory_add(
     } else {
         mem_path.parent().unwrap_or(mem_path)
     };
-    let tier = capability::get_tier(cfg).await;
+    // `get_inference_tier` (not `get_tier`): in `local_first`, inference must
+    // always prefer the local loopback embedder, even when `server_url` is
+    // explicitly set (2026-07-23 founder decision, ADR-004 revision).
+    // `get_tier` alone would probe the explicit `server_url` and hand its
+    // (wrong, for inference) URL to `effective_config`.
+    let tier = capability::get_inference_tier(cfg).await;
     let eff_cfg = tier.effective_config(cfg, project_root);
     let cfg = &eff_cfg;
     let (title, body) = if let Some(url) = &args.from_url {
@@ -102,14 +107,51 @@ pub(super) async fn memory_add(
         .valid_at
         .and_then(|s| super::parse_as_of(Some(&s)).ok().flatten());
 
+    // ── Supersede pre-flight (ADR-068 E4) ────────────────────────────────────
+    // If `--supersedes OLD` is given, OLD must still be active — checked
+    // *before* any write (SQLite or git-notes), on both storage paths,
+    // mirroring `memory supersede`'s existing reject-on-stale-OLD contract.
+    // Without this, the SQL layer's `WHERE status = 'active'` guard on the
+    // archive-OLD UPDATE silently no-ops on a stale OLD, leaving an orphaned
+    // new note plus a conflicting git-notes carrier record — the bug this
+    // amendment closes. The read is reused below by the write-through
+    // carrier instead of reading OLD a second time.
+    let mut backend_for_add: Option<Box<dyn MemoryBackend + Send>> = None;
+    let mut old_note_for_carrier = None;
+    if let Some(old_id) = args.supersedes {
+        let old = if pre_init_notes {
+            GitNotesBackend::with_root(project_root.to_path_buf())
+                .get(old_id)
+                .await?
+        } else {
+            let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
+            let old = backend.get(old_id).await?;
+            backend_for_add = Some(backend);
+            old
+        };
+        match old {
+            Some(note) if note.status == "active" => {
+                old_note_for_carrier = Some(note);
+            }
+            _ => {
+                anyhow::bail!("No active memory entry with id {old_id} (old).");
+            }
+        }
+    }
+
     // Primary store (ADR-004): the local SQLite `memory.db`, an explicit team
     // server, or (with `--backend git-notes`) git notes itself. Pre-init there
     // is no primary; the write-through carrier below is the sole writer, so mint
-    // an id the same way the backends do (`now_millis`).
-    let id = if pre_init_notes {
-        now_millis()
+    // an id the same way the backends do (`now_millis`). Reuses the backend
+    // opened above for the E4 pre-flight read (`backend_for_add`) instead of
+    // opening it twice.
+    let (id, created) = if pre_init_notes {
+        (now_millis(), true)
     } else {
-        let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
+        let backend = match backend_for_add.take() {
+            Some(backend) => backend,
+            None => open_memory_backend(cfg, mem_path, backend_override).await?,
+        };
         backend
             .add(NoteInput {
                 kind: args.kind.clone(),
@@ -135,6 +177,7 @@ pub(super) async fn memory_add(
         pre_init_notes || (cfg.store_in_git_notes && backend_override != Some("git-notes"));
     let mut notes_rewrite_note: Option<&str> = None;
     if write_through {
+        let new_entity_id = crate::storage::entity_id::entity_id(&args.kind, &title, &body);
         let record = NoteRecord {
             schema_version: 1,
             id,
@@ -151,41 +194,109 @@ pub(super) async fn memory_add(
             superseded_by: None,
             // Never-synced local row: no cross-machine id yet.
             remote_id: None,
-            entity_id: Some(crate::storage::entity_id::entity_id(
-                &args.kind, &title, &body,
-            )),
+            entity_id: Some(new_entity_id.clone()),
             superseded_by_entity_id: None,
         };
-        // Use process CWD (None) — the CLI is always run from the project root.
         // Secret scan already ran above; no second check needed here.
-        match append_to_git_notes(None, &record).await {
-            // Announce only the call that set it, so a repo says this once.
-            Ok(RewriteRefStatus::Configured) => {
-                notes_rewrite_note = Some(
-                    "Configured git notes.rewriteRef in this repo, so memory now survives \
-                     `git commit --amend` and `git rebase`.",
-                );
+        match append_to_git_notes(Some(project_root), &record).await {
+            Ok(outcome) => {
+                // Visible without RUST_LOG: an unserialized write can lose a
+                // concurrent entry, and this is the only channel that reaches
+                // the user (ADR-069 D8: proceed unlocked, loudly).
+                if let Some(degradation) = outcome.lock_degradation {
+                    eprintln!("Warning: {degradation}");
+                }
+                match outcome.rewrite_ref {
+                    // Announce only the call that set it, so a repo says this once.
+                    RewriteRefStatus::Configured => {
+                        notes_rewrite_note = Some(
+                            "Configured git notes.rewriteRef in this repo, so memory now survives \
+                             `git commit --amend` and `git rebase`.",
+                        );
+                    }
+                    RewriteRefStatus::Failed => {
+                        notes_rewrite_note = Some(
+                            "Warning: could not set git notes.rewriteRef, so memory may not survive \
+                             `git commit --amend` or `git rebase`. Set it with: \
+                             git config --add notes.rewriteRef refs/notes/spelunk",
+                        );
+                    }
+                    RewriteRefStatus::AlreadyCovered => {}
+                }
             }
-            Ok(RewriteRefStatus::Failed) => {
-                notes_rewrite_note = Some(
-                    "Warning: could not set git notes.rewriteRef, so memory may not survive \
-                     `git commit --amend` or `git rebase`. Set it with: \
-                     git config --add notes.rewriteRef refs/notes/spelunk",
-                );
-            }
-            Ok(RewriteRefStatus::AlreadyCovered) => {}
             Err(e) if pre_init_notes => {
                 return Err(e.context(
                     "recording memory entry to git notes (no local project store to fall back on)",
                 ));
             }
-            Err(e) => tracing::warn!("git-notes write-through failed (non-fatal): {e}"),
+            // Visible without RUST_LOG: a swallowed carry failure is how an
+            // entry silently stops traveling with the repo (ADR-069 D8).
+            Err(e) => {
+                eprintln!(
+                    "Warning: entry stored locally, but the git-notes carry failed, \
+                     so it will not travel with the repo: {e:#}"
+                );
+            }
+        }
+
+        // ── Carry the OLD entity's supersede edge too ────────────────────────
+        // `--supersedes` already archived OLD in the primary store above; the
+        // edge itself only travels once a state-update record is appended for
+        // OLD's own entry, pointing at NEW's `entity_id` — writing it on NEW's
+        // record (the one just written above) would be backwards. Best-effort
+        // and non-fatal like the write above: SQLite already holds the
+        // authoritative archive.
+        //
+        // Reuses the pre-flight read above (`old_note_for_carrier`) rather than
+        // re-reading OLD a second time — it was already validated `active`
+        // there, before either write in this function ran (ADR-068 E4).
+        if let Some(old_note) = old_note_for_carrier {
+            let old_id = old_note.id;
+            let invalid_at = old_note.invalid_at.or_else(|| Some(now_secs()));
+            if let Err(e) = append_state_update(
+                Some(project_root),
+                &old_note,
+                "archived",
+                invalid_at,
+                Some(new_entity_id),
+            )
+            .await
+            {
+                eprintln!(
+                    "Warning: entry stored locally, but carrying #{old_id}'s \
+                     supersede edge to git notes failed, so it will not travel \
+                     with the repo: {e:#}"
+                );
+            }
         }
     }
 
-    println!("Stored [{kind}] #{id}: {title}", kind = args.kind);
+    if created {
+        println!("Stored [{kind}] #{id}: {title}", kind = args.kind);
+    } else {
+        println!(
+            "Already recorded as [{kind}] #{id}: {title}",
+            kind = args.kind
+        );
+    }
     if let Some(line) = notes_rewrite_note {
         println!("{line}");
+    }
+
+    // ADR-037 P2: best-effort, non-blocking nudge of the local relay so a
+    // `local_first` write's outbox drains promptly. Never affects this
+    // command's own success/output; see `outbox.rs`.
+    //
+    // Gated on `placeholder_path`, not just `pre_init_notes`: when there is no
+    // local `.spelunk/` project yet and this write rode the git-notes carrier
+    // via an explicit `--backend git-notes` (not the pre-init carrier),
+    // `resolve_memory_store` still hands back a placeholder `mem_path` that no
+    // caller is meant to open (see its doc comment). Nudging it would call
+    // `MemoryStore::open`, which unconditionally creates the parent directory
+    // and an empty `memory.db` there as a side effect, a phantom SQLite store
+    // for a project that deliberately opted out of one.
+    if !placeholder_path {
+        super::outbox::nudge_after_write(cfg, mem_path).await;
     }
     Ok(())
 }
@@ -283,7 +394,7 @@ async fn fetch_url_content(url: &str) -> Result<(String, String)> {
 /// wholesale. Useful in tests and on Windows CI, where `dirs::home_dir()`
 /// (v6) calls `SHGetKnownFolderPath` rather than reading `HOME`/`USERPROFILE`,
 /// making per-process environment overrides of `HOME` ineffective — see the
-/// identical note on `spelunk_state_dir` in `capability.rs`.
+/// identical note on `spelunk_state_dir` in `capability/probe.rs`.
 fn web_to_md_script_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("SPELUNK_SCRIPTS_DIR") {
         return Some(std::path::PathBuf::from(dir).join("web-to-md.ts"));

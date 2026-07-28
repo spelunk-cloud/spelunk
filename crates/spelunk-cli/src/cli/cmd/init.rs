@@ -1,3 +1,4 @@
+use super::color::cprintln;
 use anyhow::{Context, Result};
 use clap::Args;
 
@@ -45,8 +46,8 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
     let config_path = spelunk_dir.join("config.toml");
 
     // Ignore machine-specific SQLite (index.db/memory.db + their -wal/-shm
-    // sidecars); config.toml and cloud-project-id.lock are committed, so must
-    // not be listed here. Idempotent: never clobbers a pre-existing file.
+    // sidecars); config.toml is committed, so must not be listed here.
+    // Idempotent: never clobbers a pre-existing file.
     write_spelunk_gitignore(&spelunk_dir);
 
     // Project slug: explicit --name, else derived (`host/owner/repo` when a git
@@ -102,7 +103,44 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
         "not installed  (run `spelunk hooks install` to add)".to_string()
     };
 
-    // ── 5. Run initial index (unless --no-index) ──────────────────────────────
+    // ── 5. Auto-spawn server (TTY only) or probe for a running server ─────────
+    //
+    // Interactive (stdin is a TTY): attempt to start the server so semantic
+    // search works immediately. Non-interactive (CI / hook): probe only,
+    // never auto-spawn; print a skip notice if offline.
+    //
+    // This runs BEFORE the index step, and the index step below hands the
+    // embed pass to the detached worker. The two are one change (ADR-070 D1):
+    // starting the server first is what makes the detached embed reachable on
+    // a fresh machine (otherwise the embed probes for a server this very
+    // command has not started yet and silently ships a zero-embedding index),
+    // and detaching is what keeps the reorder from holding the terminal
+    // through the entire embed pass.
+    let server_line: Option<String> = {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            match super::server::ensure_server_running(7777).await {
+                Ok((port, true)) => Some(format!(
+                    "http://127.0.0.1:{port}  \x1b[32m✓\x1b[0m  (auto-started)"
+                )),
+                Ok((port, false)) => Some(format!("http://127.0.0.1:{port}  \x1b[32m✓\x1b[0m")),
+                Err(e) => {
+                    tracing::debug!("server auto-start skipped: {e}");
+                    None
+                }
+            }
+        } else {
+            let tier = capability::get_tier(&cfg).await;
+            match tier {
+                capability::Tier::Server { url, .. } => Some(format!("{url}  \x1b[32m✓\x1b[0m")),
+                capability::Tier::Offline => {
+                    Some("[server not running - semantic search skipped]".to_string())
+                }
+            }
+        }
+    };
+
+    // ── 6. Run initial index (unless --no-index) ──────────────────────────────
     let (file_count, chunk_count) = if args.no_index {
         println!("Skipping index (--no-index). Run `spelunk index .` when ready.");
         // If the DB exists already, read its stats; otherwise report zeros.
@@ -118,7 +156,13 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
             (0, 0)
         }
     } else {
-        // Delegate to the real index command logic.
+        // Delegate to the real index command logic. `detach_embed: true` hands
+        // the (usually long) embed pass to the detached background worker, so
+        // init returns the prompt after parsing instead of holding the
+        // terminal through the whole embed (ADR-070 D1; on the profiled repo
+        // that wait is ~103 minutes). The worker waits out a still-loading
+        // embedder, so this holds on a cold machine whose server step 5 only
+        // just started.
         let index_args = super::index::IndexArgs {
             path: project_root.clone(),
             db: None,
@@ -130,7 +174,12 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
             background_phases: false,
             embed_phases: false,
             detach: false,
-            detach_embed: false,
+            detach_embed: true,
+            // `init` has no global `--config` override of its own to forward
+            // (it isn't threaded through `InitArgs`); a detached embed child
+            // spawned from here falls back to the default config, same as
+            // before this field existed.
+            config_path: None,
         };
         super::index::index(index_args, cfg.clone()).await?;
 
@@ -144,7 +193,7 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
         }
     };
 
-    // ── 5b. Import git-notes memory into the project memory.db ────────────────
+    // ── 6b. Import git-notes memory into the project memory.db ────────────────
     // Entries recorded on `refs/notes/spelunk` before init (git-notes fallback
     // or write-through) are invisible to the SQLite-backed `memory list` until
     // imported. No enclosing git repo → nothing to import. Non-fatal: a failure
@@ -164,35 +213,6 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
         }
     } else {
         None
-    };
-
-    // ── 6. Auto-spawn server (TTY only) or probe for a running server ─────────
-    //
-    // Interactive (stdin is a TTY): attempt to start the server so semantic
-    // search works immediately. Non-interactive (CI / hook): probe only —
-    // never auto-spawn; print a skip notice if offline.
-    let server_line: Option<String> = {
-        use std::io::IsTerminal;
-        if std::io::stdin().is_terminal() {
-            match super::server::ensure_server_running(7777).await {
-                Ok((port, true)) => Some(format!(
-                    "http://127.0.0.1:{port}  \x1b[32m✓\x1b[0m  (auto-started)"
-                )),
-                Ok((port, false)) => Some(format!("http://127.0.0.1:{port}  \x1b[32m✓\x1b[0m")),
-                Err(e) => {
-                    tracing::debug!("server auto-start skipped: {e}");
-                    None
-                }
-            }
-        } else {
-            let tier = capability::get_tier(&cfg).await;
-            match tier {
-                capability::Tier::Server { url, .. } => Some(format!("{url}  \x1b[32m✓\x1b[0m")),
-                capability::Tier::Offline => {
-                    Some("[server not running — semantic search skipped]".to_string())
-                }
-            }
-        }
     };
 
     // ── 7. Configure git-notes refspec on `origin` (only inside a git repo) ───
@@ -226,7 +246,7 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
         println!("  Memory:  {line}");
     }
     if let Some(line) = server_line {
-        println!("  Server:  {line}");
+        cprintln!("  Server:  {line}");
     }
     for line in &notes_lines {
         println!("  {line}");
@@ -239,19 +259,21 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// Write `.spelunk/.gitignore` covering the machine-specific SQLite files.
-/// The `*` glob covers the `-wal`/`-shm` sidecars. Created only when absent so
-/// re-init never clobbers user edits; failures are non-fatal.
+/// Write `.spelunk/.gitignore` covering the machine-specific SQLite and log
+/// files. The `*` glob covers the `-wal`/`-shm` sidecars. Created only when
+/// absent so re-init never clobbers user edits; failures are non-fatal.
 fn write_spelunk_gitignore(spelunk_dir: &std::path::Path) {
     let gitignore_path = spelunk_dir.join(".gitignore");
     if gitignore_path.exists() {
         return;
     }
-    // Only the machine-specific SQLite is listed. config.toml and
-    // cloud-project-id.lock are committed, so they must stay out of this file.
+    // Only machine-specific regenerated files are listed. config.toml is
+    // committed, so it must stay out of this file.
     const GITIGNORE: &str = "# Machine-specific SQLite, regenerated by `spelunk index`.\n\
                              index.db*\n\
-                             memory.db*\n";
+                             memory.db*\n\
+                             # Diagnostics from the detached background index phases.\n\
+                             *.log\n";
     if let Err(e) = std::fs::create_dir_all(spelunk_dir) {
         eprintln!("Warning: could not create {}: {e}", spelunk_dir.display());
         return;
@@ -275,15 +297,14 @@ fn write_spelunk_gitignore(spelunk_dir: &std::path::Path) {
 ///
 /// Push refspec is deliberately NOT set: any `remote.origin.push` value
 /// overrides git's default branch push, so a normal `git push` would stop
-/// pushing the current branch. We keep the branch-push default intact and
-/// surface the manual notes push (needed after each memory change) instead.
+/// pushing the current branch. Publishing rides the opt-in pre-push hook
+/// instead, which this announces (ADR-069 D1/D3) because opt-in only works if it
+/// is discoverable without reading the docs.
 /// Also points `notes.rewriteRef` at spelunk's ref so memory survives history
 /// rewrites. That half is independent of `origin`: rewrites are purely local,
 /// so it runs even in a remote-less repo.
 async fn configure_notes_refspec(project_root: &std::path::Path) -> Vec<String> {
     const FETCH_REFSPEC: &str = "+refs/notes/spelunk*:refs/notes/origin/spelunk*";
-    const PUSH_HINT: &str =
-        "push notes after each memory change: git push origin refs/notes/spelunk";
 
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -303,7 +324,6 @@ async fn configure_notes_refspec(project_root: &std::path::Path) -> Vec<String> 
                 format!(
                     "         run later: git config --add remote.origin.fetch '{FETCH_REFSPEC}'"
                 ),
-                format!("         {PUSH_HINT}"),
             ]
         } else {
             // Idempotent: only `--add` when the identical refspec is not already present.
@@ -317,16 +337,12 @@ async fn configure_notes_refspec(project_root: &std::path::Path) -> Vec<String> 
                 })
                 .unwrap_or(false);
             if already {
-                vec![
-                    "Memory:  notes fetch refspec already configured on 'origin'".to_string(),
-                    format!("         {PUSH_HINT}"),
-                ]
+                vec!["Memory:  notes fetch refspec already configured on 'origin'".to_string()]
             } else {
                 match git(&["config", "--add", "remote.origin.fetch", FETCH_REFSPEC]) {
                     Ok(o) if o.status.success() => vec![
                         "Memory:  configured notes fetch refspec on 'origin' (teammates' memory arrives on fetch)"
                             .to_string(),
-                        format!("         {PUSH_HINT}"),
                     ],
                     Ok(o) => vec![format!(
                         "Memory:  could not configure notes refspec: {}",
@@ -339,6 +355,20 @@ async fn configure_notes_refspec(project_root: &std::path::Path) -> Vec<String> 
     };
 
     // Continuation lines: every branch above already opened a `Memory:` block.
+
+    // Reading a teammate's memory is automatic (the refspec above plus the
+    // read-path merge); publishing yours is opt-in, so say so unprompted.
+    if super::hooks::pre_push_installed(project_root) {
+        lines.push(
+            "         pre-push hook installed: your memory publishes on `git push`".to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "         your memory stays local until you install the pre-push hook: {}",
+            super::hooks::PRE_PUSH_INSTALL_CMD
+        ));
+    }
+
     match ensure_notes_rewrite_ref(Some(project_root)).await {
         RewriteRefStatus::Configured => lines.push(
             "         configured notes.rewriteRef (memory survives `git commit --amend` and `git rebase`)"
@@ -374,57 +404,19 @@ fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 /// Install the git post-commit hook, returning a short status string.
+///
+/// Shares `hooks.rs`'s resolution logic rather than re-implementing it: a
+/// second hardcoded `$GIT_DIR/hooks` here previously disagreed with
+/// `core.hooksPath` in exactly the same way `spelunk hooks install` did.
 fn install_hook_for_init() -> Result<String> {
-    // Re-use the hook installation logic from hooks.rs by calling the same
-    // underlying helper used there: replicate it inline to avoid making private
-    // functions pub, keeping the hook module self-contained.
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let git_dir = gix::discover(&cwd)
-        .context("not inside a git repository")?
-        .git_dir()
-        .to_path_buf();
-    let hooks_dir = git_dir.join("hooks");
-    std::fs::create_dir_all(&hooks_dir)?;
-    let hook_path = hooks_dir.join("post-commit");
-
-    if hook_path.exists() {
-        let existing = std::fs::read_to_string(&hook_path)?;
-        if existing.contains("spelunk post-commit hook") {
-            return Ok(format!("already installed at {}", hook_path.display()));
+    match super::hooks::install_post_commit_hook(&cwd)? {
+        super::hooks::Installed::Wrote(p) => Ok(format!("installed at {}", p.display())),
+        super::hooks::Installed::Updated(p) => Ok(format!("updated at {}", p.display())),
+        super::hooks::Installed::AlreadyPresent(p) => {
+            Ok(format!("already installed at {}", p.display()))
         }
-        anyhow::bail!(
-            "a post-commit hook already exists at {} and was not installed by spelunk; \
-             merge manually or remove it first",
-            hook_path.display()
-        );
     }
-
-    const POST_COMMIT_HOOK: &str = r#"#!/bin/sh
-# spelunk post-commit hook — installed by `spelunk hooks install`
-# Keeps the spelunk index in sync and harvests memory from new commits.
-# Silently skips if `spelunk` is not in PATH, so teammates without spelunk are unaffected.
-
-if ! command -v spelunk >/dev/null 2>&1; then
-  exit 0
-fi
-
-PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
-
-spelunk index "$PROJECT_ROOT"
-spelunk memory harvest --git-range HEAD~1..HEAD
-"#;
-
-    std::fs::write(&hook_path, POST_COMMIT_HOOK)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&hook_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&hook_path, perms)?;
-    }
-
-    Ok(format!("installed at {}", hook_path.display()))
 }
 
 #[cfg(test)]
@@ -447,10 +439,6 @@ mod tests {
         assert!(
             !body.contains("config.toml"),
             "config.toml is committed, must not be ignored: {body}"
-        );
-        assert!(
-            !body.contains("cloud-project-id.lock"),
-            "cloud-project-id.lock is committed, must not be ignored: {body}"
         );
     }
 

@@ -19,7 +19,7 @@
           "health"
         ],
         "summary": "Server liveness check. No authentication required.",
-        "description": "Returns `200` the instant the listener is bound, regardless of embedder\nstate — it never blocks on, and never fails because of, model loading.\nReturns server version, capabilities, identity fields, and the embedder\nreadiness sub-object.",
+        "description": "Returns `200` the instant the listener is bound, regardless of embedder\nstate: it never blocks on, and never fails because of, model loading.\nReturns server version, capabilities, identity fields, and the embedder\nreadiness sub-object.",
         "operationId": "health",
         "responses": {
           "200": {
@@ -144,8 +144,8 @@
         "tags": [
           "index"
         ],
-        "summary": "Generate embeddings for code chunks. The server encodes each chunk and returns the\nvectors. **The server does not store the vectors** — the CLI is the only persistent\nstore for index data.",
-        "description": "Returns 400 if no embedder is configured.\nReturns 413 if the batch exceeds 256 chunks.",
+        "summary": "Generate embeddings for code chunks. The server encodes each chunk and returns the\nvectors. **The server does not store the vectors**: the CLI is the only persistent\nstore for index data.",
+        "description": "Returns 400 if no embedder is configured.\nReturns 413 if the batch exceeds 256 chunks.\nReturns 429 (with `Retry-After`) if the embed admission queue is full.",
         "operationId": "index_embed",
         "parameters": [
           {
@@ -204,6 +204,16 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Embed admission queue full; retry after the given delay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -219,7 +229,7 @@
           "inference"
         ],
         "summary": "Run a single LLM completion over caller-supplied messages. Streaming SSE.",
-        "description": "The server performs no orchestration, adds no system prompt, and stores nothing.\nClient-supplied `max_tokens` is clamped server-side to the configured ceiling.\n\n**Auth:** `Authorization: Bearer` required (Tier 1).\n\n**SSE event shapes:**\n- `{\"kind\":\"token\",\"content\":\"...\"}` — one streamed fragment\n- `{\"kind\":\"done\"}` — terminal success\n- `{\"kind\":\"error\",\"code\":\"...\",\"message\":\"...\"}` — terminal failure mid-stream\n\nReturns 503 if no LLM is configured on this server.",
+        "description": "The server performs no orchestration, adds no system prompt, and stores nothing.\nClient-supplied `max_tokens` is clamped server-side to the configured ceiling.\n\n**Auth:** `Authorization: Bearer` required (Tier 1).\n\n**SSE event shapes:**\n- `{\"kind\":\"token\",\"content\":\"...\"}`: one streamed fragment\n- `{\"kind\":\"done\"}`: terminal success\n- `{\"kind\":\"error\",\"code\":\"...\",\"message\":\"...\"}`: terminal failure mid-stream\n\nReturns 503 if no LLM is configured on this server.",
         "operationId": "llm_complete",
         "parameters": [
           {
@@ -399,7 +409,7 @@
           "memory"
         ],
         "summary": "Add a memory entry to a project. The project is auto-created on first write.",
-        "description": "The `embedding` field is optional. If omitted and the server has `SPELUNK_EMBEDDING_URL`\nconfigured, the server embeds the entry before storage. If neither is available, the\nentry is stored without a vector (text search only, no KNN).\n\nReturns **201** on success. Returns **409** when the new entry is semantically\nclose to one or more existing active entries (similarity ≥ conflict_threshold).\nThe entry is still stored in both cases; the 409 is informational.\nReturns **422** when the entry contains prompt-injection patterns.",
+        "description": "The `embedding` field is optional. If omitted and the server's embedder is ready,\nthe server embeds the entry before storage. If neither is available, the\nentry is stored without a vector (text search only, no KNN).\n\nReturns **201** on success. Returns **409** when the new entry is semantically\nclose to one or more existing active entries (similarity ≥ conflict_threshold).\nThe entry is still stored in both cases; the 409 is informational.\nReturns **422** when the entry contains prompt-injection patterns.",
         "operationId": "add_note",
         "parameters": [
           {
@@ -464,7 +474,78 @@
             }
           },
           "422": {
-            "description": "Entry rejected — prompt injection detected"
+            "description": "Entry rejected: prompt injection detected"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/memory/batch": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Batch-create memory entries. Idempotent on `external_id`: a live note\nalready carrying the given `external_id` is skipped, not duplicated.",
+        "description": "Wire-compatible with the CLI's `BatchPushItem`/`CloudSyncClient::push_batch`\n(the same client cloud-api's `/memory/batch` serves); `spelunk memory push`\nand `spelunk sync` target this route on an OSS team server exactly as they\ndo against cloud-api. Always returns **207** with a per-entry result list;\na request-level validation failure (oversized batch, a title/body over the\nconfigured caps, or an injection match) rejects the whole batch (4xx/422)\nwith nothing stored, before any entry is written.",
+        "operationId": "push_memory_batch",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project slug (e.g. `usercise/spelunk`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchPushRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "207": {
+            "description": "Per-entry outcomes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchPushResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (oversized batch, bad field length)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Entry rejected: prompt injection detected"
           }
         },
         "security": [
@@ -606,6 +687,16 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Embed admission queue full; retry after the given delay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -620,7 +711,8 @@
         "tags": [
           "memory"
         ],
-        "summary": "Return notes created after a given Unix timestamp. Archived entries are\nexcluded. Results are ordered `created_at ASC`.",
+        "summary": "Return notes newer than a cursor, in one of two modes:",
+        "description": "- `?since_id=<uuid>`: delta-pull mode (wire parity with cloud-api;\n  `CloudSyncClient::pull_since`/`spelunk sync` targets this). Returns\n  `{entries, count}`, entries ordered by arrival at this server.\n- `?t=<unix_secs>`: legacy timestamp mode (`spelunk memory since`\n  targets this). Returns a bare array, ordered `created_at ASC`.\n\n`since_id` takes precedence when both are supplied. Archived entries are\nexcluded in both modes.",
         "operationId": "memory_since",
         "parameters": [
           {
@@ -635,11 +727,26 @@
           {
             "name": "t",
             "in": "query",
-            "description": "Unix epoch seconds (exclusive lower bound).",
-            "required": true,
+            "description": "Unix epoch seconds (exclusive lower bound). Required unless `since_id`\nis given; ignored when `since_id` is present.",
+            "required": false,
             "schema": {
-              "type": "integer",
+              "type": [
+                "integer",
+                "null"
+              ],
               "format": "int64"
+            }
+          },
+          {
+            "name": "since_id",
+            "in": "query",
+            "description": "UUID cursor (exclusive lower bound, arrival-ordered; see\n`ServerDb::notes_since_id`). Takes precedence over `t` when both are\nsupplied. Selects the delta-pull response shape (`{entries, count}`)\ninstead of the bare array `t` returns.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -655,7 +762,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Notes newer than `t`",
+            "description": "Notes newer than `t` (bare array) or `since_id` (`{entries, count}`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -668,7 +775,7 @@
             }
           },
           "400": {
-            "description": "Missing or invalid `t` parameter",
+            "description": "Neither `t` nor `since_id` given",
             "content": {
               "application/json": {
                 "schema": {
@@ -710,7 +817,7 @@
         "tags": [
           "memory"
         ],
-        "summary": "Stream new memory entries as Server-Sent Events. Each event carries a\nsingle `ServerNote` serialised as JSON. The stream polls the database once\nper second and stays open indefinitely — close the connection to stop it.",
+        "summary": "Stream new memory entries as Server-Sent Events. Each event carries a\nsingle `ServerNote` serialised as JSON. The stream polls the database once\nper second and stays open indefinitely; close the connection to stop it.",
         "description": "Pass `?t=<unix_secs>` to replay entries written after a known timestamp.\nOmit it to receive only entries written after the connection opens.",
         "operationId": "memory_stream",
         "parameters": [
@@ -1051,7 +1158,7 @@
           "search"
         ],
         "summary": "Embed a search query server-side and return the vector for the CLI to use\nin its local KNN search.",
-        "description": "The server applies the F2LLM code-retrieval query prefix\n(`Instruct: Given a code search query…\\nQuery: {q}`) so the CLI does not\nneed to know the embedding format.  The server does **not** perform the KNN\nstep — the local SQLite index lives on the CLI side.\n\n- `\"semantic\"` / `\"hybrid\"`: embeds the query and returns `query_vector`.\n  Returns **400** if no embedder is configured on this server.\n- `\"text\"`: returns `query_vector: null`; the CLI falls back to FTS.",
+        "description": "The server applies the F2LLM code-retrieval query prefix\n(`Instruct: Given a code search query…\\nQuery: {q}`) so the CLI does not\nneed to know the embedding format. The server does **not** perform the KNN\nstep: the local SQLite index lives on the CLI side.\n\n- `\"semantic\"` / `\"hybrid\"`: embeds the query and returns `query_vector`.\n  Returns **400** if no embedder is configured on this server.\n- `\"text\"`: returns `query_vector: null`; the CLI falls back to FTS.",
         "operationId": "project_search",
         "parameters": [
           {
@@ -1097,6 +1204,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Embed admission queue full; retry after the given delay",
             "content": {
               "application/json": {
                 "schema": {
@@ -1192,7 +1309,7 @@
               "type": "number",
               "format": "float"
             },
-            "description": "Pre-computed embedding vector from the client. Optional — if omitted and the server has an\nembedding backend configured (`SPELUNK_EMBEDDING_URL`), the server embeds the entry.\nIf neither is available, the entry is stored without a vector (text search only)."
+            "description": "Pre-computed embedding vector from the client. Optional: if omitted and the\nserver's embedder is ready, the server embeds the entry.\nIf neither is available, the entry is stored without a vector (text search only)."
           },
           "kind": {
             "type": "string",
@@ -1242,6 +1359,122 @@
           }
         }
       },
+      "BatchItemResult": {
+        "type": "object",
+        "description": "Per-entry outcome in the batch response.",
+        "required": [
+          "status",
+          "external_id"
+        ],
+        "properties": {
+          "external_id": {
+            "type": "string"
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The note's `sync_id` (the same id `GET /memory/since` returns and\ncursors on, never the raw row id). Present for `\"created\"` and also\nfor a `\"skipped\"` dedupe-hit (the already-existing id), so a caller\nthat lost track of an earlier create can still recover the id from a\nplain re-push, and a caller that stamps this as its pull cursor gets\nan id that actually orders against `/memory/since`."
+          },
+          "status": {
+            "type": "string",
+            "description": "`\"created\"` or `\"skipped\"` (idempotent re-push)."
+          }
+        }
+      },
+      "BatchNoteItem": {
+        "type": "object",
+        "description": "One entry in a `POST /memory/batch` request. Field-for-field match of the\nCLI's `BatchPushItem` (`spelunk-core/src/storage/remote/sync.rs`): the CLI\nnever sends `embedding` today (its push is text-only), but the\nfield is accepted when present for forward compatibility with a possible\nfuture pushed-vector optimization: the server must not require it.",
+        "required": [
+          "kind",
+          "title",
+          "external_id"
+        ],
+        "properties": {
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "embedding": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "description": "Optional pre-computed embedding. Tolerated, never required."
+          },
+          "external_id": {
+            "type": "string",
+            "description": "Stable cross-machine identity: the server's idempotency key. Stored as\n`notes.remote_id` (unique). A re-push of the same `external_id` against\na live note is skipped, not duplicated."
+          },
+          "kind": {
+            "type": "string"
+          },
+          "source_commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Git SHA provenance, if any. No dedicated column on this schema; stored\nas a `git:<sha>` tag, the same convention `harvested_shas` already reads."
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "BatchPushRequest": {
+        "type": "object",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchNoteItem"
+            }
+          }
+        }
+      },
+      "BatchPushResponse": {
+        "type": "object",
+        "description": "Response body for `POST /memory/batch`; always `207 Multi-Status`.",
+        "required": [
+          "created",
+          "skipped",
+          "failed",
+          "results"
+        ],
+        "properties": {
+          "created": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchItemResult"
+            }
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "BoolResponse": {
         "type": "object",
         "required": [
@@ -1263,7 +1496,7 @@
         "properties": {
           "limit": {
             "type": "integer",
-            "description": "Maximum number of results the caller intends to fetch.\nPassed back in the response for informational purposes only — the server\ndoes not perform the KNN step; the CLI does that against its local index.",
+            "description": "Maximum number of results the caller intends to fetch.\nPassed back in the response for informational purposes only: the server\ndoes not perform the KNN step; the CLI does that against its local index.",
             "minimum": 0
           },
           "mode": {
@@ -1296,7 +1529,7 @@
               "type": "number",
               "format": "float"
             },
-            "description": "Query embedding vector — present for semantic/hybrid modes.\nThe CLI uses this to run KNN against its local index.\n`null` when mode is `\"text\"` (no embedding needed)."
+            "description": "Query embedding vector: present for semantic/hybrid modes.\nThe CLI uses this to run KNN against its local index.\n`null` when mode is `\"text\"` (no embedding needed)."
           }
         }
       },
@@ -1548,7 +1781,7 @@
           },
           "limits": {
             "$ref": "#/components/schemas/ServerLimits",
-            "description": "Server-enforced operative limits for `/index/embed` batch sizing. See\n[`ServerLimits`]. Absent on servers that pre-date this field — treat\nthat as the legacy 30s/no-exemption profile, not \"no limit\"."
+            "description": "Server-enforced operative limits for `/index/embed` batch sizing. See\n[`ServerLimits`]. Absent on servers that pre-date this field; treat\nthat as the legacy 30s/no-exemption profile, not \"no limit\"."
           },
           "started_by": {
             "type": [
@@ -1561,7 +1794,7 @@
           },
           "status": {
             "type": "string",
-            "description": "Always `\"ok\"` — liveness marker, independent of embedder readiness."
+            "description": "Always `\"ok\"`: liveness marker, independent of embedder readiness."
           },
           "version": {
             "type": "string",
@@ -1703,7 +1936,7 @@
           },
           "query": {
             "type": "string",
-            "description": "Text query — the server encodes this using its configured embedder."
+            "description": "Text query: the server encodes this using its configured embedder."
           }
         }
       },
@@ -1718,7 +1951,7 @@
           "embed_request_timeout_secs": {
             "type": "integer",
             "format": "int64",
-            "description": "Wall-clock budget (seconds) this server allows a single `/index/embed`\nrequest before returning `408`. A client should keep its per-request\nbatch's *expected* duration comfortably under this, not just under its\nown client-side timeout — the server will cut it off regardless of\nwhat the client is willing to wait for.",
+            "description": "Wall-clock budget (seconds) this server allows a single `/index/embed`\nrequest before returning `408`. A client should keep its per-request\nbatch's *expected* duration comfortably under this, not just under its\nown client-side timeout: the server will cut it off regardless of\nwhat the client is willing to wait for.",
             "minimum": 0
           },
           "embedder_token_cap": {
@@ -1726,7 +1959,7 @@
               "integer",
               "null"
             ],
-            "description": "Per-chunk token truncation cap the embedder enforces, if known (native\nbackend only — see `EmbeddingBackend::token_cap`). `null` when the\nembedder isn't ready or exposes none (e.g. an external `--embedding-url`).\nInformational — the binding constraint in practice is wall-clock time,\nnot per-batch memory.",
+            "description": "Per-chunk token truncation cap the embedder enforces, if known (native\nbackend only, see `EmbeddingBackend::token_cap`). `null` when the\nembedder isn't ready or exposes none (e.g. a test-only mock backend).\nInformational: the binding constraint in practice is wall-clock time,\nnot per-batch memory.",
             "minimum": 0
           },
           "max_batch_chunks": {
@@ -1808,21 +2041,85 @@
           }
         }
       },
+      "SinceIdEntry": {
+        "type": "object",
+        "description": "One entry in the `since_id`-cursor response of `/memory/since`. `id` is\nthe note's server-minted `sync_id` (arrival-ordered), never its integer\n`id`, which has no meaning to a puller on a different machine.",
+        "required": [
+          "id",
+          "kind",
+          "title",
+          "created_at"
+        ],
+        "properties": {
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "description": "RFC 3339 timestamp."
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "source_commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "SinceIdResponse": {
+        "type": "object",
+        "description": "Response body for the `since_id`-cursor mode of `/memory/since`.",
+        "required": [
+          "entries",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SinceIdEntry"
+            }
+          }
+        }
+      },
       "SinceQuery": {
         "type": "object",
-        "required": [
-          "t"
-        ],
         "properties": {
           "limit": {
             "type": "integer",
             "format": "int64",
             "description": "Maximum number of results (default: 100, max: 500)."
           },
+          "since_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "UUID cursor (exclusive lower bound, arrival-ordered; see\n`ServerDb::notes_since_id`). Takes precedence over `t` when both are\nsupplied. Selects the delta-pull response shape (`{entries, count}`)\ninstead of the bare array `t` returns."
+          },
           "t": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
-            "description": "Unix epoch seconds (exclusive lower bound)."
+            "description": "Unix epoch seconds (exclusive lower bound). Required unless `since_id`\nis given; ignored when `since_id` is present."
           }
         }
       },

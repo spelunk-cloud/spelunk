@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "wings": [
+    {
+      "artifact": "notes.bundle",
+      "expect": {
+        "era_entries": [
+          {
+            "body": "Recorded by spelunk v0.7.1.",
+            "kind": "decision",
+            "title": "single JSON blob era 1"
+          },
+          {
+            "body": "Recorded by spelunk v0.9.3.",
+            "kind": "decision",
+            "title": "JSON lines era without entity ids 1"
+          },
+          {
+            "body": "Recorded by spelunk v0.9.3.",
+            "kind": "decision",
+            "title": "JSON lines era without entity ids 2"
+          },
+          {
+            "body": "Recorded by spelunk v0.9.5.",
+            "kind": "decision",
+            "title": "entity keyed event log era 1"
+          },
+          {
+            "body": "Recorded by spelunk v0.9.5.",
+            "kind": "decision",
+            "title": "entity keyed event log era 2"
+          }
+        ]
+      },
+      "id": "git-notes-eras",
+      "kind": "git-notes",
+      "producer": "0.9.5",
+      "sha256": "a47c7995a0963b860c745d84de506c8242719c1596ded382cbaeed9388ba7e3a"
+    },
+    {
+      "artifact": "index.db.gz",
+      "expect": {
+        "chunk_count": 3,
+        "embedding_count": 3,
+        "file_count": 2,
+        "fts_expect_path": "README.md",
+        "fts_query": "corpus",
+        "graph_edge_count": 23,
+        "vector_storage": "float768"
+      },
+      "id": "index-v0.8.3-float768",
+      "kind": "index",
+      "producer": "0.8.3",
+      "sha256": "ce27da0c79e7618042e6ea269927956bc24a2886003503219a2eb8988671591f"
+    },
+    {
+      "artifact": "index.db.gz",
+      "expect": {
+        "chunk_count": 3,
+        "embedding_count": 3,
+        "file_count": 2,
+        "fts_expect_path": "README.md",
+        "fts_query": "corpus",
+        "graph_edge_count": 23,
+        "vector_storage": "int8"
+      },
+      "id": "index-v0.9.2-pre-user-version",
+      "kind": "index",
+      "producer": "0.9.2",
+      "sha256": "ffb9e7a988a5c6d0054735824fa4401fa0ccc1f11d21c83263f3e8d903eab9ae"
+    },
+    {
+      "artifact": "memory.db.gz",
+      "expect": {
+        "active_note_count": 2,
+        "archived_title": "Retired plan for a separate vector store",
+        "entity_id_present": false,
+        "memory_fts_query": "Supersedes",
+        "note_count": 4,
+        "note_vector_count": 4,
+        "successor_title": "Chunk with tree-sitter and re-window oversized nodes",
+        "superseded_title": "Chunk with tree-sitter named nodes"
+      },
+      "id": "memory-v0.9.3-pre-entity-id",
+      "kind": "memory",
+      "producer": "0.9.3",
+      "sha256": "afcdcd5e298b925aa9323aaea9a238e891ace7f5f382429cd3d998d3825122fd"
+    },
+    {
+      "artifact": "memory.db.gz",
+      "expect": {
+        "active_note_count": 2,
+        "archived_title": "Retired plan for a separate vector store",
+        "entity_id_present": true,
+        "memory_fts_query": "Supersedes",
+        "note_count": 4,
+        "note_vector_count": 4,
+        "successor_title": "Chunk with tree-sitter and re-window oversized nodes",
+        "superseded_title": "Chunk with tree-sitter named nodes"
+      },
+      "id": "memory-v0.9.5",
+      "kind": "memory",
+      "producer": "0.9.5",
+      "sha256": "2bb5198402ca2e783cf9de0c1c6ba2f7ebcfc8c72c5c904e024db3b962fa6536"
+    },
+    {
+      "artifact": "registry.db.gz",
+      "expect": {
+        "dep_count": 1,
+        "project_count": 2
+      },
+      "id": "registry-v0.9.5",
+      "kind": "registry",
+      "producer": "0.9.5",
+      "sha256": "62a75417b3922ec99097ad26395144551ab86b6e49621841ff86b11a2a1735ed"
+    }
+  ]
+}

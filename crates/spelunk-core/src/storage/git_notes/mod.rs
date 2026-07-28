@@ -1,16 +1,22 @@
-use anyhow::{Result, anyhow};
-use std::collections::HashSet;
+use anyhow::{Context, Result, anyhow};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use super::entity_id::note_entity_id;
 use super::memory::Note;
-use super::note_record::{NoteRecord, record_to_note};
+use super::note_record::{NoteRecord, now_millis, now_secs, record_to_note};
+use fold::fold_records;
 
 mod backend_impl;
+mod fold;
 mod lock;
+mod publish;
 
-pub use lock::{NotesLock, lock_notes};
+pub use lock::{LOCK_WAIT_BUDGET, LockAttempt, NotesLock, lock_notes};
+pub use publish::{PublishOutcome, SkipReason, publish_notes};
 
 // ── Carry config: surviving history rewrites ─────────────────────────────────
 
@@ -96,6 +102,137 @@ fn rewrite_ref_covers_spelunk(value: &str) -> bool {
 
 // ── Write-through helper (free function) ─────────────────────────────────────
 
+/// How a writer holds, or legitimately does not hold, the notes lock.
+///
+/// `Unlocked` is ADR-069 D8's one kept degradation, and it is a **returned
+/// value** so a caller can surface it: a `tracing::warn!` reaches nobody
+/// without `RUST_LOG`, and a degradation no caller can see is how silent data
+/// loss stayed invisible in the first place.
+#[must_use]
+enum WriterLock {
+    /// Held until dropped; the guard is retained only for its `Drop`.
+    Held { _guard: NotesLock },
+    /// The lock cannot exist here; the write proceeds unserialized.
+    Unlocked { path: PathBuf, reason: String },
+}
+
+/// Take the notes lock for a writer, per ADR-069 D8: hold it or fail, except
+/// where the lock cannot exist at all, which degrades unlocked and loudly.
+///
+/// `Ok(WriterLock::Unlocked { .. })` is that one degradation. `Err` is
+/// contention (someone else holds the lock; writing anyway is the #185 loss)
+/// or a failed path resolution (git itself is failing, and the writer's own
+/// git calls are next).
+async fn writer_lock(git_root: Option<&std::path::Path>) -> Result<WriterLock> {
+    match lock_notes(git_root).await? {
+        LockAttempt::Acquired(guard) => Ok(WriterLock::Held { _guard: guard }),
+        LockAttempt::Contended { path } => Err(anyhow!(
+            "the git notes lock ({}) stayed held by other writers for over {:?}; \
+             not writing without it, because an unserialized write can silently \
+             erase a concurrent writer's entry. Retry the command (many \
+             concurrent writers can exceed the wait legitimately); if it \
+             persists with nothing else running, a spelunk or git process is \
+             stuck holding the lock (it frees itself when that process exits)",
+            path.display(),
+            lock::LOCK_WAIT_BUDGET,
+        )),
+        LockAttempt::Unusable { path, reason } => {
+            tracing::warn!(
+                "git notes lock {} unusable ({reason}); writing without \
+                 serialization, so a concurrent memory write could be lost",
+                path.display()
+            );
+            Ok(WriterLock::Unlocked { path, reason })
+        }
+    }
+}
+
+/// Attempts for [`read_note_body`] before its failure is surfaced. The
+/// windows-latest losses were transient: the same read succeeded for every
+/// sibling writer moments apart, so a brief, bounded retry of a side-effect
+/// free read absorbs the flake without hiding a persistent failure.
+const NOTE_READ_ATTEMPTS: u32 = 4;
+
+/// Base backoff between read attempts; grows linearly per attempt.
+const NOTE_READ_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// [`read_note_body`], retried up to [`NOTE_READ_ATTEMPTS`] times.
+///
+/// Retries only genuine failures, never "no note found": the read has no side
+/// effects, so retrying cannot double-apply anything, and a persistent failure
+/// still reaches the caller as the `Err` that keeps a writer from wiping the
+/// note. Total added wait is bounded well under the lock budget, so a holder's
+/// cost stays local work (ADR-069 D9).
+async fn read_note_body_with_retry(
+    git_root: Option<&std::path::Path>,
+    object: &str,
+) -> Result<Option<String>> {
+    let mut last_err = None;
+    for attempt in 1..=NOTE_READ_ATTEMPTS {
+        match read_note_body(git_root, object).await {
+            Ok(body) => return Ok(body),
+            Err(e) => {
+                tracing::warn!(
+                    "reading existing note failed (attempt {attempt}/{NOTE_READ_ATTEMPTS}): {e}"
+                );
+                last_err = Some(e);
+                if attempt < NOTE_READ_ATTEMPTS {
+                    tokio::time::sleep(NOTE_READ_BACKOFF * attempt).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt ran"))
+}
+
+/// Read the spelunk note body on `object`, distinguishing "no note" (`None`)
+/// from a failed read (`Err`).
+///
+/// The distinction is load-bearing: a writer that mistakes a failed read for
+/// "no note yet" rewrites the whole note as just its own line, erasing every
+/// sibling entry. Seen live on Windows CI, where a transient git failure
+/// inside the guarded section wiped 6 of 8 concurrent entries (#185).
+///
+/// Matches on the exit code, not the message: "no note found" exits 1, while
+/// infrastructure failures die with 128, and the message text is localized.
+async fn read_note_body(
+    git_root: Option<&std::path::Path>,
+    object: &str,
+) -> Result<Option<String>> {
+    let mut cmd = Command::new("git");
+    if let Some(d) = git_root {
+        cmd.current_dir(d);
+    }
+    let out = cmd
+        .args(["notes", "--ref=spelunk", "show", "--", object])
+        .output()
+        .await?;
+
+    if out.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()));
+    }
+    if out.status.code() == Some(1) {
+        return Ok(None);
+    }
+    Err(anyhow!(
+        "git notes show -- {object}: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+/// What [`append_to_git_notes`] did, beyond writing the entry.
+#[derive(Debug)]
+pub struct AppendOutcome {
+    /// The carry-config status ensured along the way; a CLI caller announces
+    /// it once.
+    pub rewrite_ref: RewriteRefStatus,
+    /// Set when the write proceeded **without** the notes lock (ADR-069 D8's
+    /// one kept degradation, on a filesystem where the lock cannot exist).
+    /// The caller must show it to the user: this return value is the only
+    /// channel that works without `RUST_LOG`.
+    pub lock_degradation: Option<String>,
+}
+
 /// Append a `NoteRecord` as a JSON line to `refs/notes/spelunk` on HEAD.
 ///
 /// Read-modify-write with append semantics: the existing blob is read and its
@@ -105,10 +242,9 @@ fn rewrite_ref_covers_spelunk(value: &str) -> bool {
 ///
 /// Serialized end to end by [`lock_notes`]; without it a concurrent writer
 /// reads the same body and silently drops this entry on write-back (#185).
-///
-/// Errors are intentionally non-fatal: the caller should log `tracing::warn!`
-/// and continue.  On success it returns the [`RewriteRefStatus`] of the carry
-/// config ensured along the way, so a CLI caller can announce it once.
+/// Per ADR-069 D8 a contended lock is an `Err` and nothing is written; only a
+/// lock that cannot exist on this filesystem degrades to an unlocked write,
+/// reported in [`AppendOutcome::lock_degradation`].
 ///
 /// # Arguments
 /// * `git_root` — directory passed to `git -C`; `None` uses the process CWD.
@@ -116,14 +252,23 @@ fn rewrite_ref_covers_spelunk(value: &str) -> bool {
 pub async fn append_to_git_notes(
     git_root: Option<&std::path::Path>,
     record: &NoteRecord,
-) -> Result<RewriteRefStatus> {
+) -> Result<AppendOutcome> {
     // Touches `git config` only, never the notes ref, so it stays outside the
     // lock: serializing it would widen the guarded section for nothing.
     let rewrite_ref = ensure_notes_rewrite_ref(git_root).await;
 
-    // Guard all four steps. Contention must never fail the caller's write, so
-    // an unavailable lock degrades to the pre-#185 unserialized behaviour.
-    let _lock = lock_notes(git_root).await;
+    // Guards all four steps (D8). Bind the whole enum: `Held`'s guard must
+    // live to the end of the function.
+    let lock = writer_lock(git_root).await?;
+    let lock_degradation = match &lock {
+        WriterLock::Held { .. } => None,
+        WriterLock::Unlocked { path, reason } => Some(format!(
+            "wrote to git notes without the cross-process lock (lock file {} \
+             unusable: {reason}); concurrent memory writes in this repo can \
+             lose entries",
+            path.display()
+        )),
+    };
 
     // ── 1. Get HEAD sha ───────────────────────────────────────────────────────
     let head = run_git(git_root, &["rev-parse", "HEAD"])
@@ -131,17 +276,18 @@ pub async fn append_to_git_notes(
         .map(|s| s.trim().to_string())?;
 
     // ── 2. Read existing note (may not exist) ─────────────────────────────────
-    let existing = run_git(git_root, &["notes", "--ref=spelunk", "show", "--", &head])
+    let existing = read_note_body_with_retry(git_root, &head)
         .await
-        .unwrap_or_default();
+        .context("could not read the existing note, so not overwriting it")?;
 
     // ── 3. Append new entry ───────────────────────────────────────────────────
     let new_line = serde_json::to_string(record)?;
 
-    let combined = if existing.trim().is_empty() {
-        new_line
-    } else {
-        format!("{}\n{}", existing.trim_end_matches('\n'), new_line)
+    let combined = match existing {
+        Some(body) if !body.trim().is_empty() => {
+            format!("{}\n{}", body.trim_end_matches('\n'), new_line)
+        }
+        _ => new_line,
     };
 
     // ── 4. Write back ─────────────────────────────────────────────────────────
@@ -168,7 +314,67 @@ pub async fn append_to_git_notes(
     )
     .await?;
 
-    Ok(rewrite_ref)
+    Ok(AppendOutcome {
+        rewrite_ref,
+        lock_degradation,
+    })
+}
+
+/// Append a state-update record for an entity that already exists on the
+/// carrier: `base` supplies its content (`kind`/`title`/`body`/`tags`/
+/// `linked_files`/`source_ref`/`valid_at`) unchanged, while `status`,
+/// `invalid_at` and `superseded_by_entity_id` override its mutable state.
+///
+/// **Never rewrites the entity's existing line(s) in place.** A live-git
+/// experiment (three-repo harness) showed why: a rewrite leaves a second
+/// machine, which holds the original line plus a divergent local note of its
+/// own, with both the rewritten and the stale original line after
+/// `cat_sort_uniq` unions them — the entity appears twice, with conflicting
+/// `status`. Appending a new line instead, and folding same-`entity_id` copies
+/// at read time ([`fold_records`]), converges regardless of merge order
+/// (ADR-068 A6): the fold's archival rule is monotonic, so whichever copy
+/// carries `status: "archived"` wins.
+///
+/// This append is **not** the "re-recording an unchanged entry" case ADR-068
+/// A6 calls a no-op — that no-op is scoped to a byte-for-byte-unchanged
+/// re-record, and does not apply here since this call always changes mutable
+/// state. Nothing in this module suppresses same-`entity_id` appends; keep it
+/// that way; a guard that did would silently swallow every state update this
+/// function writes.
+///
+/// Shared by three callers, all passing `superseded_by_entity_id: None`
+/// except the supersede pair: `memory archive`'s carrier write-through
+/// (`archive.rs`), `GitNotesBackend::archive` (git-notes as the primary
+/// store, not the carrier), and `memory supersede` / `memory add
+/// --supersedes` (the two carriers of a supersede edge, which do pass it).
+pub async fn append_state_update(
+    git_root: Option<&std::path::Path>,
+    base: &Note,
+    status: &str,
+    invalid_at: Option<i64>,
+    superseded_by_entity_id: Option<String>,
+) -> Result<AppendOutcome> {
+    let record = NoteRecord {
+        schema_version: 1,
+        id: now_millis(),
+        kind: base.kind.clone(),
+        title: base.title.clone(),
+        body: base.body.clone(),
+        tags: base.tags.clone(),
+        linked_files: base.linked_files.clone(),
+        created_at: now_secs(),
+        status: status.to_string(),
+        source_ref: base.source_ref.clone(),
+        valid_at: base.valid_at,
+        invalid_at,
+        // Machine-local rowid link: never populated by this path, which keys
+        // entities by `entity_id` only (ADR-068 A6).
+        superseded_by: None,
+        remote_id: None,
+        entity_id: Some(note_entity_id(base)),
+        superseded_by_entity_id,
+    };
+    append_to_git_notes(git_root, &record).await
 }
 
 // ── Read-path merge: making fetched notes visible ────────────────────────────
@@ -198,9 +404,18 @@ pub enum NotesMergeOutcome {
 /// the merge rather than waiting the caller out.
 pub async fn merge_tracking_notes(git_root: Option<&std::path::Path>) -> NotesMergeOutcome {
     // Without this, a concurrent `append_to_git_notes` read-modify-write
-    // silently overwrites the merged entries (#185 / ADR-069 D6).
-    let Some(_lock) = lock_notes(git_root).await else {
-        return NotesMergeOutcome::LockUnavailable;
+    // silently overwrites the merged entries (#185 / ADR-069 D6). Unlike a
+    // writer, every non-acquired outcome skips: the union is idempotent, so
+    // the next read catches up, and a read must never fail over the lock.
+    let _lock = match lock_notes(git_root).await {
+        Ok(LockAttempt::Acquired(guard)) => guard,
+        Ok(LockAttempt::Contended { .. }) | Ok(LockAttempt::Unusable { .. }) => {
+            return NotesMergeOutcome::LockUnavailable;
+        }
+        Err(e) => {
+            tracing::debug!("notes merge skipped, lock path unresolved: {e}");
+            return NotesMergeOutcome::LockUnavailable;
+        }
     };
 
     // `-s` is explicit on every call: the `notes.mergeStrategy` default is
@@ -286,8 +501,8 @@ async fn run_git_with_stdin(
 
 /// Hard cap on entries returned by `list()`.
 ///
-/// Each entry requires one `git notes show` subprocess call (~13 ms).
-/// Without a guard, `list(5000)` would take ~65 seconds.
+/// Bounds output only, not work: the entity fold has to read every reachable
+/// note blob whatever the limit.
 /// Callers needing unbounded listing should use `--backend sqlite`.
 const GIT_NOTES_MAX_LIST: usize = 500;
 
@@ -299,10 +514,13 @@ const GIT_NOTES_MAX_LIST: usize = 500;
 /// Multiple entries accumulate within a commit's note and across commits.
 ///
 /// # Concurrency
-/// `add`/`archive` do read-modify-write and rewrite the note with
-/// `git notes add -f`. Each is serialized by [`lock_notes`], which is keyed on
-/// the git **common** dir so that worktrees sharing one notes ref contend on
-/// one lock (#185).
+/// `add` and `archive` both do read-modify-write and rewrite the note with
+/// `git notes add -f`, appending a new JSON line rather than mutating an
+/// existing one (`archive` appends a `status: "archived"` state-update via
+/// [`append_state_update`], resolving its target by `entity_id` first, per
+/// ADR-068 A6). Each is serialized by [`lock_notes`], which is keyed on the
+/// git **common** dir so that worktrees sharing one notes ref contend on one
+/// lock (#185).
 ///
 /// # Unsupported methods
 /// Semantic search (`search`, `search_hybrid`, `search_timeline`, `search_text`),
@@ -337,6 +555,14 @@ impl GitNotesBackend {
             cmd.current_dir(root);
         }
         cmd
+    }
+
+    /// Exposes the configured root to the free-function carrier helpers
+    /// (`append_state_update` et al.), which take `Option<&Path>` rather than
+    /// `&GitNotesBackend`: they are shared with the SQLite-primary write-through
+    /// path, which has no `GitNotesBackend` to borrow from.
+    fn git_root(&self) -> Option<&std::path::Path> {
+        self.git_root.as_deref()
     }
 
     async fn run(&self, args: &[&str]) -> Result<String> {
@@ -395,9 +621,13 @@ impl GitNotesBackend {
         Ok(self.run(&["rev-parse", "HEAD"]).await?.trim().to_string())
     }
 
-    /// Return (commit-sha, commit-timestamp) pairs for commits that have a
-    /// spelunk note, in reverse-chronological (newest first) order.
-    async fn noted_commits(&self) -> Result<Vec<(String, i64)>> {
+    /// `(commit_sha, note_blob_sha)` for every commit reachable from HEAD that
+    /// carries a spelunk note, in reverse-chronological (newest first) order.
+    ///
+    /// Only commits reachable from HEAD are listed: memory travels with the
+    /// code that carries it, so a teammate's note on a fetched-but-unmerged
+    /// commit stays invisible until that commit is merged.
+    async fn noted_commits(&self) -> Result<Vec<(String, String)>> {
         // `git notes --ref=spelunk list` → "<note-blob-sha> <commit-sha>"
         let list_out = self
             .git()
@@ -409,17 +639,22 @@ impl GitNotesBackend {
             return Ok(vec![]);
         }
 
-        let noted: HashSet<String> = String::from_utf8_lossy(&list_out.stdout)
+        let listing = String::from_utf8_lossy(&list_out.stdout);
+        let noted: HashMap<&str, &str> = listing
             .lines()
-            .filter_map(|l| l.split_whitespace().nth(1).map(str::to_owned))
+            .filter_map(|l| {
+                let mut parts = l.split_whitespace();
+                let blob = parts.next()?;
+                let commit = parts.next()?;
+                Some((commit, blob))
+            })
             .collect();
 
         if noted.is_empty() {
             return Ok(vec![]);
         }
 
-        // Walk git log in reverse-chronological order to get commit timestamps.
-        let log_out = self.git().args(["log", "--format=%H %at"]).output().await?;
+        let log_out = self.git().args(["log", "--format=%H"]).output().await?;
 
         if !log_out.status.success() {
             return Ok(vec![]);
@@ -428,57 +663,85 @@ impl GitNotesBackend {
         let pairs = String::from_utf8_lossy(&log_out.stdout)
             .lines()
             .filter_map(|line| {
-                let mut parts = line.split_whitespace();
-                let sha = parts.next()?.to_owned();
-                let ts: i64 = parts.next()?.parse().ok()?;
-                noted.contains(&sha).then_some((sha, ts))
+                let commit = line.trim();
+                noted
+                    .get(commit)
+                    .map(|blob| (commit.to_owned(), (*blob).to_owned()))
             })
             .collect();
 
         Ok(pairs)
     }
 
-    /// Read the raw note blob for `commit_sha` (empty string if no note).
-    async fn read_note_blob(&self, commit_sha: &str) -> Result<String> {
-        let out = self
-            .git()
-            .args(["notes", "--ref=spelunk", "show", "--", commit_sha])
-            .output()
-            .await?;
-        if !out.status.success() {
-            return Ok(String::new());
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    /// Note blob shas only, for the lenient batch read `folded_records` uses:
+    /// listing/lookup reads must not break because one historical note is
+    /// unreadable (see [`read_note_blobs`](Self::read_note_blobs)).
+    async fn noted_blobs(&self) -> Result<Vec<String>> {
+        Ok(self
+            .noted_commits()
+            .await?
+            .into_iter()
+            .map(|(_, blob)| blob)
+            .collect())
     }
 
-    /// Permissively parse the spelunk records from a commit's note blob.
+    /// Read every listed note blob in one `git cat-file --batch`, in the order
+    /// given.
     ///
-    /// The blob is JSON Lines interleaved with foreign content (prose, other
-    /// tools' lines). Foreign lines are skipped without error; only a record
-    /// from a newer, incompatible `schema_version` returns an error.
-    async fn read_records(&self, commit_sha: &str) -> Result<Vec<NoteRecord>> {
-        let blob = self.read_note_blob(commit_sha).await?;
-        let mut records = Vec::new();
-        for line in blob.lines() {
-            match parse_spelunk_line(line) {
-                Some(record) => {
-                    if record.schema_version > 1 {
-                        return Err(anyhow::Error::new(
-                            crate::error::SpelunkError::SchemaMismatch {
-                                found: record.schema_version,
-                                max_known: 1,
-                            },
-                        ));
-                    }
-                    records.push(record);
-                }
-                None => continue, // foreign line: skip, never error
-            }
+    /// The fold needs every reachable blob, so a per-commit `git notes show`
+    /// would cost one subprocess each (~13 ms). Write paths keep `show`: they
+    /// read exactly one note.
+    async fn read_note_blobs(&self, blob_shas: &[String]) -> Result<Vec<String>> {
+        if blob_shas.is_empty() {
+            return Ok(vec![]);
         }
-        // `cat_sort_uniq` unions lines lexicographically, so after a merge blob
-        // order is not chronological (ADR-069 D2). Stable: ties keep blob order.
-        records.sort_by_key(|r| r.created_at);
-        Ok(records)
+
+        let mut cmd = self.git();
+        cmd.args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open stdin for git cat-file --batch"))?;
+
+        let mut request = blob_shas.join("\n");
+        request.push('\n');
+
+        // Write and drain concurrently: git blocks once the stdout pipe fills,
+        // so writing the whole request first would deadlock on a big enough repo.
+        let writer = async move {
+            stdin.write_all(request.as_bytes()).await?;
+            stdin.shutdown().await
+        };
+        let (write_res, out) = tokio::join!(writer, child.wait_with_output());
+
+        let out = out?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "git cat-file --batch: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        write_res?;
+
+        parse_cat_file_batch(&out.stdout)
+    }
+
+    /// Read the raw note blob for `commit_sha` (empty string if no note).
+    ///
+    /// A failed read is an `Err`, never an empty blob: `append_record` writes
+    /// back what this returns, so conflating the two turns one transient git
+    /// failure into a wiped note (#185).
+    async fn read_note_blob(&self, commit_sha: &str) -> Result<String> {
+        Ok(
+            read_note_body_with_retry(self.git_root.as_deref(), commit_sha)
+                .await?
+                .unwrap_or_default(),
+        )
     }
 
     /// Append `record` as a new JSON line to `object`'s note, preserving every
@@ -489,7 +752,7 @@ impl GitNotesBackend {
         // this path has no command output to announce on.
         ensure_notes_rewrite_ref(self.git_root.as_deref()).await;
 
-        let _lock = lock_notes(self.git_root.as_deref()).await;
+        let _lock = writer_lock(self.git_root.as_deref()).await?;
 
         let existing = self.read_note_blob(object).await?;
         let new_line = serde_json::to_string(record)?;
@@ -501,32 +764,27 @@ impl GitNotesBackend {
         self.add_note_stdin(object, &combined).await
     }
 
-    /// Set `status = "archived"` on the single spelunk record whose `id` matches
-    /// `id` within `object`'s note. Every other line (sibling records and
-    /// foreign content) is re-emitted unchanged in its original position; only
-    /// the matched record's line is re-serialized. Returns whether a match was
-    /// rewritten.
-    async fn archive_record(&self, object: &str, id: i64) -> Result<bool> {
-        let _lock = lock_notes(self.git_root.as_deref()).await;
+    /// Every entry on the ref, folded to one record per entity, no filtering
+    /// or limit truncation — the shared basis for `collect()`'s filtered
+    /// listing and `get()`'s single-entity lookup, so both see the same
+    /// folded state (ADR-068 A6/E4): a record's `status`/
+    /// `superseded_by_entity_id` must reflect every state-update appended
+    /// for its entity (e.g. via `append_state_update`), not just whichever
+    /// raw line happens to carry its original numeric `id`.
+    ///
+    /// The only site that sees every commit's records, so the only site that
+    /// can fold an entity's copies together.
+    async fn folded_records(&self) -> Result<Vec<NoteRecord>> {
+        let blob_shas = self.noted_blobs().await?;
 
-        let blob = self.read_note_blob(object).await?;
-        let mut out_lines: Vec<String> = Vec::new();
-        let mut changed = false;
-        for line in blob.lines() {
-            match parse_spelunk_line(line) {
-                Some(mut record) if !changed && record.id == id => {
-                    record.status = "archived".to_string();
-                    out_lines.push(serde_json::to_string(&record)?);
-                    changed = true;
-                }
-                // Foreign lines and untargeted records: re-emit verbatim.
-                _ => out_lines.push(line.to_string()),
-            }
+        let mut records = Vec::new();
+        for blob in self.read_note_blobs(&blob_shas).await? {
+            records.extend(parse_records(&blob)?);
         }
-        if changed {
-            self.add_note_stdin(object, &out_lines.join("\n")).await?;
-        }
-        Ok(changed)
+
+        // Fold before every filter below. Dropping an archived copy first would
+        // leave a surviving active copy to resurrect the entity.
+        Ok(fold_records(records))
     }
 
     async fn collect(
@@ -536,35 +794,105 @@ impl GitNotesBackend {
         as_of: Option<i64>,
         limit: usize,
     ) -> Result<Vec<Note>> {
-        let commits = self.noted_commits().await?;
-        let mut notes = Vec::new();
+        let mut folded = self.folded_records().await?;
 
-        'outer: for (sha, _) in commits {
-            for record in self.read_records(&sha).await? {
-                if notes.len() >= limit {
-                    break 'outer;
-                }
-                if kind_filter.is_some_and(|k| record.kind != k) {
-                    continue;
-                }
-                if !include_archived && record.status == "archived" {
-                    continue;
-                }
-                if let Some(ts) = as_of {
-                    let effective = record.valid_at.unwrap_or(record.created_at);
-                    if effective > ts {
-                        continue;
-                    }
-                    if record.invalid_at.is_some_and(|ia| ia <= ts) {
-                        continue;
-                    }
-                }
-                notes.push(record_to_note(record));
+        folded.retain(|record| {
+            if kind_filter.is_some_and(|k| record.kind != k) {
+                return false;
             }
+            if !include_archived && record.status == "archived" {
+                return false;
+            }
+            if let Some(ts) = as_of {
+                let effective = record.valid_at.unwrap_or(record.created_at);
+                if effective > ts {
+                    return false;
+                }
+                if record.invalid_at.is_some_and(|ia| ia <= ts) {
+                    return false;
+                }
+            }
+            true
+        });
+
+        // Stable over first-encounter order, so ties keep blob order (D2).
+        folded.sort_by_key(|r| r.created_at);
+        if folded.len() > limit {
+            // Keep the newest, as the sqlite backend's `ORDER BY created_at
+            // DESC LIMIT` does. Folding first is what makes this exact.
+            folded.drain(..folded.len() - limit);
         }
 
-        Ok(notes)
+        Ok(folded.into_iter().map(record_to_note).collect())
     }
+}
+
+/// Permissively parse the spelunk records from one note blob.
+///
+/// The blob is JSON Lines interleaved with foreign content (prose, other
+/// tools' lines). Foreign lines are skipped without error; only a record from
+/// a newer, incompatible `schema_version` returns an error.
+fn parse_records(blob: &str) -> Result<Vec<NoteRecord>> {
+    let mut records = Vec::new();
+    for line in blob.lines() {
+        match parse_spelunk_line(line) {
+            Some(record) => {
+                if record.schema_version > 1 {
+                    return Err(anyhow::Error::new(
+                        crate::error::SpelunkError::SchemaMismatch {
+                            found: record.schema_version,
+                            max_known: 1,
+                        },
+                    ));
+                }
+                records.push(record);
+            }
+            None => continue, // foreign line: skip, never error
+        }
+    }
+    Ok(records)
+}
+
+/// Split `git cat-file --batch` output into one body per requested object.
+///
+/// Each record is `<sha> <type> <size>\n<size bytes>\n`. The size header is the
+/// only safe delimiter: a note body contains newlines of its own.
+fn parse_cat_file_batch(out: &[u8]) -> Result<Vec<String>> {
+    let mut bodies = Vec::new();
+    let mut rest = out;
+
+    while !rest.is_empty() {
+        let nl = rest
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| anyhow!("git cat-file --batch: header with no newline"))?;
+        let header = String::from_utf8_lossy(&rest[..nl]).into_owned();
+        rest = &rest[nl + 1..];
+
+        let fields: Vec<&str> = header.split(' ').collect();
+        match fields.as_slice() {
+            // "<sha> missing" / "<sha> ambiguous": no body follows. A read must
+            // not break on one unreadable note.
+            [_, _] => bodies.push(String::new()),
+            [_, _, size] => {
+                let size: usize = size
+                    .parse()
+                    .map_err(|_| anyhow!("git cat-file --batch: bad size in {header:?}"))?;
+                if rest.len() < size + 1 {
+                    return Err(anyhow!("git cat-file --batch: truncated body"));
+                }
+                bodies.push(String::from_utf8_lossy(&rest[..size]).into_owned());
+                rest = &rest[size + 1..];
+            }
+            _ => {
+                return Err(anyhow!(
+                    "git cat-file --batch: unexpected header {header:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(bodies)
 }
 
 /// Classify one line of a note blob: `Some(record)` if it parses as a JSON
@@ -581,4 +909,139 @@ fn parse_spelunk_line(line: &str) -> Option<NoteRecord> {
         return None;
     }
     serde_json::from_value(value).ok()
+}
+
+/// The framing `git cat-file --batch` emits, pinned against git 2.55.
+#[cfg(test)]
+mod cat_file_batch {
+    use super::*;
+
+    /// One object: `<sha> <type> <size>\n<body>\n`.
+    fn framed(sha: &str, body: &str) -> String {
+        format!("{sha} blob {}\n{body}\n", body.len())
+    }
+
+    #[test]
+    fn empty_output_yields_no_bodies() {
+        assert!(parse_cat_file_batch(b"").expect("parse").is_empty());
+    }
+
+    /// A note body holds newlines of its own, so only the size header can
+    /// delimit it: a body line that mimics a header must not split it.
+    #[test]
+    fn a_body_that_mimics_a_header_is_not_split() {
+        let body = "line one\ndeadbeef blob 99\nline three";
+
+        assert_eq!(
+            parse_cat_file_batch(framed("aaa", body).as_bytes()).expect("parse"),
+            vec![body]
+        );
+    }
+
+    /// One unreadable note must not fail the whole read: git reports
+    /// `<sha> missing` with no body and still exits 0.
+    #[test]
+    fn a_missing_object_yields_an_empty_body_and_the_batch_survives() {
+        let out = format!(
+            "{}bbb missing\n{}",
+            framed("aaa", "first"),
+            framed("ccc", "third")
+        );
+
+        assert_eq!(
+            parse_cat_file_batch(out.as_bytes()).expect("parse"),
+            vec!["first", "", "third"]
+        );
+    }
+
+    /// `git notes add --allow-empty` writes the empty blob. Git still emits the
+    /// body's trailing newline, so a zero-length body must not read as truncated.
+    #[test]
+    fn an_empty_blob_parses_as_an_empty_body() {
+        assert_eq!(
+            parse_cat_file_batch(b"aaa blob 0\n\n").expect("parse"),
+            vec![""]
+        );
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_header_claims_is_an_error() {
+        assert!(parse_cat_file_batch(b"aaa blob 99\nshort\n").is_err());
+    }
+
+    /// Records are consumed in request order, so a body can never be attributed
+    /// to the wrong note.
+    #[test]
+    fn bodies_come_back_in_request_order() {
+        let out = format!("{}{}", framed("aaa", "one"), framed("bbb", "two"));
+
+        assert_eq!(
+            parse_cat_file_batch(out.as_bytes()).expect("parse"),
+            vec!["one", "two"]
+        );
+    }
+
+    /// A repo carrying one note, and that note's blob sha.
+    fn repo_with_one_note() -> (tempfile::TempDir, String) {
+        crate::test_support::isolate_git_config();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "T"]);
+        std::fs::write(dir.path().join("README.md"), "x").expect("write");
+        run(&["add", "."]);
+        run(&["commit", "--no-gpg-sign", "-m", "first"]);
+        run(&["notes", "--ref=spelunk", "add", "-m", "one\ntwo", "HEAD"]);
+
+        let listing =
+            String::from_utf8(run(&["notes", "--ref=spelunk", "list"]).stdout).expect("utf8");
+        let blob = listing
+            .split_whitespace()
+            .next()
+            .expect("a note blob sha")
+            .to_string();
+
+        (dir, blob)
+    }
+
+    /// The batch has to drain stdout while it writes stdin. Sending the whole
+    /// request first deadlocks: git stops reading once its stdout pipe fills,
+    /// and the fold reads every reachable blob, so `GIT_NOTES_MAX_LIST` does not
+    /// bound the request size.
+    ///
+    /// 5000 shas is ~205 KiB in and ~340 KiB out, past the 64 KiB pipe buffer
+    /// both ways. A regression here hangs, so the read is bounded to fail loudly.
+    #[tokio::test]
+    async fn a_request_past_the_pipe_buffer_does_not_deadlock() {
+        let (dir, blob) = repo_with_one_note();
+        let backend = GitNotesBackend::with_root(dir.path().to_path_buf());
+
+        let bodies = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            backend.read_note_blobs(&vec![blob; 5000]),
+        )
+        .await
+        .expect("deadlocked: stdout must drain while stdin is written")
+        .expect("read");
+
+        assert_eq!(bodies.len(), 5000, "one body per requested sha");
+        assert!(
+            bodies.iter().all(|b| b == "one\ntwo\n"),
+            "every body must survive the batch intact"
+        );
+    }
 }

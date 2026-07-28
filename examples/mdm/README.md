@@ -106,7 +106,7 @@ Steps:
    server host, install `macos/cloud.spelunk.server.mobileconfig` (it installs a
    system-scoped LaunchDaemon). On Linux, deploy the team systemd unit from
    `packaging/spelunk-server-team.service` (see
-   [Self-hosting](../../docs/self-hosting.md)); `packaging/spelunk-server.service`
+   [Server setup](../../docs/server-setup.md)); `packaging/spelunk-server.service`
    is the per-developer local-inference unit, not the team server. On Windows,
    run it as a Windows Service with `windows/Install-SpelunkServerService.ps1`
    (see [`windows/README.md`](windows/README.md)).
@@ -190,7 +190,7 @@ report that they are unavailable instead of starting anything.
   config delivery + running `spelunk-server` as a Windows Service).
 - [Getting started](../../docs/getting-started.md) - install paths and the team
   setup walkthrough.
-- [Self-hosting](../../docs/self-hosting.md) - exposing `spelunk-server` to
+- [Server setup](../../docs/server-setup.md) - exposing `spelunk-server` to
   remote machines over TLS.
 - [Commands reference](../../docs/commands.md) - the full list of environment
   variables and config keys.

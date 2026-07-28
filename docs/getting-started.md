@@ -116,12 +116,12 @@ spelunk --version
 
 binaries on your `$PATH`. Supported targets:
 
-| Platform | Archive name |
-|----------|-------------|
-| macOS (Apple Silicon) | `spelunk-<version>-aarch64-apple-darwin.tar.gz` |
-| Linux x86_64 | `spelunk-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64 | `spelunk-<version>-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `spelunk-<version>-x86_64-pc-windows-msvc.zip` |
+| Platform | Archive name | Notes |
+|----------|-------------|-------|
+| macOS (Apple Silicon) | `spelunk-<version>-aarch64-apple-darwin.tar.gz` | |
+| Linux x86_64 | `spelunk-<version>-x86_64-unknown-linux-gnu.tar.gz` | Requires glibc 2.31 (Debian 11 Bullseye or newer / Ubuntu 20.04 or newer); on minimal images, install `libdbus-1-3` |
+| Linux ARM64 | `spelunk-<version>-aarch64-unknown-linux-gnu.tar.gz` | Requires glibc 2.31 (Debian 11 Bullseye or newer / Ubuntu 20.04 or newer); on minimal images, install `libdbus-1-3` |
+| Windows x86_64 | `spelunk-<version>-x86_64-pc-windows-msvc.zip` | |
 
 > **Intel Macs (`x86_64-apple-darwin`):** prebuilt binaries are not published for
 > this target — Apple deprecated the architecture and Apple Silicon replaced it on
@@ -156,10 +156,11 @@ cd /path/to/your/project
 spelunk init
 ```
 
-That's the whole setup. `spelunk init` registers the project, parses and chunks
-every source file, starts the bundled `spelunk-server` in the background when run
-interactively (if one isn't already running), and embeds your code so semantic
-search works out of the box:
+That's the whole setup. `spelunk init` registers the project, starts the bundled
+`spelunk-server` in the background when run interactively (if one isn't already running),
+parses and chunks every source file, and hands the embedding pass to a detached background
+worker so the prompt returns after parsing rather than after the full embed pass. Embeddings build in the background; full-text and ast-grep search
+work immediately, and semantic search becomes available as embeddings land.
 
 ```bash
 # Search by meaning, not just text
@@ -171,11 +172,10 @@ spelunk search "where do we validate auth tokens"
 project slug as `project_id` in `.spelunk/config.toml`. The slug defaults to the
 git-derived identity (`host/owner/repo` when an `origin` remote exists, else
 `local/<blake3-hex>` of the path); pass `spelunk init --name <slug>` to set an
-explicit one for a repo without a remote. Both `.spelunk/config.toml` and
-`.spelunk/cloud-project-id.lock` stay tracked, since they are meant to be
-committed and shared, so the whole team resolves to one project identity. An
-existing `project_id` or `.spelunk/.gitignore` is never overwritten, so
-re-running `init` is safe.
+explicit one for a repo without a remote. `.spelunk/config.toml` stays tracked,
+since it is meant to be committed and shared, so the whole team resolves to one
+project identity. An existing `project_id` or `.spelunk/.gitignore` is never
+overwritten, so re-running `init` is safe.
 
 No config file, no Docker, no external embedder. The server bundles a native
 embedding model (codefuse-ai/F2LLM-v2-330M, 896-dim, GPU-accelerated on macOS
@@ -206,11 +206,12 @@ project here` error instead of using a machine-global store. From inside your
 project you can:
 
 ```bash
-# Trace callers and callees for any symbol
-spelunk graph validate_token
-
-# Full-text search
+# Find the code behind a concept: search takes any phrase, no symbol name needed
 spelunk search "error handling" --mode text
+
+# Trace how a symbol connects. graph resolves an exact identifier (a real symbol
+# name, e.g. one you just saw in the search results above), not a concept phrase
+spelunk graph validate_token
 
 # Store a decision for your team
 spelunk memory add --kind decision \
@@ -262,24 +263,28 @@ spelunk hooks uninstall
 
 ## Capability tiers: where inference and memory live
 
-spelunk works at three tiers. You do not pick one by hand; spelunk uses the best
-one available and degrades cleanly when a server is not reachable. The
-load-bearing distinction is that a **local server does inference only and never
-stores memory**. Your memory always lives in the project's local `memory.db`
-until you *explicitly* configure a team server.
+spelunk works at three tiers; the team-memory tier can be a server you host
+yourself or the managed spelunk.cloud, shown as separate rows below. You do not
+pick one by hand; spelunk uses the best one available and degrades cleanly when a
+server is not reachable. The load-bearing distinction is that a **local server
+does inference only and never stores memory**. Your memory always lives in the
+project's local `memory.db` until you *explicitly* configure a team server or use
+the managed spelunk.cloud.
 
 | Tier | What runs it | What it adds | Where memory lives |
 |---|---|---|---|
 | **Built-in** (zero infra) | just the `spelunk` binary | git-notes memory, full-text and ast-grep search, code graph | local `memory.db` |
 | **Local semantic server** | a loopback `spelunk-server`, auto-started on demand | semantic / hybrid `search`, `explore`, LLM summaries | still local `memory.db`: the server is **inference only, never a memory store** |
-| **Team memory server** | a shared `spelunk-server` you deploy, set via an explicit `server_url` | shared memory across the team | the shared server, the **only** way memory leaves your machine |
+| **Team memory server** | a shared `spelunk-server` you deploy, set via an explicit `server_url` | shared memory across the team | the shared server you run: memory leaves your machine, your code stays local |
+| **spelunk.cloud** (hosted) | a managed service: nothing to deploy or maintain | the same shared-team memory as a self-hosted server, without running one | the hosted service: memory leaves your machine, your code stays local |
 
 Built-in works with nothing installed but the binary (the always-available
 commands in section 3). The local semantic server is auto-discovered on loopback
 (`127.0.0.1`) and started for you the first time a command needs it; it embeds
 queries and runs LLM calls, but a project's memory stays in `memory.db`
 regardless of whether it is running. Memory moves off the local machine only when
-you set an explicit team `server_url` (see
+you point at a team server, self-hosted via an explicit `server_url` or the
+managed spelunk.cloud (see
 [Team setup](#team-setup-shared-memory-with-spelunk-server)); each developer's
 code still stays local.
 
@@ -288,34 +293,38 @@ process), set `SPELUNK_NO_SERVER=1`: spelunk then runs built-in only, and
 inference-only commands exit with a clear message instead of starting anything.
 
 For how discovery works and how to point the CLI at a remote server, see
-**[Server setup](server.md)** and
+**[Server setup](server-setup.md)** and
 [CLI capability tiers](architecture/capability-tiers.md).
 
-### Using your own inference server (advanced)
+### Using your own LLM endpoint (advanced)
 
 By default the bundled `spelunk-server` provides embeddings (native, via the
-candle-served F2LLM-v2-330M model) and — when a chat model is configured — LLM
-inference. The embedding **model is fixed** to F2LLM-v2-330M (896-dim) product-wide
-and can no longer be selected: a mismatched embedding model silently corrupts
-semantic search. You *can* relocate **where** embeddings are computed — point the
-server at your own OpenAI-compatible endpoint that serves that same model (e.g. a
-shared GPU host) — but the model itself stays fixed. Configure **the server** —
-this is not a CLI `config.toml` key. `spelunk-server` reads these environment
+candle-served F2LLM-v2-330M model, 896-dim) and, when a chat model is
+configured, LLM inference. The embedding **model and its compute path are
+both fixed** product-wide: `spelunk` always embeds through the bundled native
+embedder, and there is no way to relocate or swap it. LLM inference is
+different: the server has no LLM of its own, so you point it at your own
+OpenAI-compatible chat-completions endpoint. Configure **the server**: this
+is not a CLI `config.toml` key. `spelunk-server` reads these environment
 variables (each has an equivalent flag):
 
 | Variable | Flag | Purpose |
 |---|---|---|
-| `SPELUNK_EMBEDDING_URL` | `--embedding-url` | Base URL of an OpenAI-compatible embedding endpoint serving F2LLM-v2-330M. When set, the server embeds through it instead of computing embeddings itself. |
 | `SPELUNK_LLM_URL` | `--llm-url` | Base URL of an OpenAI-compatible chat-completions endpoint for LLM features (`explore`, summaries, `memory harvest`). |
 | `SPELUNK_LLM_MODEL` | `--llm-model` | Chat model id to send to that endpoint. |
+
+`explore` and `memory harvest` pick up an LLM-configured local daemon
+automatically. Index-time chunk summaries are the exception: they additionally
+need an *explicit* `server_url` in `.spelunk/config.toml` (even a loopback one),
+not just a reachable server: see
+[Third-party models](third-party-models.md#what-this-unlocks) for the full
+absence-behavior and the team-server equivalent.
 
 For the auto-started local daemon, export the variables and then restart the
 server so it picks them up. The daemon inherits your shell environment, but a
 daemon that is already running keeps its old configuration until restarted:
 
 ```bash
-export SPELUNK_EMBEDDING_URL="http://127.0.0.1:1234"
-# optional, for LLM features (explore, summaries, harvest):
 export SPELUNK_LLM_URL="http://127.0.0.1:1234"
 export SPELUNK_LLM_MODEL="your-chat-model-id"
 
@@ -323,29 +332,16 @@ spelunk server stop     # if one is already running
 spelunk server start    # starts with the endpoint configured above
 ```
 
-Or, if you run `spelunk-server` yourself, pass the flag directly:
+Or, if you run `spelunk-server` yourself, pass the flags directly:
 
 ```bash
-spelunk-server --embedding-url http://127.0.0.1:1234
+spelunk-server --llm-url http://127.0.0.1:1234 --llm-model your-chat-model-id
 ```
 
-There is no embedding-model flag: `spelunk` always computes 896-dim
-F2LLM-v2-330M vectors, and your endpoint must serve that model. (A legacy
-`SPELUNK_EMBEDDING_MODEL` / `--embedding-model` is ignored, with a startup
-warning, rather than honoured.) `--embedding-dim` still exists so an endpoint
-whose vectors differ in dimension can be matched, but changing it means you are
-running a different model at your own risk — the server records the dimension on
-the first write and rejects later writes that disagree (see
-[Embedding dimension](server.md#embedding-dimension)). Re-embedding an existing
-index through a new endpoint needs a full re-index (`spelunk index --force`),
-since unchanged files are otherwise skipped.
-
-Tune the per-request embedding batch ceiling at index time with
-`spelunk index --batch-size <n>` if a slow or memory-constrained endpoint
-struggles with the default.
-
-This is an advanced override; most users never set it — the native embedder in
-`spelunk-server` handles embeddings with no extra configuration.
+This is an advanced override; most users never set it: `explore`, summaries,
+and `memory harvest` are simply unavailable without an LLM configured, and
+semantic search works regardless since the native embedder needs no
+configuration at all.
 
 ### Index your project for semantic search
 
@@ -423,7 +419,7 @@ spelunk check --format porcelain --files    # list files that need re-indexing
 - [Memory](memory.md) — storing project context across sessions
 - [Agent Guide](agent-guide.md) — using `spelunk` with AI coding agents
 - [Remote agents](remote-agents.md) — running an agent in a Docker container against your local server
-- [Self-hosting](self-hosting.md) — exposing spelunk-server to remote agents over TLS
+- [Server setup](server-setup.md): exposing spelunk-server to remote agents over TLS
 - [Building from source](building.md) — for contributors and platform builders
 
 ---
@@ -447,44 +443,58 @@ project_id = "my-awesome-app"
 > **`server_url` must be `https://` unless it points at loopback**
 > (`127.0.0.1` / `::1` / `localhost`) — a non-loopback `http://` URL is
 > rejected at startup, with no opt-out, because the CLI attaches your bearer
-> token to these requests. See [Self-hosting](self-hosting.md) for putting TLS
+> token to these requests. See [Server setup](server-setup.md) for putting TLS
 > in front of a deployed server.
 
-Each developer provides their API key. Prefer the `SPELUNK_SERVER_KEY`
-environment variable, which works everywhere (including CI / headless):
+Each developer provides their own key with `spelunk auth set-key`, scoped to
+this server's URL:
+
+```bash
+spelunk auth set-key --server https://spelunk.internal.example.com
+```
+
+The key is stored in your OS keychain (macOS Keychain, Linux Secret Service,
+Windows Credential Manager) rather than in plaintext, keyed by the server's
+origin so a second project's server key never collides with this one. For CI /
+headless use, the `SPELUNK_SERVER_KEY` environment variable works everywhere
+and takes precedence over the stored key:
 
 ```bash
 export SPELUNK_SERVER_KEY="your-shared-api-key"
 ```
 
-The credential is otherwise stored in your OS keychain (macOS Keychain, Linux
-Secret Service, Windows Credential Manager) rather than in plaintext. If you
-have an old personal `~/.config/spelunk/config.toml` with a bare
-`server_key = "…"`, it is migrated into the keychain and stripped from the file
-automatically on the next run. On a host with no keychain, spelunk falls back to
-an owner-only `~/.config/spelunk/secrets.toml`. For the full credential-storage
-rules and the `SPELUNK_SECRET_STORE` override, see the
-[Commands reference](commands.md#spelunk-login).
+If you have an old personal `~/.config/spelunk/config.toml` with a bare
+`server_key = "..."`, it is picked up and migrated into the per-server store
+automatically the first time it's needed; no action required. A `server_key`
+line in a project's checked-in `.spelunk/config.toml` is no longer read at all,
+so remove it if one is still there. On a host with no keychain, spelunk falls
+back to an owner-only `~/.config/spelunk/secrets.toml`. For the full
+credential-storage rules and the `SPELUNK_SECRET_STORE` override, see the
+[Commands reference](commands.md#spelunk-auth).
 
-`project_id` stays a human-readable slug. If the server routes projects by an
-internal UUID (as a team/cloud memory server does), the CLI resolves the slug
-for you on first use and caches the result locally, so no manual UUID lookup is
-needed. See [Server setup](server.md#client-configuration) for details.
+`project_id` stays a human-readable slug, and it is sent to the server exactly
+as configured. Both a self-hosted spelunk-server and the hosted cloud API accept
+either a slug or a UUID as the project key, so nothing is looked up and nothing
+is cached. See [Server setup](server-setup.md#client-configuration) for details.
 
 After setup, all `spelunk memory` commands transparently use the server. Seed it
-with your existing local memory, then keep the two in step as you and your
-teammates record decisions:
+with your existing local memory, then keep recording decisions as usual:
 
 ```bash
-spelunk memory push    # one-way: send your local entries up to the server
-spelunk sync           # two-way: push local entries and pull teammates' entries down
+spelunk memory push    # one-way: seed the server with your existing local entries
+spelunk sync           # force a synchronous two-way reconcile (usually not needed; see below)
 ```
 
-`spelunk sync` is the day-to-day command for a shared server: it pushes what you
-recorded and pulls what everyone else did, so the team reads and writes one
-shared memory. Code never travels; only memory does.
+In the default `local_first` mode you rarely run `spelunk sync` by hand. Your
+writes commit to the local `memory.db` immediately and never block on the
+network; from an interactive terminal a background reconciler then drains what
+you recorded up to the server and pulls teammates' entries down, so the shared
+memory converges on its own. `spelunk sync` is the explicit escape hatch for
+when you want that reconcile to happen synchronously now rather than in the
+background, such as a CI job that needs entries pushed before it exits. Code
+never travels; only memory does.
 
-For full setup and deployment guide: **[Server setup](server.md)** — Docker, configuration, API reference.
+For full setup and deployment guide: **[Server setup](server-setup.md)**: Docker, configuration, API reference.
 
 ### Enterprise / MDM deployment
 

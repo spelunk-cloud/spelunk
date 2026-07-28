@@ -74,15 +74,40 @@ fn harvest_fails_with_actionable_error_when_no_server_and_no_model() {
 #[test]
 fn harvest_check_passes_when_server_url_is_set() {
     let temp = tempdir().unwrap();
-    // server_url is set; project_id is required alongside it.
-    let config_path = write_harvest_config(
+    // `Config::load` only honors `server_url`/`project_id` from project-level
+    // `.spelunk/config.toml` (or env), never the global `--config` file, so
+    // they're written separately from `write_harvest_config`'s `extra`.
+    //
+    // `mode = "cloud_first"` is required since the 2026-07-23 ADR-004
+    // revision: with `SPELUNK_NO_SERVER=1` forcing
+    // `Tier::Offline` (no loopback probe at all) and no explicit mode, a
+    // bare `server_url` now defaults to `local_first`, which never falls
+    // back to `server_url` for inference — so the Tier-0 gate this test
+    // means to bypass would (correctly) still fire. This test's intent is
+    // "an explicit server_url IS used for inference", which is the
+    // `cloud_first` case.
+    let config_path = write_harvest_config(temp.path(), "mode = \"cloud_first\"\n");
+    plumbing_helpers::write_project_server_config(
         temp.path(),
-        "server_url = \"http://127.0.0.1:7777\"\nproject_id = \"test/proj\"\n",
+        "http://127.0.0.1:7777",
+        "test/proj",
     );
 
+    // `SPELUNK_NO_SERVER=1` (set by `harvest_cmd` for the other two tests in
+    // this file) is a hard offline kill-switch: `resolve_mode()` forces
+    // `Offline` under it regardless of the configured `mode`
+    // (`resolve_mode_no_server_env_forces_offline`), which would make
+    // `resolve_inference_url()` return `None` here even in `cloud_first` and
+    // defeat the very case this test means to cover. It must be removed for
+    // this test specifically. This is safe: unlike loopback auto-discovery,
+    // `cloud_first`'s `server_url` fallback in `resolve_inference_url` does
+    // not depend on the URL actually being reachable, so a real local server
+    // happening to run on 7777 cannot change whether the Tier-0 gate fires.
+    //
     // The command will fail (no live server, no git repo) but NOT with the
     // Tier-0 "requires spelunk-server" message.
     harvest_cmd(&config_path, temp.path())
+        .env_remove("SPELUNK_NO_SERVER")
         .assert()
         .failure()
         .stderr(predicate::str::contains(SERVER_REQUIRED).not());

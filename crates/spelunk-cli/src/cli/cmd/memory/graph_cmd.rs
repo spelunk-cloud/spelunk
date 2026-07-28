@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use super::super::color::cprintln;
 use super::{MemoryGraphArgs, backend_err};
 use crate::{config::Config, storage::open_memory_backend};
 
@@ -55,7 +56,7 @@ pub(super) async fn memory_graph(
         return Ok(());
     }
 
-    println!("\x1b[1m#{} [{}] {}\x1b[0m", root.id, root.kind, root.title);
+    cprintln!("\x1b[1m#{} [{}] {}\x1b[0m", root.id, root.kind, root.title);
 
     if outgoing.is_empty() && incoming.is_empty() {
         println!("  (no relationships)");
@@ -74,7 +75,7 @@ pub(super) async fn memory_graph(
             "contradicts" => "\x1b[31m─[contradicts]→\x1b[0m",
             k => &format!("─[{k}]→"),
         };
-        println!("  {arrow}  #{} {target_title}", e.to_id);
+        cprintln!("  {arrow}  #{} {target_title}", e.to_id);
     }
     for e in &incoming {
         let src_title = backend
@@ -88,7 +89,7 @@ pub(super) async fn memory_graph(
             "contradicts" => "\x1b[31m←[contradicted by]\x1b[0m",
             k => &format!("←[{k}]"),
         };
-        println!("  {arrow}  #{} {src_title}", e.from_id);
+        cprintln!("  {arrow}  #{} {src_title}", e.from_id);
     }
     Ok(())
 }

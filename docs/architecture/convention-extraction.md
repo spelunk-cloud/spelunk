@@ -12,7 +12,6 @@ This spec covers OSS v1.0 work only:
 - Heuristic extraction from stored chunks (post-index, no LLM, no API keys)
 - `conventions` table in the local `spelunk.db`
 - Integration into `spelunk context` (new section, both text + JSON)
-- Plumbing command `spelunk plumbing read-conventions`
 - Tests for Rust and TypeScript fixtures
 
 **Out of scope** (tracked in cloud-api):
@@ -64,9 +63,6 @@ conventions/
 | `crates/spelunk-core/src/storage/mod.rs` | re-export `ConventionRecord`, `insert_conventions`, `list_conventions` |
 | `crates/spelunk-cli/src/cli/cmd/index/mod.rs` | call `run_extraction()` after embed phase |
 | `crates/spelunk-cli/src/cli/cmd/context.rs` | add conventions section to output |
-| `crates/spelunk-cli/src/cli/cmd/plumbing/mod.rs` | wire new plumbing subcommand |
-| `crates/spelunk-cli/src/cli/cmd/plumbing/read_conventions.rs` | NEW handler |
-| `crates/spelunk-cli/src/cli/mod.rs` | add `ReadConventions` variant |
 
 ---
 
@@ -229,25 +225,15 @@ Acceptable at v1.0 pre-release; no downstream consumers are pinned to the curren
 
 ---
 
-## Plumbing Command — `spelunk plumbing read-conventions`
+## Plumbing Command: not implemented
 
-```
-spelunk plumbing read-conventions [--lang <language>]
-```
-
-Emits one JSON object per convention row, in insertion order.
-
-```json
-{"language":"rust","category":"naming.functions","description":"Functions use snake_case","confidence":0.97,"evidence_count":142,"extracted_at":1748048400}
-{"language":"rust","category":"error_handling","description":"Error handling via anyhow::Result","confidence":0.78,"evidence_count":89,"extracted_at":1748048400}
-```
-
-**Exit codes:**
-- `0` — ≥1 row emitted
-- `1` — no conventions extracted (table empty or no rows match `--lang`)
-- `2` — DB error
-
-`--lang` filters to a single language (exact match, case-insensitive).
+A `spelunk plumbing read-conventions` JSONL dump was scoped alongside this
+feature but was never wired up and has since been dropped from v1.0: no
+demand signal for an agent-facing conventions dump, and the backing library
+(`conventions::list_conventions`, `run_extraction`) already serves `index`
+and `context` without it. Revisit only if a real use case shows up; wiring it
+would be a small follow-up (module + `PlumbingCommand` arm + dispatch, same
+shape as `ls_files`).
 
 ---
 

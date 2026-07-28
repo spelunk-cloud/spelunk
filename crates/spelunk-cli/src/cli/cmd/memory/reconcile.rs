@@ -25,6 +25,8 @@ use std::path::PathBuf;
 
 use super::MemoryReconcileArgs;
 use crate::{
+    capability,
+    capability::spelunk_state_dir,
     config::Config,
     server_client::ServerInferenceClient,
     storage::{MemoryStore, entity_id, note_entity_id},
@@ -234,6 +236,16 @@ pub(super) async fn memory_reconcile(
     // Resolve project slug.
     let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let slug = cfg.resolve_project_id(&project_root);
+
+    // `get_inference_tier` (not `get_tier`): local_first always prefers the
+    // local loopback embedder for step 5's best-effort embed, even with an
+    // explicit server_url set (2026-07-23 founder decision).
+    // Without this, step 5 silently imports every note unembedded under a
+    // local_first + server_url config, exactly the silent-unembedded-write
+    // symptom this fix eliminates.
+    let tier = capability::get_inference_tier(cfg).await;
+    let eff_cfg = tier.effective_config(cfg, &project_root);
+    let cfg = &eff_cfg;
 
     if args.all_projects {
         run_all_projects(&server_db_path, mem_path, cfg, &args, json).await
@@ -463,13 +475,18 @@ async fn reconcile_project(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Default path for the daemon's server.db: `~/.local/state/spelunk/server.db`.
+/// Default path for the daemon's server.db: `~/.local/state/spelunk/server.db`,
+/// or `SPELUNK_STATE_DIR` when set.
+///
+/// Must go through the shared `capability::spelunk_state_dir` resolver, not
+/// reconstruct the path from `dirs::home_dir()` independently: the daemon
+/// (`spelunk server start`) writes `server.db` via that same resolver, so a
+/// second, hardcoded reconstruction here would silently stop finding it
+/// under `SPELUNK_STATE_DIR` while still reporting reconcile as a no-op
+/// success (the "server.db doesn't exist" branch) instead of an error.
 fn default_server_db_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local")
-        .join("state")
-        .join("spelunk")
+    spelunk_state_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
         .join("server.db")
 }
 
@@ -537,7 +554,7 @@ fn import_batch(
                 "active"
             };
 
-            let id = store.add_note_with_created_at(
+            let (id, _created) = store.add_note_with_created_at(
                 &note.kind,
                 &note.title,
                 &note.body,
@@ -801,6 +818,10 @@ mod init_import_tests {
     }
 
     fn make_temp_git_repo() -> tempfile::TempDir {
+        // Process-wide: this repo's own `commit` below runs through the
+        // ambient global git config if it isn't neutralized first, so an
+        // ambient `core.hooksPath` fires a foreign pre-commit hook here.
+        crate::cli::cmd::test_support::isolate_git_config();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let p = dir.path();
         let run = |args: &[&str]| {
@@ -1004,7 +1025,7 @@ mod init_import_tests {
         let git_root = repo.path();
 
         let backend = GitNotesBackend::with_root(git_root.to_path_buf());
-        let id = backend
+        let (id, _created) = backend
             .add(NoteInput {
                 kind: "note".to_string(),
                 title: "retired decision".to_string(),
@@ -1053,13 +1074,12 @@ mod init_import_tests {
         );
     }
 
-    /// A git-notes entry whose content already exists in `memory.db` (e.g. it
-    /// arrived earlier via `memory reconcile` or a manual add) is NOT
-    /// re-imported: init reuses reconcile's content key, so the two stores
-    /// dedup against each other. Only the genuinely-new entry imports.
-    #[tokio::test]
-    async fn init_import_skips_entries_already_in_memory_db() {
-        register_sqlite_vec();
+    /// Runs the "already-present entry is skipped, new entry imports" scenario
+    /// end to end against a fresh temp repo. Shared by the single-run test
+    /// below and the concurrency stress test, so both exercise identical
+    /// logic instead of the stress test drifting from what it's supposed to
+    /// be probing.
+    async fn run_skip_already_present_scenario() -> Result<()> {
         let repo = make_temp_git_repo();
         let git_root = repo.path();
 
@@ -1078,7 +1098,7 @@ mod init_import_tests {
                 supersedes: None,
             })
             .await
-            .expect("git-notes add A");
+            .context("git-notes add A")?;
         // Entry B: only in git-notes — the one init should actually import.
         backend
             .add(NoteInput {
@@ -1093,22 +1113,22 @@ mod init_import_tests {
                 supersedes: None,
             })
             .await
-            .expect("git-notes add B");
+            .context("git-notes add B")?;
 
         // Read A back so we can seed memory.db with a byte-identical content key
         // (same kind/title/body/tags/created_at → same dedup hash).
         let seeded = backend
             .list(None, 10, true, None)
             .await
-            .expect("list git notes");
+            .context("list git notes")?;
         let a = seeded
             .iter()
             .find(|n| n.title == "already present")
-            .expect("entry A present in git notes");
+            .context("entry A present in git notes")?;
 
         let mem_path = git_root.join(".spelunk").join("memory.db");
         {
-            let store = MemoryStore::open(&mem_path).expect("open memory.db");
+            let store = MemoryStore::open(&mem_path).context("open memory.db")?;
             let tags: Vec<&str> = a.tags.iter().map(String::as_str).collect();
             store
                 .add_note_with_created_at(
@@ -1121,27 +1141,95 @@ mod init_import_tests {
                     "active",
                     a.created_at,
                 )
-                .expect("seed A into memory.db");
+                .context("seed A into memory.db")?;
         }
 
         let imported = import_git_notes_into_memory(git_root, &mem_path)
             .await
-            .expect("import");
-        assert_eq!(imported, 1, "only the entry absent from memory.db imports");
+            .context("import")?;
+        anyhow::ensure!(
+            imported == 1,
+            "only the entry absent from memory.db imports, got {imported}"
+        );
 
-        let store = MemoryStore::open(&mem_path).expect("reopen memory.db");
-        let all = store.list(None, 50, true).expect("list");
-        assert_eq!(
-            all.len(),
-            2,
-            "no duplicate row for the already-present entry"
+        let store = MemoryStore::open(&mem_path).context("reopen memory.db")?;
+        let all = store.list(None, 50, true).context("list")?;
+        anyhow::ensure!(
+            all.len() == 2,
+            "no duplicate row for the already-present entry, got {}",
+            all.len()
         );
         // A keeps its original source_ref; only B is stamped init:git-notes.
         let init_sourced = all
             .iter()
             .filter(|n| n.source_ref.as_deref() == Some(INIT_GIT_NOTES_SOURCE))
             .count();
-        assert_eq!(init_sourced, 1, "exactly one row came from the init import");
+        anyhow::ensure!(
+            init_sourced == 1,
+            "exactly one row came from the init import, got {init_sourced}"
+        );
+
+        // Keep the tempdir alive through every access above.
+        drop(repo);
+        Ok(())
+    }
+
+    /// A git-notes entry whose content already exists in `memory.db` (e.g. it
+    /// arrived earlier via `memory reconcile` or a manual add) is NOT
+    /// re-imported: init reuses reconcile's content key, so the two stores
+    /// dedup against each other. Only the genuinely-new entry imports.
+    #[tokio::test]
+    async fn init_import_skips_entries_already_in_memory_db() {
+        register_sqlite_vec();
+        run_skip_already_present_scenario().await.expect("scenario");
+    }
+
+    /// Stress the same scenario across concurrent tasks in one process, each
+    /// against its own temp repo, so CI gets an active signal instead of
+    /// relying on the parallel test runner's luck to reproduce a flake.
+    ///
+    /// Concurrency is bounded by a semaphore rather than firing all `RUNS`
+    /// unbounded: each run shells out to several real `git` subprocesses, and
+    /// letting 20 of those launch at once, stacked on top of the rest of the
+    /// workspace's own parallel test suite doing the same, was observed to
+    /// spuriously fail `Command::spawn` with ENOENT under `cargo test
+    /// --workspace` (not in isolation), i.e. this test flaked from OS-level
+    /// process-spawn contention, the exact class of noise it exists to filter
+    /// out rather than reintroduce. Capping in-flight scenarios keeps the
+    /// cross-task concurrency this test is actually probing (shared
+    /// `register_sqlite_vec` init, overlapping temp-repo lifecycles, the
+    /// scenario's own dedup transaction) while staying well under what the
+    /// dev/CI machine's fork/exec path reliably sustains alongside everything
+    /// else running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn init_import_skip_scenario_is_race_free_under_concurrent_tasks() {
+        register_sqlite_vec();
+        const RUNS: usize = 20;
+        const MAX_CONCURRENT: usize = 4;
+
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
+        let tasks: Vec<_> = (0..RUNS)
+            .map(|_| {
+                let semaphore = semaphore.clone();
+                tokio::spawn(async move {
+                    let _permit = semaphore.acquire_owned().await.expect("semaphore open");
+                    run_skip_already_present_scenario().await
+                })
+            })
+            .collect();
+
+        let mut failures = Vec::new();
+        for (i, task) in tasks.into_iter().enumerate() {
+            if let Err(e) = task.await.expect("task should not panic") {
+                failures.push(format!("run {i}: {e:#}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{}/{RUNS} concurrent runs failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     /// Drift guard: reconcile's server-row key and init-import's memory-row key

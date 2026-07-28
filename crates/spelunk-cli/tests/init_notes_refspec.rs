@@ -166,11 +166,18 @@ fn init_no_origin_prints_hint_and_succeeds() {
         )),
         "no-origin init should print the exact refspec hint, got:\n{stdout}"
     );
-    // The push hint frames the notes push as per-change, not one-time: each
-    // memory add/remove makes a new notes commit that must be pushed to travel.
+    // Publishing is opt-in, so init has to name the step unprompted: a user who
+    // never reads the docs must still learn their memory stays local.
     assert!(
-        stdout.contains("push notes after each memory change: git push origin refs/notes/spelunk"),
-        "no-origin init should print the per-change notes push hint, got:\n{stdout}"
+        stdout.contains("your memory stays local until you install the pre-push hook")
+            && stdout.contains("spelunk hooks install --pre-push"),
+        "no-origin init should name the pre-push hook as the publishing step, got:\n{stdout}"
+    );
+    // The retired hint told users to push notes after each memory change, which
+    // orphans every entry recorded before its commit is pushed. Never restore it.
+    assert!(
+        !stdout.contains("push notes after each memory change"),
+        "init must not advertise the orphan-prone per-change notes push, got:\n{stdout}"
     );
     // And it must not have invented an `origin` remote.
     assert!(
@@ -178,6 +185,42 @@ fn init_no_origin_prints_hint_and_succeeds() {
             .status
             .success(),
         "init must not create an origin remote when none exists"
+    );
+}
+
+/// (2a) The publishing announce reads the hook's actual state rather than
+/// asserting a fixed one: once the pre-push hook is installed, telling the user
+/// their memory stays local is simply false, and a stale nag trains them to
+/// ignore the line that matters.
+#[test]
+fn init_announce_reflects_the_installed_pre_push_hook() {
+    let tmp = tempdir().unwrap();
+    init_repo_with_commit(tmp.path());
+
+    let before = run_init(tmp.path());
+    assert!(
+        before.contains("your memory stays local until you install the pre-push hook"),
+        "with no hook installed, init must say memory stays local, got:\n{before}"
+    );
+
+    let cfg = empty_config(tmp.path());
+    spelunk_bin()
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .arg("--config")
+        .arg(&cfg)
+        .args(["hooks", "install", "--pre-push"])
+        .assert()
+        .success();
+
+    let after = run_init(tmp.path());
+    assert!(
+        after.contains("pre-push hook installed: your memory publishes on `git push`"),
+        "with the hook installed, init must report that, got:\n{after}"
+    );
+    assert!(
+        !after.contains("your memory stays local"),
+        "init must not still ask for an install it already has, got:\n{after}"
     );
 }
 

@@ -39,11 +39,24 @@ fn write_fixture(dir: &Path, name: &str) {
 /// `spelunk index` as a raw `std::process::Command` so the test can hold a live
 /// `Child` across the gate; `assert_cmd`'s runner blocks until exit.
 /// Mirrors `plumbing_helpers::spelunk_bin_in`'s keychain/home pinning.
+///
+/// `SPELUNK_MODE=cloud_first`: every test in this file drives its fixture's
+/// explicit `server_url` for LLM summaries (2026-07-23 ADR-004 revision).
+/// `index/summaries.rs::generate_summaries` calls
+/// `ServerInferenceClient::from_config` directly on the loaded `Config` with
+/// no loopback auto-discovery bridging, so under the default `local_first`
+/// mode a bare `server_url` no longer resolves to any inference target at
+/// all. `cloud_first` is what makes this file's premise — an explicit
+/// `server_url` IS used for summaries — hold.
 fn index_command(home: &Path, config: &Path, db: &Path, project: &Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("spelunk"));
     cmd.env("SPELUNK_SECRET_STORE", "file")
         .env("HOME", home)
+        .env("SPELUNK_MODE", "cloud_first")
         .env_remove("XDG_CONFIG_HOME")
+        // Project-level config discovery walks up from CWD; every caller here
+        // writes `server_url` to `<project>/.spelunk/config.toml`.
+        .current_dir(project)
         .arg("--config")
         .arg(config)
         .arg("index")
@@ -131,8 +144,13 @@ fn summary_pass_completes_before_index_returns() {
     });
 
     let mock_url = mock_server.uri();
-    let config_path =
-        plumbing_helpers::write_config_with_server(project.path(), &db_path, &mock_url, &mock_url);
+    let config_path = plumbing_helpers::write_config_with_server(
+        project.path(),
+        &db_path,
+        &mock_url,
+        &mock_url,
+        project.path(),
+    );
 
     let mut child = index_command(project.path(), &config_path, &db_path, project.path())
         .stdout(Stdio::null())
@@ -224,8 +242,13 @@ fn summary_failure_is_reported_but_index_still_succeeds() {
     });
 
     let mock_url = mock_server.uri();
-    let config_path =
-        plumbing_helpers::write_config_with_server(project.path(), &db_path, &mock_url, &mock_url);
+    let config_path = plumbing_helpers::write_config_with_server(
+        project.path(),
+        &db_path,
+        &mock_url,
+        &mock_url,
+        project.path(),
+    );
 
     let output = index_command(project.path(), &config_path, &db_path, project.path())
         .output()
@@ -291,8 +314,13 @@ fn background_phases_mode_completes_summaries() {
     });
 
     let mock_url = mock_server.uri();
-    let config_path =
-        plumbing_helpers::write_config_with_server(project.path(), &db_path, &mock_url, &mock_url);
+    let config_path = plumbing_helpers::write_config_with_server(
+        project.path(),
+        &db_path,
+        &mock_url,
+        &mock_url,
+        project.path(),
+    );
 
     // Populate chunks first: background-phases mode skips parse/embed.
     let seed = index_command(project.path(), &config_path, &db_path, project.path())

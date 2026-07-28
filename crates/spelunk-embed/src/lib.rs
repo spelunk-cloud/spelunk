@@ -28,6 +28,13 @@ pub use backend::EmbeddingBackend;
 /// Exact-match token: never parse it. Requantization or a hardware-portability
 /// rebuild of the same model must NOT change this — only a genuine model swap
 /// (different weights / vector space) does, which forces a re-index.
+///
+/// Before changing this value, ship memory.db embedding-provenance stamping
+/// first: unstamped `note_embeddings` vectors are assumed to be this model
+/// (backfill rule "unstamped ⇒ F2LLM-v2-330M@896"), an invariant that only
+/// holds while this is the sole model ever shipped. See the 2026-07-26
+/// `requirement` entry in spelunk memory and task spelunk-oss^286 for the
+/// acceptance criteria that work must meet.
 pub const MODEL_ID: &str = "F2LLM-v2-330M@896";
 
 mod embedder_native;

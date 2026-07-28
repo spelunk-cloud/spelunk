@@ -265,6 +265,46 @@ mod tests {
         assert_eq!(resolved, tmp.path());
     }
 
+    // ── canonicalize ───────────────────────────────────────────────────────
+
+    /// `canonicalize`'s whole reason to exist is de-UNCing: it must never
+    /// return the verbatim `\\?\`-prefixed form that `std::fs::canonicalize`
+    /// produces on Windows for a real, existing directory. A caller that
+    /// builds one path through this wrapper and another through
+    /// `std::fs::canonicalize`/`Path::canonicalize` directly is comparing two
+    /// different spellings of the same directory - `PathBuf` equality (and
+    /// `assert_eq!`) then fails even though both name the identical real
+    /// path. This is exactly the mismatch that broke the hooks-dir tests in
+    /// `crates/spelunk-cli/src/cli/cmd/hooks.rs`: a test built its "expected"
+    /// value via the raw std canonicalize while production went through this
+    /// wrapper.
+    #[test]
+    #[cfg(windows)]
+    fn canonicalize_never_returns_the_verbatim_unc_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("real");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let std_form = dir.canonicalize().unwrap();
+        let wrapped_form = canonicalize(&dir);
+
+        assert!(
+            std_form.to_string_lossy().starts_with(r"\\?\"),
+            "setup: std::fs::canonicalize is expected to add the verbatim \
+             prefix on Windows, got: {}",
+            std_form.display()
+        );
+        assert!(
+            !wrapped_form.to_string_lossy().starts_with(r"\\?\"),
+            "canonicalize() must strip the verbatim prefix, got: {}",
+            wrapped_form.display()
+        );
+        // Same real directory, so re-canonicalizing the std form through the
+        // wrapper must land on the same result the wrapper gives directly -
+        // proving the two flavors name one identical path rather than two.
+        assert_eq!(canonicalize(&std_form), wrapped_form);
+    }
+
     // ── normalize_index_path ──────────────────────────────────────────────────
 
     #[test]

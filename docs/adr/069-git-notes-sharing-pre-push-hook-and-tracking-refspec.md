@@ -3,8 +3,8 @@
 **Date:** 2026-07-14
 **Deciders:** founder (Johan); architect
 **Relationship to prior ADRs:** resolves the Open question
-[ADR-068](068-zero-setup-onboarding-git-notes-memory-fallback.md) deferred to
-^126 ("Does 'travels with the repo' require configuring the notes refspec?").
+[ADR-068](068-zero-setup-onboarding-git-notes-memory-fallback.md) deferred
+("Does 'travels with the repo' require configuring the notes refspec?").
 ADR-068 made `refs/notes/spelunk` the durable carrier for pre-`init` memory,
 which put the whole "travels with the repo" promise on that ref being visible
 across clones. The answer is yes, and the mechanism currently on `main` (#582)
@@ -35,13 +35,22 @@ observed behaviour, not projections.
 
 ## Decision
 
-**Publish notes on `git push` through an opt-in, non-blocking pre-push hook;
-merge with `cat_sort_uniq`; fetch into a tracking ref rather than over the live
-one; have spelunk itself merge that tracking ref on its read paths, so reading a
-teammate's memory needs no opt-in; and put a lock around the note
-read-modify-write, without which the merge silently eats entries.**
+**Publish notes on `git push` through an opt-in pre-push hook that delegates to a
+spelunk plumbing command; merge with `cat_sort_uniq`; fetch into a tracking ref
+rather than over the live one; have spelunk itself merge that tracking ref on its
+read paths, so reading a teammate's memory needs no opt-in; and put a lock around
+the note read-modify-write, without which the merge silently eats entries.**
 
 ### D1 – notes sharing is coupled to `git push`, via an opt-in pre-push hook
+
+> **Amended after review of the first implementation (#617).** The trigger
+> decision below is unchanged and was not reconsidered: `git push` is still the
+> only correct moment to publish. What changed is **where the publish logic
+> lives**. As first drafted, D3 specified the flow as a shell hook body
+> (`fetch`, then `git notes merge -s cat_sort_uniq`, then `push --no-verify`).
+> That logic now moves into Rust behind a plumbing command (**D7**), and the hook
+> becomes a shim that calls it. The superseded flow is recorded in D3 rather than
+> edited away.
 
 Not to `memory add`, and not to a timer.
 
@@ -101,29 +110,76 @@ behaviour owned by an external tool, so the implementation must carry a
 **regression test** that would fail if that normalization ever changed. It must
 not be left as an implicit assumption.
 
-### D3 – opt-in, non-blocking, best-effort
+### D3 – opt-in, best-effort, and blocking only when spelunk itself is gone
+
+> **Amended after review of the first implementation (#617).** Two things in
+> this section changed, and both are recorded rather than edited away.
+>
+> **The `command -v spelunk` skip is withdrawn, and the reason it carried was
+> wrong.** As first written, this section justified the guard as a
+> `command -v spelunk` skip "so teammates without spelunk are unaffected."
+> **That case cannot occur:** `.git/hooks/` is never cloned, so a teammate never
+> receives the hook at all. This ADR was the sole carrier of that wrong fact,
+> the same failure mode #616 had to correct in D5. The guard is replaced by an
+> embedded absolute path, for a *different* reason that nothing had written
+> down (below).
+>
+> **"Exits `0` unconditionally" is now scoped, not deleted.** The empirical
+> finding behind it stands: a hook exiting `1` aborts the branch push outright,
+> and in the spike origin never received the commit. That still governs
+> **publish failures**. It no longer governs a **missing binary**, which is now
+> the one case allowed to fail loudly.
+>
+> The **hook flow** as first specified (`fetch`, then
+> `git notes merge -s cat_sort_uniq` from the tracking ref, then
+> `push --no-verify`) moves out of shell and into Rust behind a plumbing
+> command (**D7**). D1's trigger decision is untouched.
 
 - **Installed explicitly** (`spelunk hooks install --pre-push`), never silently.
   It reuses the guard pattern already established by the post-commit hook
   (`crates/spelunk-cli/src/cli/cmd/hooks.rs`,
   `crates/spelunk-cli/src/cli/cmd/init.rs`): bail if a non-spelunk pre-push hook
-  is present, keep an idempotent marker, and `command -v spelunk` skip so
-  teammates without spelunk are unaffected.
-- **Never blocks the user's `git push`.** A hook exiting `1` aborts the branch
-  push outright, and in the spike origin never received the commit. Memory
-  sharing must not be able to cost someone their push. The hook exits `0`
-  unconditionally and warns on stderr.
-- **A recursion guard is mandatory.** A naive pre-push hook that pushes the
-  notes ref recursed **740 levels deep** and stopped only by exhausting the
-  process table (`cannot fork() ... Resource temporarily unavailable`). All
-  outer pushes failed invisibly while the branch push still reported success.
-  The nested push MUST use `--no-verify`, which makes git skip pre-push
-  entirely; an env sentinel is belt-and-braces on top.
+  is present, and keep an idempotent marker.
+- **`hooks install` embeds the resolved absolute path of the binary**, rather
+  than looking spelunk up on `PATH`. The guard this replaces was load-bearing for
+  a reason never recorded: `install.sh` falls back to `${HOME}/.local/bin` when
+  `/usr/local/bin` is not writable (`install.sh:74-82`) and then tells the user to
+  add it to their **shell profile** (`install.sh:130-139`). macOS GUI apps inherit
+  their environment from launchd, not from a shell profile, so Tower, GitHub
+  Desktop, VS Code and IntelliJ run hooks **without** `~/.local/bin` on `PATH`.
+  Simply dropping the guard would therefore break `git push` from every GUI client
+  for anyone on that install path. Embedding the path separates the two cases,
+  which a `PATH` lookup could not:
+
+  | Case | Behaviour |
+  |---|---|
+  | spelunk genuinely removed | the absolute path fails, the hook exits non-zero, the push stops and says so |
+  | spelunk present, but absent from a GUI client's `PATH` | irrelevant: there is no `PATH` lookup |
+  | publish fails (offline, remote rejects) | exits `0`, the push proceeds |
+
+  **The cost is accepted, not absent:** the embedded path goes stale if the binary
+  is moved or reinstalled elsewhere. It then fails loudly, and
+  `spelunk hooks install --pre-push` re-resolves it. That was chosen over failing
+  silently: a user is better served by being told a tool it expected is gone than
+  by cruft sitting untidied forever.
+- **A publish failure never blocks the user's `git push`.** Memory sharing must
+  not be able to cost someone their push, so every failure to fetch, merge or
+  publish exits `0` and warns on stderr. Only a missing binary is exempt.
+- **A recursion guard is mandatory, and survives the move into Rust.** A naive
+  pre-push hook that pushes the notes ref recursed **740 levels deep** and stopped
+  only by exhausting the process table (`cannot fork() ... Resource temporarily
+  unavailable`). All outer pushes failed invisibly while the branch push still
+  reported success. The Rust command still runs `git push`, which still fires
+  pre-push, so the hazard is unchanged: the nested push MUST use `--no-verify`,
+  which makes git skip pre-push entirely, with the `SPELUNK_NOTES_PUSH` env
+  sentinel as belt-and-braces on top.
 - **Retry at most 3 times** on non-fast-forward. This is not a guess: under a
-  concurrent 3-way race the third developer only succeeded on attempt 3. Never
-  force-push.
-- **Hook flow:** `fetch`, then `git notes merge -s cat_sort_uniq` from the
-  tracking ref, then `push --no-verify`.
+  concurrent 3-way race the third developer only succeeded on attempt 3. The
+  retry predicate stays narrow: anything that is not a lost race (offline, a
+  rejecting remote) would fail identically three times. Never force-push.
+- **Hook flow:** the shim `exec`s the plumbing command (D7), which performs
+  `fetch`, then `git notes merge -s cat_sort_uniq` from the tracking ref, then
+  `push --no-verify`.
 - **`spelunk init` must announce the step.** Opt-in only works if it is
   discoverable, so `init`'s summary output must state that sharing memory with
   teammates requires installing the pre-push hook, and name the command. This is
@@ -289,6 +345,14 @@ lock is not optional.
 
 ### D6 – serialize note writes with a spelunk-owned lock
 
+> **The bounded-degradation clause below is superseded by D8.** Its closing
+> paragraph reads the budget's expiry as "skip the merge and read anyway," which
+> is right for the read-path merge it was written about and wrong for a writer:
+> a writer that proceeds past the budget performs the very read-modify-write
+> this section exists to prevent. D8 replaces that policy and states it per
+> caller. The rest of D6, including the decision to take a spelunk-owned lock
+> around the whole read-modify-write, stands and was not reconsidered.
+
 `append_to_git_notes` (`crates/spelunk-core/src/storage/git_notes/mod.rs:38-73`)
 is a **lock-free read-modify-write**: step 2 reads the note body
 (`notes show`), step 4 writes the whole body back (`notes add -f -F -`), and
@@ -317,6 +381,258 @@ read-path merge. The lock is **bounded**: if it is contended or the wait exceeds
 a small budget, **skip the merge and read anyway**. That is safe because the
 merge is idempotent (D2), so the next read catches up. A read must **never**
 fail because it could not take the lock.
+
+### D7 – the publish flow is a spelunk plumbing command; the hook is a shim
+
+Added on review of the first implementation (#617), which put the flow in the
+hook body as shell.
+
+**The shim still needs `#!/bin/sh`, and that is not the problem.** A git hook
+must be an executable file, and Git for Windows ships its own `sh` and runs hooks
+through it. The existing `POST_COMMIT_HOOK` (`hooks.rs:32`) already relies on
+exactly this, and the `windows-latest` CI cell exercises it today on default
+features. "Windows has no `/bin/sh`" is not the reason to move, and this ADR
+should not be read as recording that. The reason is that **scripting logic** in
+shell is the wrong home for it, on three counts:
+
+- **The shell cannot take the D6 lock, and that is a correctness gap, not a
+  style objection.** The lock is a **cross-process** file lock on
+  `<git-common-dir>/spelunk-notes.lock`
+  (`crates/spelunk-core/src/storage/git_notes/lock.rs`), so in principle a hook
+  could take it. In practice it cannot do so portably: `flock(1)` is a
+  util-linux tool, absent from stock macOS and from Git for Windows' shell.
+  The shell hook's merge therefore ran **unlocked**, so a concurrent
+  `spelunk memory add` during a push could still lose a record by exactly the
+  read-modify-write in D6. Moving publish into Rust closes that gap rather than
+  relocating it: `File::try_lock` is available on every supported platform, and
+  the publish path takes the same lock as every other writer. The portability
+  argument and the lock argument are the same argument.
+- **The logic is duplicated outside the tested codebase.** The retry predicate,
+  the recursion sentinel and the explicit `-s cat_sort_uniq` are all decisions
+  this ADR makes, re-expressed in a second language that shares no types with
+  the Rust that makes them.
+- **The test cost is disproportionate.** #617's hook body is **58 lines (26 of
+  them executable)** and carries a **984-line** integration test
+  (`crates/spelunk-cli/tests/pre_push_hook.rs`) driving real git repositories to
+  cover it. In Rust the same logic is reachable by ordinary unit tests. (An
+  earlier note on #617 put the shell at "~200 lines"; measured, it is 58. The
+  smaller number is the honest one and it does not weaken the case.)
+
+**The command is `spelunk plumbing publish-notes`.** The verb-noun name matches
+the namespace's existing pattern and reuses this ADR's own vocabulary
+(*publishing*, as distinct from *reading*, per the first Consequence).
+
+**This changes what the plumbing namespace means, which is worth stating rather
+than slipping in.** All eight existing subcommands (`cat-chunks`, `ls-files`,
+`parse-file`, `hash-file`, `knn`, `embed`, `graph-edges`, `read-memory`) are
+**read-only JSONL emitters**. `publish-notes` is the first that **writes** and
+performs **network I/O**. That is still plumbing in git's sense, where
+`git update-ref` writes and `git send-pack` talks to a remote, so the namespace
+is the right home. But "plumbing == read-only" stops being true of it, and
+anything that assumed so needs to stop.
+
+**It is plumbing, and is treated as such: discoverable but not promoted.** Not
+hidden, and not shouted about. `spelunk hooks install --pre-push` stays the
+porcelain a user is pointed at (D3), and the `init` announcement names that
+command, not this one.
+
+### D8 – a writer that cannot take the notes lock fails; it never proceeds unlocked
+
+Added on review of a `windows-latest` CI failure in D6's own regression guard.
+
+> **The closing diagnosis below ("What D8 does not do") is superseded by the
+> implementation's evidence.** It reasoned from a single run that lost 1 of 8
+> entries and concluded the defect was lock **identity** across worktrees.
+> Three further `windows-latest` failures refute that as the mechanism: one
+> lost **6 of 8** entries in the single-repo guard, one process, one repo, no
+> worktrees, where no identity split is possible. In every failing run the
+> survivors are a contiguous **tail** of the serialization order (ids `[6, 8]`;
+> `[8, 2, 4]`; and twice all-but-one), which is the fingerprint of exactly one
+> writer reading an **empty** note mid-sequence and rewriting the ref with only
+> its own line. The write path made that possible: `append_to_git_notes` read
+> the existing note with `git notes show` and treated **any** failure as "no
+> note yet" (`.unwrap_or_default()`), so one transient git failure inside the
+> guarded section wiped every prior entry, while the writer held the lock the
+> whole time, and the lock excluded correctly. The fix distinguishes "no note
+> found" (exit 1) from a failed read (anything else); a failed read is retried
+> briefly (it is side-effect free, and every observed failure was transient:
+> the same read succeeded for sibling writers moments apart) and then fails
+> the writer rather than guessing empty. The identity concern was real hygiene and is
+> hardened anyway (`--path-format=absolute` where git knows it, output-checked
+> because `rev-parse` **echoes** unknown flags with exit 0 rather than
+> rejecting them, then canonicalized), with a regression test pinning that
+> worktree contenders converge on one lock file. But note the OS primitive
+> locks the underlying **file**, not the path string, so two spellings of one
+> path never excluded nothing; only paths resolving to genuinely different
+> files could, and no failing run required that. D8's contention policy is
+> unchanged by this; what it governs was never the loss mechanism observed.
+>
+> **A second premise below is also corrected by observation: budget expiry is
+> not always a bug's symptom.** This section argues the budget is "set
+> generously enough that reaching it means a bug rather than a busy repo". A
+> `windows-latest` run falsified that: eight legitimate concurrent writers
+> serialized correctly on a slow runner, and the back of the queue exceeded
+> the 5s budget with nothing pathological anywhere; every over-budget writer
+> failed visibly (~5.4s in, naming the lock) while every serialized entry
+> survived. The policy stands exactly as written, since expiry stays an error
+> and never a downgrade. What does not stand is reading that error as proof of
+> a stuck holder: heavy legitimate write concurrency can reach it, the normal
+> remedy is a retry, and the error text says so. The concurrency guards assert
+> the D8 invariant accordingly: every entry lands or its writer fails visibly,
+> never "all must land".
+
+**The rule D6 left implicit, stated:** the contention policy is set by *what is
+lost when the lock is missing*, not by whether the caller is nominally a read or
+a write. Three cases, three answers:
+
+- **Proceeding unlocked can destroy a record.** `append_to_git_notes`,
+  `append_record` and `archive_record` are the exact read-modify-write #185
+  describes. They must hold the lock or **fail**. They never proceed unlocked.
+- **The work is idempotent and retried on the next invocation.** D5's read-path
+  merge and D7's publish lose nothing permanent by not running now. They
+  **skip**, report the skip, and never fail the caller.
+- **The lock cannot be established at all on this filesystem.** Serialization is
+  impossible there, so failing every write would make spelunk unusable on that
+  filesystem in order to prevent a race that needs a second concurrent writer to
+  matter. These **proceed unlocked, loudly**. This is the one degradation kept,
+  and it is kept narrow.
+
+**Why "never fail the caller" was the wrong reading for a writer.** D6 bounded
+the lock: "if it is contended or the wait exceeds a small budget, skip the merge
+and read anyway... A read must never fail because it could not take the lock."
+That clause is about **the merge on a read path**, where skipping costs
+freshness and nothing else. The implementation generalized it to writers.
+`lock_notes` returns `None` on a contended timeout and all three writer call
+sites discard it (`let _lock = lock_notes(...)`), so a writer that times out
+performs the unserialized read-modify-write D6 exists to prevent, and exits 0.
+"A command must never fail because of lock contention" is being bought with "a
+command sometimes silently loses the user's decision." For a tool whose promise
+is that it remembers why, that is the worse half of the trade. An error the user
+can see and retry costs them a command. A silent clobber costs them the record.
+
+**The wait budget is a watchdog, not a contention threshold.** `lock.rs`
+justifies its 5s budget by the holder cost ("~30ms"), which frames it as a
+number tuned against expected contention. That framing is wrong twice over.
+First, an OS advisory lock (`flock`, `LockFileEx`) is released by the kernel
+when the holding process dies, so a **stale lock cannot happen** and there is no
+crashed-holder case to time out for. The only thing a budget protects against is
+a live holder that never releases, which is a bug, or a deadlock. Second, a
+threshold tuned on one platform's timings becomes a correctness knob the moment
+its expiry silently changes behaviour.
+
+So the budget stays a **single constant**. It is *not* scaled per platform and
+*not* derived from observed holder cost: both add tuning to a number that should
+never be reached. It is set generously enough that reaching it means a bug
+rather than a busy repo, and its expiry is an **error**, never a downgrade.
+Making expiry loud is what makes a generous budget safe, and making the budget
+generous is what keeps the loud expiry rare enough that "a writer can fail" is
+not a practical regression.
+
+**`Option` is the wrong shape and is replaced.** `None` today means three
+different things: someone else holds the lock, the lock file cannot be opened,
+and the lock path could not be resolved. D8 gives those three different answers,
+so they cannot share one return value. `lock_notes` returns a three-way outcome
+(acquired, contended, unavailable-with-reason). The guard is `#[must_use]` so a
+caller cannot collapse the distinction back down with `let _`.
+
+**D7's publish path under contention: skip, report, do not fail the push.**
+Publishing is a fetch, a merge and a write-back, so by mechanism it is a writer.
+But its work is idempotent (D2), and records it did not publish stay in the
+local ref and publish on the next push, so a skipped publish loses nothing
+permanent. It therefore takes the second branch, not the first. This keeps D3's
+best-effort stance intact (spelunk does not block a push) without reintroducing
+the unlocked write-back that D7 moved publish into Rust to close. The skip is
+reported on the push output rather than swallowed: a user whose memory did not
+publish needs to know that it did not.
+
+**The degraded path must be observable, because its silence is why this needed a
+CI failure to surface.** Every branch above reports through `tracing::warn!`
+today. The integration tests install no subscriber, so those events go nowhere,
+and a test run cannot distinguish "the lock was held" from "the lock was skipped
+and the write raced." The outcome above is a returned value precisely so that
+callers and tests can assert on it directly rather than inferring it from
+damage.
+
+**What D8 does not do: it does not by itself fix the `windows-latest` failure
+that prompted it.** The evidence rules the timeout path out as that mechanism.
+In one run the cross-worktree guard
+(`append_to_git_notes_concurrent_worktrees_all_survive`) failed in **2.569s**,
+having lost 1 of 8 entries. In the same run, on the same runner,
+`append_to_git_notes_proceeds_when_lock_budget_is_exhausted` passed in
+**6.189s**. That test forces a real budget exhaustion, so it calibrates the cost
+of one: over 5s. A 2.569s failure cannot contain a 5s wait. In the same run the
+single-repo guard (`append_to_git_notes_concurrent_writers_all_survive`, eight
+concurrent writers in one process) **passed** in 2.460s, and the lock's own
+contract tests passed, which together show the primitive excludes and times out
+correctly on Windows.
+
+What is left is that two contenders do not converge on one lock file when they
+sit in **different worktrees** on Windows. `notes_lock_path` reaches that path by
+two different branches: a main worktree gets a relative answer from
+`git rev-parse --git-common-dir` (`.git`) and joins it against the repo root,
+while a linked worktree gets an absolute answer and uses it as-is. On unix both
+branches land on the same file, which is why only the Windows cell fails.
+Deciding which of those two strings is wrong on Windows needs a Windows host,
+and the warning that would say so is discarded, per the observability point
+above. That is a defect in lock **identity** and is fixed separately. D8 governs
+what a writer does once it knows it does not hold the lock, which is a question
+the identity fix does not answer and which the current code answers wrongly.
+
+### D9 – the notes lock covers the merge only, never the fetch or the push
+
+Added on review of D7's implementation (#630), which has this right and records
+nothing about why.
+
+D7 puts a fetch, a merge and a push behind one command, and D8 makes a writer
+that cannot take the lock fail. Together they make the lock's **scope** inside
+`publish-notes` load-bearing in a way neither section states. Taking the lock
+once around the whole operation is the tidier-looking code and is the bug.
+
+**The budget is bounded; network I/O is not.** D8 sets the wait budget as a
+watchdog, "generously enough that reaching it means a bug rather than a busy
+repo", and rests its case that "a writer can fail" is not a practical regression
+on exactly that rarity. A `fetch` or a `push` against a slow or unreachable
+remote outlasts any budget chosen on that reasoning. A lock spanning either does
+not merely stretch D8's premise, it **falsifies** it: budget expiry stops meaning
+a bug and starts meaning a slow network, and a `memory add` that happens to
+coincide with such a push fails for a reason that is not a bug. D8's error is
+correct because it is rare. D9 is what keeps it rare.
+
+`lock.rs` shows how directly this is load-bearing. It justifies its budget by the
+holder cost, "a few git subprocesses, ~30ms", and concludes that the budget is
+"orders of magnitude above realistic contention". That holds only while a holder
+does local git work and nothing else. Scope the lock over a fetch or a push and
+the holder cost stops being a spelunk constant and becomes the remote's latency.
+
+The constraint outlives the policy it was first drafted against. Under D6's
+withdrawn proceed-unlocked clause a network-spanning lock converted a rare race
+into a reliable one; under D8 it converts a rare failure into a reliable one. It
+is the same defect either way, which is why the scope rule is stated separately
+from the contention policy: the lock's hold time stops being a property of
+spelunk's own work and becomes a property of the network.
+
+**Neither network step needs the lock.** `fetch` writes only the tracking ref
+(D4), so it never contends for the working ref's content. `push` only reads the
+working ref, and git's ref locking already makes that read atomic; the worst case
+is that it publishes a state one entry stale, which the next push carries.
+Staleness is not loss.
+
+**Per attempt, not around the retry loop.** D3 retries a lost race up to 3 times,
+and each attempt is a fetch, a merge and a push. The lock is taken and released
+inside each attempt's merge. A guard hoisted out of the loop would hold it across
+up to three network round trips, which is the same defect three times over.
+
+**#630 satisfies this by reuse rather than by intent, which is the reason to
+record it.** `publish_notes` runs `fetch` and `push` itself and delegates the
+merge to `merge_tracking_notes`, which takes `lock_notes` in its own body and
+drops the guard on return, so no lock is held across either network call. Nothing
+at that call site says the arrangement is load-bearing. The obvious tidy-up,
+hoisting the lock to the top of `publish_notes` so that the whole flow is
+"properly" serialized, removes it silently and reads as an improvement.
+
+D8 governs what publish does when it **cannot** take the lock: skip, report, do
+not fail the push. D9 governs how much of publish the lock covers when it
+**can**.
 
 ## Non-goals
 
@@ -366,6 +682,22 @@ fail because it could not take the lock.
 - **#185 moves from deferred to required, and a concurrency bug gets fixed on
   the way.** D6's lock is a precondition of D5, and it also closes a live
   entry-losing race that predates this ADR for parallel agents in worktrees.
+- **The publish path joins the lock protocol, closing a gap the shell left
+  open.** The shell hook of #617 could not portably take D6's lock, so its merge
+  ran unlocked and a concurrent `spelunk memory add` during a push could still
+  lose a record. That was accepted at the time as a tracked follow-up. D7 closes
+  it as a side effect: publish is now a Rust caller of the same
+  cross-process lock as every other writer, so it needs no separate fix.
+- **`spelunk plumbing` is no longer a read-only namespace.** `publish-notes`
+  (D7) is its first writing, network-touching subcommand. Anything that treated
+  the namespace as safe-by-construction for scripting or sandboxing needs to
+  account for it.
+- **The hook stops being a place where decisions live.** After D7 the installed
+  file is a shim, so changing the retry count, the merge strategy or the
+  recursion guard is a code change under test, not an edit to a string constant
+  that a user may already have on disk. Users who installed an older hook keep
+  the shell body until they re-run `spelunk hooks install --pre-push`, which is
+  the same re-resolution path the embedded absolute path already needs (D3).
 - **Note size is not the cost axis; divergence is.** Growing a note is nearly
   free (10 to 1000 entries moves the merge from 11.9ms to 14.9ms). The cost
   scales with **divergent annotated objects**, at roughly 0.6ms each: 5000
@@ -393,7 +725,11 @@ fail because it could not take the lock.
   than the alternatives rejected in D1: push-on-`memory add` and a timer would
   both send data at moments the user did not initiate. The hook adds no egress
   the user was not already performing, and to no host other than the remote they
-  chose.
+  chose. D7 makes the publish flow **directly invocable**
+  (`spelunk plumbing publish-notes`), which does not widen this bound: running it
+  is itself a user-initiated action, and it reaches only the remote it is given.
+  It is the first plumbing subcommand that touches the network at all, so the
+  namespace no longer implies "no egress" (see Consequences).
 - **D5's read-path merge does not fetch, and this was verified rather than
   assumed.** With the remote made unreachable the merge still succeeds (~12ms).
   `GIT_TRACE` and `GIT_TRACE_PACKET` show no transport. And the positive proof:

@@ -1,16 +1,12 @@
 use proptest::prelude::*;
-use spelunk_core::indexer::chunker::sliding_window;
+use spelunk_core::indexer::chunker::{MAX_CHUNK_TOKENS, sliding_window};
+use spelunk_core::search::tokens::estimate_tokens;
 
 proptest! {
-    // Every chunk's content must be a substring of the original source
+    // Every chunk's content must be a substring of the original source.
     #[test]
-    fn chunks_are_substrings_of_source(
-        source in "([a-z ]+\n){1,50}",
-        window in 5usize..=50,
-        overlap in 0usize..=10,
-    ) {
-        let overlap = overlap.min(window - 1);
-        let chunks = sliding_window(&source, "test.txt", "text", window, overlap);
+    fn chunks_are_substrings_of_source(source in "([a-z ]+\n){1,50}") {
+        let chunks = sliding_window(&source, "test.txt", "text", None, None, None);
         for chunk in &chunks {
             prop_assert!(
                 source.contains(chunk.content.trim()),
@@ -19,34 +15,44 @@ proptest! {
         }
     }
 
-    // No chunk should exceed window size (in lines)
+    // Every window is within the token budget unless it is a single line that
+    // alone exceeds it (the forward-progress escape hatch).
     #[test]
-    fn chunks_respect_window_size(
-        source in "([a-z ]+\n){1,100}",
-        window in 5usize..=30,
-        overlap in 0usize..=5,
-    ) {
-        let overlap = overlap.min(window - 1);
-        let chunks = sliding_window(&source, "test.txt", "text", window, overlap);
+    fn windows_respect_token_budget(source in "([a-zA-Z0-9 ]{0,200}\n){1,120}") {
+        let chunks = sliding_window(&source, "test.txt", "text", None, None, None);
         for chunk in &chunks {
-            let line_count = chunk.content.lines().count();
+            let over_budget = estimate_tokens(&chunk.content) > MAX_CHUNK_TOKENS;
+            let single_line = chunk.content.lines().count() <= 1;
             prop_assert!(
-                line_count <= window,
-                "chunk has {} lines, window is {}",
-                line_count,
-                window
+                !over_budget || single_line,
+                "window {}-{} exceeds the cap but is not a lone line",
+                chunk.start_line,
+                chunk.end_line,
             );
         }
     }
 
-    // Empty source always yields no chunks
+    // Windows always make forward progress and cover the source contiguously:
+    // start lines are strictly increasing and never leave a gap wider than an
+    // overlap (each next window starts on or before the previous window's end).
     #[test]
-    fn empty_source_yields_no_chunks(
-        window in 1usize..=50,
-        overlap in 0usize..=10,
-    ) {
-        let overlap = overlap.min(window - 1);
-        let chunks = sliding_window("", "test.txt", "text", window, overlap);
+    fn windows_advance_and_stay_contiguous(source in "([a-z ]{0,120}\n){2,80}") {
+        let chunks = sliding_window(&source, "test.txt", "text", None, None, None);
+        for pair in chunks.windows(2) {
+            prop_assert!(pair[1].start_line > pair[0].start_line, "windows must advance");
+            prop_assert!(
+                pair[1].start_line <= pair[0].end_line + 1,
+                "gap between windows: {} after {}",
+                pair[1].start_line,
+                pair[0].end_line,
+            );
+        }
+    }
+
+    // Empty source always yields no chunks.
+    #[test]
+    fn empty_source_yields_no_chunks(_ in 0u8..=0) {
+        let chunks = sliding_window("", "test.txt", "text", None, None, None);
         prop_assert!(chunks.is_empty());
     }
 }

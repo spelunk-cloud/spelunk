@@ -9,7 +9,7 @@
 
 **Date:** 2026-07-05
 **Deciders:** founder (Johan), architect
-**Trigger:** founder review on PR #516 (spelunk-oss^79). The pre-v1.0 server
+**Trigger:** founder review on PR #516. The pre-v1.0 server
 hardening made `spelunk-server` refuse a non-loopback plaintext bind
 *unconditionally*, and the founder review of that PR removed the bundled
 reverse-proxy/TLS-sidecar packaging entirely (Caddyfile and
@@ -24,7 +24,7 @@ the founder's answer.
 ## Context
 
 `spelunk-server` (`crates/spelunk-server/`) is an axum HTTP listener. It serves
-two roles ([`server.md`](../server.md)): an automatic loopback **inference**
+two roles (`server.md`): an automatic loopback **inference**
 backend on a developer's own machine (never a memory store), and — when a
 developer sets an explicit `server_url` — a deployed **team memory** server that
 holds a team's shared memory ([ADR-004](004-unified-memory-storage.md),
@@ -51,7 +51,7 @@ deployment run over TLS is an **operational** one that the operator satisfies
 outside the binary, by putting a TLS terminator in front of a loopback-bound
 server. The client half enforces the same contract from the other side:
 `server_url` must be `https://` unless it points at loopback
-([`server.md`](../server.md) "Client configuration").
+(`server.md` "Client configuration").
 
 ### Why Docker cannot host the networked serving path
 
@@ -75,8 +75,8 @@ Only a **same-host bare-metal** process can bind the host's real loopback and be
 reached there by a same-host TLS terminator. This is the mechanical reason
 bare-metal — not Docker — is the deployment vehicle for a networked team server.
 
-This also resolves the [spelunk-oss^70](../remote-agents.md) friction (Docker
-remote-agent loopback): the fix is to containerize the **agent**, not the
+This also resolves the [Docker remote-agent loopback](../remote-agents.md)
+friction: the fix is to containerize the **agent**, not the
 **server**. With the server on bare-metal loopback behind the operator's TLS
 terminator, a containerized agent connects to the operator's `https://`
 endpoint the same way any other client does — the terminator forwards to
@@ -94,7 +94,7 @@ say (see §4).
 
 ### What already exists
 
-[`self-hosting.md`](../self-hosting.md) already documents the correct shape:
+`self-hosting.md` already documents the correct shape:
 server on `127.0.0.1`, an operator's TLS reverse proxy (Caddy or nginx) in
 front, a systemd unit, and a client pointed at the `https://` hostname. It is
 currently framed as one self-hosting recipe among others. What is missing is
@@ -250,8 +250,8 @@ in the implementation PR, not in this ADR's PR:
   containerized agent's `server_url` points at the operator's `https://`
   terminator (the same one clients use), not the Docker bridge gateway or
   `host.docker.internal`, which does not reach a host-loopback-bound server on
-  native Linux. This is the concrete [spelunk-oss^70](../remote-agents.md) fix;
-  add a one-line cross-reference that the server-side of a team deployment is
+  native Linux. This is the concrete [remote-agent loopback](../remote-agents.md)
+  fix; add a one-line cross-reference that the server-side of a team deployment is
   the bare-metal path in `self-hosting.md`.
 
 ### 5. Interaction with the health/limits surface
@@ -265,7 +265,7 @@ health body reflects the unit's `User=spelunk`, which is the identity the CLI's
 loopback auto-discovery guards against reusing — a deployed team server on a
 shared host is a distinct identity from a developer's auto-started loopback
 server, and that is correct. The `/index/embed` route is already exempt from the
-30 s request timeout (spelunk-oss^71/^73/^74), so large embed batches over the
+30 s request timeout, so large embed batches over the
 proxy are not cut off by the router timeout; the operator's proxy
 `proxy_read_timeout`/equivalent must be set generously to match (the
 `self-hosting.md` nginx example already does this for the SSE stream). If a
@@ -332,7 +332,7 @@ ADR does not depend on that field existing.
     `MemoryDenyWriteExecute`).
   - Execute the §4 docs restructure across `server.md`, `self-hosting.md`,
     `docker-compose.yml`, and `remote-agents.md` (including the R1
-    TLS-endpoint rework, the concrete spelunk-oss^70 fix), superseding the
+    TLS-endpoint rework, the concrete remote-agent loopback fix), superseding the
     PR #516 interim pointer.
   - Reconcile `self-hosting.md`'s existing systemd block (currently
     `Environment=`-based, `User=spelunk`) with the credential-based §2 unit.

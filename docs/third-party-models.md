@@ -1,46 +1,115 @@
 # Third-party models
 
-spelunk-server bundles a native embedding model rather than calling an external
-embedding endpoint. `cargo-about` (see `about.toml`) covers Rust dependency
-licenses, but it does not cover the model weights downloaded at runtime, so they
-are attributed here.
+`spelunk-server` bundles a native embedding model, so semantic search works
+with no external endpoint and no way to relocate it: the embedding model and
+its compute path are both pinned product-wide. LLM-backed features are
+different: the server has no LLM of its own, and proxies those calls to an
+external OpenAI-compatible chat-completions endpoint that you configure. This
+page covers wiring that up.
 
-## F2LLM-v2-330M (embedder)
+Looking for the bundled embedder's license and provenance instead? See
+[Model attribution](model-attribution.md).
 
-- **Model:** `codefuse-ai/F2LLM-v2-330M`
-- **Upstream:** https://huggingface.co/codefuse-ai/F2LLM-v2-330M
-- **Pinned source revision:** `1239cdd544b24c247ed75df2ae22e5a401ac4659` — the
-  provenance anchor for the weights, tokenizer, and config redistributed in
-  `spelunk-cloud/F2LLM-v2-330M-Q8_0-GGUF` (see below). Not used at runtime;
-  update it (and regenerate/re-upload the artifacts) if the pin ever moves.
-- **License:** Apache License 2.0 (declared via the upstream Hugging Face
-  model-card license tag). Full text:
-  https://www.apache.org/licenses/LICENSE-2.0
-- **Use in spelunk:** loaded by `spelunk-server` as the 896-dim semantic
-  embedding backend (Qwen3 decoder architecture, candle runtime).
+## Configuring an external LLM endpoint
 
-### Modification notice (Apache-2.0 §4)
+Flags and environment variables (verified against `spelunk-server --help`,
+v0.9.4):
 
-spelunk redistributes a **modified** copy of these weights: the original BF16
-safetensors are **quantized to Q8_0** (projection matmuls and the token-embedding
-table are stored Q8_0; RMSNorm weights are kept F32) and packaged as a single
-GGUF file. No other changes are made to the weights.
+| Flag | Env | Purpose |
+|---|---|---|
+| `--llm-url` | `SPELUNK_LLM_URL` | Base URL of an OpenAI-compatible chat-completions server (e.g. LM Studio, Ollama, vLLM). |
+| `--llm-model` | `SPELUNK_LLM_MODEL` | Model name to send to that endpoint (e.g. `google/gemma-3n-e4b`). |
 
-spelunk fetches this pre-quantized Q8_0 GGUF, plus the unmodified upstream
-`tokenizer.json`, from a Hugging Face repository it owns
-(`spelunk-cloud/F2LLM-v2-330M-Q8_0-GGUF`); that artifact carries its own
-`LICENSE`, `NOTICE`, and model card reproducing this attribution. `config.json`
-(unmodified, ~1 KB) is vendored directly into the `spelunk-server` binary
-(`crates/spelunk-server/assets/f2llm-v2-330m-config.json`) rather than fetched.
-**None of the three artifacts (GGUF, tokenizer, config) are fetched from the
-third-party upstream repo at runtime** — everything comes from our own
-first-party repo or is embedded in the binary. Set `SPELUNK_EMBEDDER_GGUF_REPO`
-to a different repo to fetch the GGUF and tokenizer from there instead (it must
-host both files). See `docs/embedder-artifact/` for the text that accompanies
-the distributed artifact.
+These are flags to **`spelunk-server`**, not CLI `config.toml` keys: the CLI
+never talks to an LLM directly, only through the server. There is no
+authentication option for the endpoint itself: the server sends unauthenticated
+requests, so point it at a trusted local or internal endpoint, not a public one.
 
-### Other bundled inference dependencies
+### What this unlocks
 
-The candle runtime (`candle-core`, `candle-nn`, `candle-transformers`), the
-Hugging Face hub client (`hf-hub`), and `tokenizers` are Rust crates and are
-covered by `cargo-about` / `about.toml`; they are not re-listed here.
+- **`spelunk explore`**: the interactive LLM reasoning loop (`/explore`).
+- **`spelunk memory harvest`**: LLM-based decision extraction from commits and
+  agent sessions.
+- **`spelunk index` chunk summaries**: see the caveat below; this one needs an
+  explicitly configured `server_url` in addition to the server having an LLM.
+
+### Absence behavior
+
+With no LLM configured on the server:
+
+- `spelunk explore` and `spelunk memory harvest` fail with an actionable error
+  naming `server_url` (or, if no server is reachable at all, pointing at
+  `spelunk server start`).
+- The server's own `/explore` and `/llm/complete` routes return `503` with
+  `"This server has no LLM configured. Set SPELUNK_LLM_URL and SPELUNK_LLM_MODEL."`
+- `spelunk index` prints `Skipping summaries (no server_url configured)` to
+  stderr and continues; a missing LLM never fails an index run.
+
+### Loopback (local dev) setup
+
+Export the variables, then restart the auto-managed local daemon so the
+new process inherits them (a daemon already running keeps its old
+configuration until restarted):
+
+```bash
+export SPELUNK_LLM_URL="http://127.0.0.1:1234"   # your LM Studio / Ollama / vLLM endpoint
+export SPELUNK_LLM_MODEL="your-chat-model-id"
+
+spelunk server stop      # if one is already running
+spelunk server start     # the new daemon inherits the variables above
+```
+
+`spelunk explore` and `spelunk memory harvest` now work against the
+auto-discovered loopback server, no `config.toml` change needed, since both
+commands fill in the loopback URL for you when no explicit `server_url` is set.
+
+**Index-time summaries are the exception.** They are gated on an *explicitly
+configured* `server_url`, not merely on a reachable server, so they stay off
+even against an LLM-configured loopback daemon unless you also set:
+
+```toml
+# .spelunk/config.toml
+server_url = "http://127.0.0.1:7777"
+```
+
+(A loopback `http://` value is allowed here; see
+[Server setup → Client configuration](server-setup.md#client-configuration).)
+
+### Team server setup
+
+Pass the same two flags when you start the deployed `spelunk-server` (see
+[Server setup](server-setup.md)):
+
+```bash
+spelunk-server --host 0.0.0.0 --port 7777 \
+  --tls-cert /etc/spelunk/tls-cert --tls-key /etc/spelunk/tls-key \
+  --llm-url http://llm-host:1234 --llm-model your-chat-model-id
+```
+
+Every client already sets an explicit `server_url` to reach a team server, so
+`explore`, `memory harvest`, and index-time summaries are all unlocked with no
+extra client-side configuration.
+
+## Native embedder artifact source
+
+Embeddings have no external endpoint or config: the model is pinned
+product-wide to F2LLM-v2-330M at 896 dimensions, computed only by the bundled
+native embedder. `SPELUNK_EMBEDDER_GGUF_REPO` points that *bundled native*
+embedder at an alternate source for the same F2LLM-v2-330M GGUF and tokenizer
+artifacts, not a different model. See [Model attribution](model-attribution.md).
+
+## Running with no network access at all
+
+`SPELUNK_EMBEDDER_GGUF_REPO` above still calls out over the network, just to a
+different (self-hosted) source. For a host with no route out at all, not
+even to an alternate source, `--model-dir` / `SPELUNK_MODEL_DIR` loads the
+bundled native embedder from a directory you provision ahead of time instead
+of fetching it from Hugging Face Hub. See [Server setup → Air-gapped /
+no-egress install](server-setup.md#air-gapped--no-egress-install) for the
+directory layout and the fetch-and-transfer procedure.
+
+## Related
+
+- [Server setup](server-setup.md): deploying `spelunk-server`, TLS, client configuration
+- [Model attribution](model-attribution.md): license and provenance for the bundled embedder
+- [Getting started](getting-started.md): the zero-setup local path

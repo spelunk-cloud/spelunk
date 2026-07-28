@@ -52,7 +52,7 @@ For the default local configuration spelunk makes no outbound connections except
 to `127.0.0.1` (a local server the user controls). When `server_url` points at a
 remote instance, treat the network path and the server's authentication as
 in-scope — see [`docs/security/THREAT-MODEL.md`](docs/security/THREAT-MODEL.md)
-(Mode B) and [`docs/self-hosting.md`](docs/self-hosting.md) for TLS guidance.
+(Mode B) and [`docs/server-setup.md`](docs/server-setup.md) for TLS guidance.
 
 ## Security Controls
 

@@ -1,3 +1,4 @@
+use super::color::cprintln;
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
@@ -151,11 +152,17 @@ pub async fn check(args: CheckArgs, cfg: Config) -> Result<()> {
                     } else {
                         features.join(", ")
                     };
-                    println!("Server:  {url}  \x1b[32m✓\x1b[0m  ({feature_str} available)");
+                    cprintln!("Server:  {url}  \x1b[32m✓\x1b[0m  ({feature_str} available)");
                 }
                 capability::Tier::Offline => {
                     let url = cfg.server_url.as_deref().unwrap_or("?");
-                    println!("Server:  {url}  \x1b[31m✗\x1b[0m  unreachable — offline mode");
+                    let label = match capability::explicit_probe_failure() {
+                        Some(capability::ConnFailure::Tls(cause)) => {
+                            format!("reachable, but TLS trust failed: {cause}")
+                        }
+                        _ => "unreachable, offline mode".to_string(),
+                    };
+                    cprintln!("Server:  {url}  \x1b[31m✗\x1b[0m  {label}");
                 }
             }
         }

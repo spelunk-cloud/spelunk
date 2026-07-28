@@ -10,6 +10,11 @@ on:
   #   gh workflow run ci.yml --ref <branch>
   workflow_dispatch:
 
+# Deny by default; every job below grants only what it needs. None of these
+# jobs push commits, comment on PRs, or create releases, so `contents: read`
+# (checkout only) covers all of them.
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
   # Force the file-backed secret store in all CI runs. The OS keychain
@@ -26,9 +31,23 @@ jobs:
   check:
     name: Check & Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
+    env:
+      # clippy/check/build in this job need no debug info from the dev
+      # profile; the full workspace build (all-targets, rich-formats, incl.
+      # the embedder dep tree) has been observed to exhaust runner disk
+      # (ENOSPC) with debug info on. Mirrors CARGO_PROFILE_TEST_DEBUG below.
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v7
+
+      - name: Git isolation lint
+        run: scripts/check-git-isolation.sh
+
+      - name: Disk usage (baseline)
+        run: df -h
 
       - name: Install libdbus (keyring sync-secret-service backend)
         run: sudo apt-get install -y libdbus-1-dev pkg-config
@@ -50,6 +69,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Disk usage (after cache restore)
+        run: df -h
+
       # Each gate is a make target so `make check` and CI cannot diverge. Keep
       # them as separate steps: it names the failing gate in the job summary.
       - name: Rustfmt
@@ -64,9 +86,15 @@ jobs:
       - name: Build (rich-formats)
         run: make build
 
+      - name: Disk usage (after build)
+        if: always()
+        run: df -h
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     timeout-minutes: 30
     env:
       # Test binaries don't need full debug info; this shrinks compile times
@@ -100,10 +128,15 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y libdbus-1-dev pkg-config
 
-      - name: Install stable toolchain
-        run: |
-          rustup update stable
-          rustup default stable
+      # One command per step: this job's matrix includes windows-latest, and a
+      # Windows step's exit status does not reflect a failing native
+      # executable (only a failing PowerShell cmdlet), so chaining two rustup
+      # invocations in one run block would mask a failure in the first.
+      - name: Update stable toolchain
+        run: rustup update stable
+
+      - name: Set default toolchain
+        run: rustup default stable
 
       - name: Cache
         uses: actions/cache@v6
@@ -155,6 +188,8 @@ jobs:
   release-scripts:
     name: Release script tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -167,6 +202,8 @@ jobs:
   docker-build:
     name: Docker image build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     # The image compiles the release server (candle embedder) from scratch with
     # no cargo cache, so allow a generous ceiling.
     timeout-minutes: 45
@@ -185,9 +222,50 @@ jobs:
           test -n "$(docker run --rm spelunk-server:ci --version)"
           docker run --rm spelunk-server:ci --print-openapi | head -c1 | grep -q .
 
+      # Regression check for the container-user-has-no-home bug: start the
+      # image against a real named volume (as a deployment would) and poll
+      # `/v1/health` from a sidecar sharing its network namespace (the
+      # pattern documented at the top of the Dockerfile, since the server
+      # only binds loopback). This only needs the embedder's model-cache
+      # `mkdir` to succeed, not the full ~339 MB download: `create_dir_all`
+      # runs before any network I/O in `load_from_hub()`, so a cache-dir
+      # failure surfaces as an `unavailable` state within a couple of
+      # seconds, well before "loading" would ever complete.
+      - name: Check embedder initializes against the persistent volume
+        run: |
+          docker run -d --name spelunk-server-ci -v spelunk-data-ci:/data spelunk-server:ci
+          trap 'docker logs spelunk-server-ci || true; docker rm -f spelunk-server-ci >/dev/null 2>&1; docker volume rm spelunk-data-ci >/dev/null 2>&1' EXIT
+
+          health=""
+          for _ in $(seq 1 30); do
+            health="$(docker run --rm --network container:spelunk-server-ci curlimages/curl -s http://127.0.0.1:7777/v1/health || true)"
+            [ -n "$health" ] && break
+            sleep 1
+          done
+
+          if [ -z "$health" ]; then
+            echo "ERROR: /v1/health never answered"
+            exit 1
+          fi
+          echo "$health"
+
+          state="$(echo "$health" | jq -r '.embedder.state')"
+          detail_lower="$(echo "$health" | jq -r '.embedder.detail // empty' | tr '[:upper:]' '[:lower:]')"
+
+          if [ "$state" = "unavailable" ]; then
+            case "$detail_lower" in
+              *mkdir*|*"permission denied"*)
+                echo "ERROR: embedder failed to initialize (model-cache dir/permissions failure): $detail_lower"
+                exit 1
+                ;;
+            esac
+          fi
+
   openapi-snapshot:
     name: OpenAPI snapshot check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

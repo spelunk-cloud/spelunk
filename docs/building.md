@@ -76,7 +76,7 @@ cargo build --release -p spelunk-server
 
 | Feature | Default | Description |
 |---|---|---|
-| `embed-native` | yes | Bundle the F2LLM-v2-330M native embedder via candle (CPU). Disable to build a server that relies on an external OpenAI-compatible embedding endpoint. |
+| `embed-native` | yes | Bundle the F2LLM-v2-330M native embedder via candle (CPU). Disabling it builds a server with no embedding capability at all: embed endpoints return a permanent 400 (there is no external-endpoint fallback). |
 | `metal` | no | Enable Metal GPU acceleration on macOS. Requires the `embed-native` feature. Add when building the macOS release binary for best performance. |
 
 Enable non-default features with `--features`:
@@ -85,7 +85,7 @@ Enable non-default features with `--features`:
 # macOS release build with Metal GPU acceleration
 cargo build --release -p spelunk-server --features metal
 
-# Server without the bundled embedder (external endpoint required)
+# Server without the bundled embedder (no embedding capability at all)
 cargo build --release -p spelunk-server --no-default-features
 ```
 
@@ -158,10 +158,19 @@ equivalent, or are deliberately left opt-in because they are slow or need extra 
 | cargo-deny (Security) | `make deny` |
 | OpenAPI snapshot check | `make openapi-check`, and `make openapi` to regenerate |
 | Workflow/Makefile drift guard | `make ci-drift` |
+| Upgrade corpus: pinned-old-binary leg | none |
 | Test (windows-latest) | none |
 | Docker image build | none |
 | Release script tests | none |
 | Fuzz (weekly) | none |
+
+Two PR-gating jobs are absent from that list because `make check` already covers them.
+The Stability contract job re-runs `schema_contract_checker`, `plumbing_jsonl_contract`
+and `plumbing_exit_codes` on their own so a contract break is a named failure rather
+than one red line in a thousand-test run, but the full suite runs those same binaries.
+The Upgrade corpus job's fixture leg is likewise an ordinary test. Only its second leg
+is out of reach locally: it is `#[ignore]`d and needs a downloaded release binary in
+`SPELUNK_OLD_BINARY`, which is why it has a row above.
 
 For the legs with no local target, run CI on your branch. It does not need a pull
 request:

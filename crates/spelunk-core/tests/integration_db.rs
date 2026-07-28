@@ -27,8 +27,12 @@ fn unit_vec(dim: usize, pos: usize) -> Vec<f32> {
 #[serial]
 fn upsert_file_returns_stable_id() {
     let db = common::open_test_db();
-    let id1 = db.upsert_file("src/lib.rs", Some("rust"), "hash1").unwrap();
-    let id2 = db.upsert_file("src/lib.rs", Some("rust"), "hash2").unwrap();
+    let id1 = db
+        .upsert_file("src/lib.rs", Some("rust"), "hash1", 0)
+        .unwrap();
+    let id2 = db
+        .upsert_file("src/lib.rs", Some("rust"), "hash2", 0)
+        .unwrap();
     assert_eq!(id1, id2, "upsert must return the same row id");
 }
 
@@ -36,7 +40,7 @@ fn upsert_file_returns_stable_id() {
 #[serial]
 fn file_hash_round_trips() {
     let db = common::open_test_db();
-    db.upsert_file("src/main.rs", Some("rust"), "abc123")
+    db.upsert_file("src/main.rs", Some("rust"), "abc123", 0)
         .unwrap();
     let hash = db.file_hash("src/main.rs").unwrap();
     assert_eq!(hash.as_deref(), Some("abc123"));
@@ -55,7 +59,7 @@ fn file_hash_returns_none_for_unknown() {
 #[serial]
 fn insert_and_delete_chunks() {
     let db = common::open_test_db();
-    let file_id = db.upsert_file("src/foo.rs", Some("rust"), "h").unwrap();
+    let file_id = db.upsert_file("src/foo.rs", Some("rust"), "h", 0).unwrap();
     let chunk_id = db
         .insert_chunk(
             file_id,
@@ -87,7 +91,7 @@ fn knn_returns_closest_vector_first() {
     let db = common::open_test_db();
 
     // Insert two chunks with distinct embeddings.
-    let fid = db.upsert_file("a.rs", Some("rust"), "h").unwrap();
+    let fid = db.upsert_file("a.rs", Some("rust"), "h", 0).unwrap();
     let cid1 = db
         .insert_chunk(
             fid,
@@ -138,7 +142,7 @@ fn knn_returns_closest_vector_first() {
 #[serial]
 fn int8_knn_preserves_ranking_and_rescales_distance() {
     let db = common::open_test_db();
-    let fid = db.upsert_file("vec.rs", Some("rust"), "h").unwrap();
+    let fid = db.upsert_file("vec.rs", Some("rust"), "h", 0).unwrap();
 
     // query = e0; `near` is mostly e0 with a little e1; `far` is orthogonal (e1).
     let query = unit_vec(DIM, 0);
@@ -184,7 +188,7 @@ fn int8_knn_preserves_ranking_and_rescales_distance() {
 #[serial]
 fn knn_limit_is_respected() {
     let db = common::open_test_db();
-    let fid = db.upsert_file("b.rs", Some("rust"), "h").unwrap();
+    let fid = db.upsert_file("b.rs", Some("rust"), "h", 0).unwrap();
 
     for i in 0..5 {
         let cid = db

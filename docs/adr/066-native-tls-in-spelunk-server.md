@@ -14,7 +14,7 @@ in-process TLS, which this ADR removes).
 `check_bind_safety` (`crates/spelunk-server/src/main.rs`), refuses **every**
 non-loopback bind, whether keyless (an open server) or keyed (the bearer key
 would cross the wire in cleartext). That refusal is unconditional and has no
-opt-out (hardened in spelunk-oss^122). Loopback binds are always allowed.
+opt-out (hardened pre-v1.0). Loopback binds are always allowed.
 
 The consequence: the only code-supported way to reach the server from another
 machine is to bind loopback and put an operator-owned TLS reverse proxy in front
@@ -120,7 +120,7 @@ a direct encoding of "local = HTTP no key, remote = HTTPS + key":
 
 Nothing currently permitted is removed: the keyed-non-loopback-plaintext bind
 that ADR-058 described as "permitted by the binary" was **already refused** by
-the time of this ADR (spelunk-oss^122 removed it). The only change is additive –
+the time of this ADR (the pre-v1.0 hardening removed it). The only change is additive –
 a non-loopback bind becomes allowed when, and only when, TLS **and** a key are
 both configured. Plaintext off-host stays refused with no opt-out.
 
@@ -185,7 +185,7 @@ bearer key in ADR-058:
 - **`examples/mdm/`** (macOS `.mobileconfig`, Windows service installer, README)
   – switch the daemon arguments from `--host 127.0.0.1` + a proxy note back to a
   routable bind with `--tls-cert`/`--tls-key`, undoing the interim
-  proxy-pointer that spelunk-oss^120 (PR #559) added as a stopgap under the
+  proxy-pointer that PR #559 added as a stopgap under the
   no-native-TLS constraint.
 - **`docs/remote-agents.md`** and **`packaging/*.service`** – point at the
   server's own `https://` endpoint; reconcile the shipped units with §6.

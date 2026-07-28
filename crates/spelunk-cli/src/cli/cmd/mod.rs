@@ -1,6 +1,9 @@
+pub mod auth;
 pub mod auth_api;
 pub mod check;
+pub(crate) mod color;
 pub mod context;
+mod embed_worker;
 pub mod explore;
 pub mod graph;
 pub mod helpers;
@@ -18,9 +21,13 @@ pub mod plumbing;
 pub mod search;
 pub mod server;
 pub mod status;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod ui;
 
+pub use auth::auth;
 pub use check::check;
+pub(crate) use color::{ColorChoice, set_color_choice};
 pub use context::context;
 pub use explore::explore;
 pub use graph::graph;

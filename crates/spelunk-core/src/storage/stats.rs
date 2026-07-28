@@ -12,6 +12,18 @@ pub struct IndexStats {
     pub last_indexed: Option<i64>,
 }
 
+/// Token-weighted view of the embed queue, for progress reporting. Chunk
+/// counts answer "what can search see" (coverage); token sums answer "how much
+/// embed work remains" (progress). The two are different questions and must
+/// never be rendered under one name.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct EmbedTokenStats {
+    /// Sum of `token_count` over all chunks. 0 on an empty or pre-backfill index.
+    pub total_tokens: i64,
+    /// Sum of `token_count` over chunks with no embedding row.
+    pub pending_tokens: i64,
+}
+
 /// Result of a lightweight random-sample staleness probe.
 #[derive(Debug, serde::Serialize)]
 pub struct StalenessReport {
@@ -68,6 +80,27 @@ impl Database {
             chunk_count,
             embedding_count,
             last_indexed,
+        })
+    }
+
+    /// Token-weighted embed-queue totals (see [`EmbedTokenStats`]).
+    pub fn embed_token_stats(&self) -> Result<EmbedTokenStats> {
+        let total_tokens: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(token_count), 0) FROM chunks",
+            [],
+            |r| r.get(0),
+        )?;
+        let pending_tokens: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(c.token_count), 0)
+             FROM chunks c
+             LEFT JOIN embeddings e ON e.chunk_id = c.id
+             WHERE e.chunk_id IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(EmbedTokenStats {
+            total_tokens,
+            pending_tokens,
         })
     }
 

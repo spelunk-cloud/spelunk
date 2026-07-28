@@ -46,7 +46,7 @@ fn parse_docx(bytes: &[u8], file_path: &str) -> Vec<Chunk> {
         return vec![];
     }
 
-    sliding_window(&lines.join("\n"), file_path, "docx", 120, 15)
+    sliding_window(&lines.join("\n"), file_path, "docx", None, None, None)
 }
 
 /// Recursively collect plain text lines from document children.
@@ -179,7 +179,7 @@ fn parse_spreadsheet(bytes: &[u8], file_path: &str) -> Vec<Chunk> {
                 summary: None,
             });
         } else {
-            for mut chunk in sliding_window(&content, file_path, "spreadsheet", 120, 15) {
+            for mut chunk in sliding_window(&content, file_path, "spreadsheet", None, None, None) {
                 chunk.name = Some(format!(
                     "{} (rows {}–{})",
                     sheet_name, chunk.start_line, chunk.end_line

@@ -5,7 +5,7 @@
 #     is reachable only from inside that namespace (e.g. a sidecar started with
 #     `--network container:spelunk-server`; the runtime image has no curl/wget to
 #     test from a bare `docker compose exec` shell). Use it to poke at the API
-#     locally. See docs/server.md#docker-a-team-server-or-a-local-scaffold.
+#     locally. See docs/server-setup.md#4-docker-a-team-server-or-a-local-scaffold.
 #     Start with:  SPELUNK_SERVER_KEY=your-key docker compose up -d
 #
 #   team-server (profile) – a TEAM-REACHABLE deployment. spelunk-server binds a
@@ -13,14 +13,14 @@
 #     itself with an operator-provided PEM cert + key, with nothing in front of
 #     it. A non-loopback bind is refused unless BOTH the TLS cert/key AND an API
 #     key are set (see
-#     docs/server.md#non-loopback-plaintext-binds-are-refused-no-override).
+#     docs/server-setup.md#non-loopback-plaintext-binds-are-refused-no-override).
 #     Bring your own certificate (internal CA / certbot / cloud); the server does
 #     not renew it, so you do. Start with:
 #       SPELUNK_SERVER_KEY=your-key \
 #       SPELUNK_TLS_CERT=/etc/spelunk/tls-cert SPELUNK_TLS_KEY=/etc/spelunk/tls-key \
 #       docker compose --profile team-server up -d
 #
-# The bare-metal/systemd path in docs/self-hosting.md is the same shape without a
+# The bare-metal/systemd path in docs/server-setup.md is the same shape without a
 # container, and is the recommended single-host deployment.
 
 services:

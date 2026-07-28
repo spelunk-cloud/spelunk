@@ -14,19 +14,32 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # Linux builds run inside a debian:11 (bullseye) container so the binaries
+    # link against glibc 2.31, the supported floor (Debian 11+ / Ubuntu 20.04+).
+    # Building on the runner's own userland (24.04, glibc 2.39) is what made
+    # earlier releases crash on the floor distros. An empty `container` means
+    # the job runs directly on the runner VM (macOS, Windows).
+    container: ${{ matrix.container }}
+    timeout-minutes: 30
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
+          # debian:11 = glibc 2.31 floor (Bullseye+/Ubuntu 20.04+). LTS ends
+          # 2026-08-31: apt sources then fall back to archive.debian.org;
+          # changing this base image changes the supported floor.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: rich-formats
-          - os: ubuntu-latest
+            container: debian:11
+          # Native arm64 runner (free for public repos) + arm64 bullseye
+          # container. Replaces the old cross-compile + ports-mirror setup.
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             features: rich-formats
+            container: debian:11
           - os: macos-latest
             target: aarch64-apple-darwin
             features: rich-formats,metal
@@ -35,12 +48,38 @@ jobs:
             features: rich-formats
 
     steps:
+      # Inside the bullseye container nothing is preinstalled. git must be
+      # present before actions/checkout so it does a real clone; curl +
+      # ca-certificates are for rustup; libdbus-1-dev + pkg-config are for the
+      # keyring crate's sync-secret-service feature (links libdbus, a C lib).
+      - name: Install build dependencies (Linux container)
+        if: matrix.container != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential pkg-config libdbus-1-dev
+
       - uses: actions/checkout@v7
 
-      - name: Install Rust stable
+      - name: Install Rust stable (Linux container)
+        if: matrix.container != ''
+        shell: bash
         run: |
-          rustup toolchain install stable --no-self-update
-          rustup target add ${{ matrix.target }}
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # One command per step (Windows steps must not chain rustup invocations).
+      - name: Install Rust toolchain (runner VM)
+        if: matrix.container == ''
+        run: rustup toolchain install stable --no-self-update
+
+      - name: Add Rust target (runner VM)
+        if: matrix.container == ''
+        run: rustup target add ${{ matrix.target }}
 
       - name: Cache Cargo registry
         uses: actions/cache@v6
@@ -49,61 +88,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          # The `${{ matrix.container }}` component keeps container-built artifacts
+          # separate from caches produced by builds on the runner VM. cc-built
+          # static archives (ring, bundled sqlite, blake3) do not refingerprint
+          # on the C toolchain's glibc, so restoring a VM-era cache into the
+          # container would silently re-raise the binaries' glibc ceiling.
+          key: ${{ runner.os }}-${{ matrix.container }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.target }}-
-
-      # The `keyring` crate's `sync-secret-service` feature links libdbus (a C
-      # library) on Linux, so the dev package + pkg-config must be present.
-      - name: Install Linux build dependencies (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libdbus-1-dev
-
-      # For the aarch64 cross-build we need the cross toolchain *and* the arm64
-      # build of libdbus. The latter requires enabling the arm64 architecture
-      # and pointing apt at the ports mirror (the default mirrors are amd64-only).
-      - name: Install aarch64 cross-compilation toolchain
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-          # Restrict the existing (amd64) sources so apt doesn't try to fetch
-          # arm64 indexes from amd64-only mirrors.
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo sed -i '/^Architectures:/d' /etc/apt/sources.list.d/ubuntu.sources
-            sudo sed -i '/^URIs:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          fi
-          # Add an arm64-only ports source.
-          sudo tee /etc/apt/sources.list.d/arm64-ports.sources >/dev/null <<EOF
-          Types: deb
-          URIs: http://ports.ubuntu.com/ubuntu-ports/
-          Suites: ${CODENAME} ${CODENAME}-updates ${CODENAME}-backports ${CODENAME}-security
-          Components: main universe restricted multiverse
-          Architectures: arm64
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-          EOF
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-            pkg-config \
-            libdbus-1-dev:arm64
+            ${{ runner.os }}-${{ matrix.container }}-${{ matrix.target }}-
 
       - name: Build release binaries
         shell: bash
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          # Let pkg-config resolve the arm64 libdbus when cross-compiling.
-          PKG_CONFIG_ALLOW_CROSS: "1"
         run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
-          fi
+          set -euo pipefail
           FEATURES="${{ matrix.features }}"
           if [ -n "$FEATURES" ]; then
             cargo build --release --target ${{ matrix.target }} --features "$FEATURES"
@@ -111,16 +108,46 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
-      - name: Strip binaries (native Linux x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Strip binaries (Linux)
+        if: contains(matrix.target, 'linux')
+        shell: bash
         run: |
-          strip target/${{ matrix.target }}/release/spelunk
-          strip target/${{ matrix.target }}/release/spelunk-server
+          set -euo pipefail
+          strip "target/${{ matrix.target }}/release/spelunk"
+          strip "target/${{ matrix.target }}/release/spelunk-server"
+
+      # The whole point of the container build: fail the release if either
+      # binary needs a glibc symbol newer than the 2.31 floor. Pinned forever,
+      # not measured once: must keep failing even after toolchain bumps. A
+      # missing, empty, or non-numeric ceiling is treated as a broken check,
+      # never as proof of compliance (a bare GLIBC_PRIVATE match, or no
+      # GLIBC_ symbols at all, would otherwise slip through as a false pass).
+      - name: Enforce glibc ceiling (Linux)
+        if: matrix.container != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in spelunk spelunk-server; do
+            path="target/${{ matrix.target }}/release/${bin}"
+            raw="$(objdump -T "$path")"
+            ceiling="$(printf '%s\n' "$raw" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 || true)"
+            if ! [[ "$ceiling" =~ ^GLIBC_[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::${bin}: no valid versioned GLIBC symbol found (got '${ceiling}')"
+              exit 1
+            fi
+            echo "${bin}: max versioned glibc symbol = ${ceiling}"
+            max="$(printf '%s\nGLIBC_2.31\n' "$ceiling" | sort -V | tail -1)"
+            if [ "$max" != "GLIBC_2.31" ]; then
+              echo "::error::${bin} requires ${ceiling}, above the glibc 2.31 floor"
+              exit 1
+            fi
+          done
 
       - name: Package tarball (unix)
         if: matrix.target != 'x86_64-pc-windows-msvc'
         shell: bash
         run: |
+          set -euo pipefail
           VERSION="${{ github.ref_name }}"
           TARGET="${{ matrix.target }}"
           ARCHIVE="spelunk-${VERSION}-${TARGET}.tar.gz"
@@ -198,16 +225,24 @@ jobs:
           install -m 644 packaging/spelunk-server.service \
             BUILD/usr/lib/systemd/user/spelunk-server.service
 
-          # Depends is derived from the packaged binaries, never hardcoded.
-          # dpkg-shlibdeps needs a debian/control in its working dir, and errors
-          # out if a linked library maps to no installed package.
-          mkdir -p shlibdeps/debian
-          printf 'Source: spelunk\nMaintainer: spelunk-cloud <hello@spelunk.cloud>\n\nPackage: spelunk\nArchitecture: amd64\nDescription: placeholder\n placeholder\n' \
-            > shlibdeps/debian/control
-          DEB_DEPENDS="$(cd shlibdeps && dpkg-shlibdeps -O \
-            ../BUILD/usr/bin/spelunk \
-            ../BUILD/usr/bin/spelunk-server)"
-          rm -rf shlibdeps
+          # Depends is derived from the packaged binaries, never hardcoded, and
+          # derived INSIDE debian:11 (the build floor), not on the ubuntu runner.
+          # On ubuntu-24.04 (glibc 2.39) the binaries' link against the pre-merge
+          # libpthread.so.0 / libdl.so.2 resolves to libc's merged (>= 2.34)
+          # symbols, so dpkg-shlibdeps derives libc6 (>= 2.34) — which then cannot
+          # install on the glibc-2.31 floor the release targets. debian:11 derives
+          # libc6 (>= 2.30). The container needs dpkg-dev plus every linked
+          # library's package (libdbus-1-3); libc6/libgcc-s1 are in the base
+          # image. dpkg-shlibdeps needs a debian/control in its working dir.
+          DEB_DEPENDS="$(docker run --rm -v "$PWD:/w:ro" debian:11 bash -c '
+            set -euo pipefail
+            apt-get update -qq >/dev/null
+            apt-get install -y -qq --no-install-recommends dpkg-dev libdbus-1-3 >/dev/null
+            mkdir -p /tmp/sd/debian
+            printf "Source: spelunk\nMaintainer: spelunk-cloud <hello@spelunk.cloud>\n\nPackage: spelunk\nArchitecture: amd64\nDescription: placeholder\n placeholder\n" > /tmp/sd/debian/control
+            cd /tmp/sd
+            dpkg-shlibdeps -O /w/BUILD/usr/bin/spelunk /w/BUILD/usr/bin/spelunk-server
+          ')"
           echo "Derived ${DEB_DEPENDS}"
 
           # DEBIAN/control — written via JS to avoid YAML heredoc issues
@@ -220,20 +255,47 @@ jobs:
 
       - name: Build .deb
         run: |
-          dpkg-deb --build BUILD "spelunk_${{ env.DEB_VERSION }}_amd64.deb"
+          # -Zxz: this runner is ubuntu-24.04, whose dpkg-deb defaults to zstd
+          # (control.tar.zst / data.tar.zst). debian:11's dpkg (1.20) cannot read
+          # zstd members, so a default-built .deb fails to install on the
+          # glibc-2.31 floor with "unknown compression for member 'control.tar.zst'".
+          # xz members install everywhere from the floor up.
+          dpkg-deb --build -Zxz BUILD "spelunk_${{ env.DEB_VERSION }}_amd64.deb"
 
       # apt-get install SUCCEEDS on a .deb whose Depends omits a linked library;
-      # only executing the binary resolves its NEEDED libs and surfaces the gap.
-      # Pinned to 24.04: it supplies the GLIBC_2.39 the derived libc6 floor
-      # targets, so a failure here means the .deb no longer installs on it.
-      - name: Smoke-test the .deb in a clean container
+      # only executing real subcommands (a git-backed memory round trip
+      # included) surfaces that gap and proves the installed binary runs, not
+      # just links. debian:11 and ubuntu:20.04 are the support floor (glibc
+      # 2.31); ubuntu:24.04 guards the forward direction. The package is
+      # mounted read-only; the scratch repo lives in the container's own
+      # filesystem so the smoke test never writes into the runner's checkout.
+      - name: Smoke-test the .deb in clean containers (floor and current)
         run: |
-          docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 bash -euc '
-            apt-get update -qq
-            apt-get install -y -qq ./spelunk_${{ env.DEB_VERSION }}_amd64.deb
-            test -n "$(spelunk --version)"
-            test -n "$(spelunk-server --version)"
-          '
+          set -euo pipefail
+          for image in debian:11 ubuntu:20.04 ubuntu:24.04; do
+            echo "=== ${image} ==="
+            docker run --rm -v "$PWD:/pkg:ro" -e SPELUNK_SECRET_STORE=file "$image" bash -euc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq /pkg/spelunk_${{ env.DEB_VERSION }}_amd64.deb
+              apt-get install -y -qq --no-install-recommends git ca-certificates
+              test -n "$(spelunk --version)"
+              test -n "$(spelunk-server --version)"
+
+              mkdir -p /w && cd /w
+              git init -q .
+              git config user.email t@t
+              git config user.name t
+              echo "fn main() {}" > main.rs
+              git add . && git commit -qm init
+
+              spelunk status
+              spelunk init --no-index
+              spelunk memory add --kind note --title "deb smoke" --body "runs on this image"
+              spelunk memory list | grep -q "deb smoke"
+            '
+          done
 
       - name: Upload deb artifact
         uses: actions/upload-artifact@v7
@@ -241,9 +303,69 @@ jobs:
           name: spelunk-${{ github.ref_name }}-amd64-deb
           path: spelunk_${{ env.DEB_VERSION }}_amd64.deb
 
+  # The .deb is only one packaging of the Linux binaries; the raw tarballs
+  # (served by install.sh and the Homebrew formula) ship the same files and
+  # must also be executed on the support floor. libdbus-1-3 is a declared
+  # runtime dependency of the CLI (the .deb pulls it in via shlibdeps; tarball
+  # users need it present, as on any desktop/server with dbus installed).
+  tarball-smoke:
+    name: Run tarball binaries on the support floor (${{ matrix.target }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: spelunk-${{ github.ref_name }}-${{ matrix.target }}
+          path: tarball
+
+      - name: Extract tarball
+        run: |
+          tar -xzf tarball/spelunk-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
+            -C tarball
+
+      # Install-success proves nothing: apt is happy with a package whose
+      # binary immediately fails to link or run. Exercise real subcommands
+      # (a git-backed memory round trip included) on each floor/current image.
+      - name: Execute on floor and current images
+        run: |
+          set -euo pipefail
+          for image in debian:11 ubuntu:20.04 ubuntu:24.04 debian:12; do
+            echo "=== ${image} ==="
+            docker run --rm -v "$PWD/tarball:/t:ro" -e SPELUNK_SECRET_STORE=file "$image" bash -euc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends libdbus-1-3 git ca-certificates
+              test -n "$(/t/spelunk --version)"
+              test -n "$(/t/spelunk-server --version)"
+
+              mkdir -p /w && cd /w
+              git init -q .
+              git config user.email t@t
+              git config user.name t
+              echo "fn main() {}" > main.rs
+              git add . && git commit -qm init
+
+              /t/spelunk status
+              /t/spelunk init --no-index
+              /t/spelunk memory add --kind note --title "tarball smoke" --body "runs on this image"
+              /t/spelunk memory list | grep -q "tarball smoke"
+            '
+          done
+
   release:
     name: Create GitHub Release
-    needs: [build, deb]
+    needs: [build, deb, tarball-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -354,8 +476,16 @@ jobs:
     if: ${{ !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-beta') && !contains(github.ref_name, '-alpha') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Serializes retries/manual re-runs for the same tag: two overlapping runs
+    # would both push to the same ci/scoop-manifest-<tag> branch and race on
+    # `gh pr create` (the loser errors "pull request already exists" and
+    # fails the job even though the PR the winner opened is fine).
+    concurrency:
+      group: scoop-manifest-${{ github.ref_name }}
+      cancel-in-progress: false
     permissions:
       contents: write
+      pull-requests: write
     steps:
       # Commit lands on main, not the tag ref.
       - uses: actions/checkout@v7
@@ -386,17 +516,41 @@ jobs:
 
           cat bucket/spelunk.json
 
-      - name: Commit and push bucket/spelunk.json
+      # This repo doubles as the Scoop bucket (unlike the separate,
+      # unprotected homebrew-spelunk tap repo above), so main's ruleset
+      # applies: a direct `git push origin main` is rejected with GH013
+      # (pull_request rule violation). That ruleset's
+      # required_approving_review_count is 0 and it has no required status
+      # checks, so opening a PR and merging it immediately in this same job
+      # satisfies the rule with no human in the loop and no extra token:
+      # just the default GITHUB_TOKEN with pull-requests: write added above.
+      - name: Open and merge a PR updating bucket/spelunk.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
           if git diff --quiet -- bucket/spelunk.json; then
-            echo "No changes to bucket/spelunk.json — skipping push."
+            echo "No changes to bucket/spelunk.json — skipping PR."
             exit 0
           fi
 
+          BRANCH="ci/scoop-manifest-${{ github.ref_name }}"
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
           git add bucket/spelunk.json
           git commit -m "scoop: spelunk ${{ github.ref_name }}"
-          git push origin main
+          # -f: a retried run of this workflow (same tag) reuses the branch name.
+          git push -f origin "$BRANCH"
+
+          if ! gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            gh pr create \
+              --title "scoop: spelunk ${{ github.ref_name }}" \
+              --body "Automated Scoop bucket update for ${{ github.ref_name }}." \
+              --base main \
+              --head "$BRANCH"
+          fi
+
+          gh pr merge "$BRANCH" --merge --delete-branch

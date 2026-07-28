@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-embed"
-version = "0.9.3"
+version = "0.9.5"
 edition = "2024"
 description = "Native F2LLM-v2-330M embedder (candle) for spelunk"
 license = "MIT"
@@ -42,3 +42,6 @@ libc = "0.2"
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
+# Only for the embed_bench example (surfaces the loader's device-selection log
+# line without requiring the caller to export RUST_LOG themselves).
+tracing-subscriber = { workspace = true }

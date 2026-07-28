@@ -9,6 +9,7 @@ use std::io::BufRead as _;
 
 use anyhow::{Context, Result};
 
+use super::super::color::cprintln;
 use super::{MemoryHarvestArgs, backend_err};
 use crate::{
     config::Config,
@@ -425,7 +426,7 @@ pub(super) async fn harvest_claude_code(
                 })
                 .await
             {
-                Ok(id) => id,
+                Ok((id, _created)) => id,
                 Err(e) => {
                     eprintln!(
                         "  warning: failed to store entry '{title}' (session {session_id}), skipping: {e:#}"
@@ -435,7 +436,7 @@ pub(super) async fn harvest_claude_code(
             };
 
             let short_id = &session_id[..session_id.len().min(8)];
-            println!("  + [{kind}] #{note_id}: {title}  \x1b[2m({short_id}…)\x1b[0m");
+            cprintln!("  + [{kind}] #{note_id}: {title}  \x1b[2m({short_id}…)\x1b[0m");
             stored += 1;
         }
     }

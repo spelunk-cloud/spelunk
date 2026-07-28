@@ -107,22 +107,3 @@ pub(super) struct BoolResponse {
 pub(super) struct CountResponse {
     pub(super) count: i64,
 }
-
-// ── Cloud project listing (ADR-005 slug→UUID resolution) ──────────────────────
-
-/// One entry from cloud-api `GET /v1/projects` (`listProjects`).
-///
-/// Only `id` and `slug` are needed to resolve a human slug to its UUID; the
-/// other fields the endpoint returns (name, visibility, …) are ignored.
-#[derive(Deserialize)]
-pub(super) struct CloudProjectItem {
-    pub(super) id: uuid::Uuid,
-    #[serde(default)]
-    pub(super) slug: Option<String>,
-}
-
-/// Response body of cloud-api `GET /v1/projects`.
-#[derive(Deserialize)]
-pub(super) struct CloudProjectListResponse {
-    pub(super) projects: Vec<CloudProjectItem>,
-}

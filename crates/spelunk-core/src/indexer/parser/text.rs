@@ -1,4 +1,4 @@
-use super::super::chunker::{Chunk, ChunkKind, MAX_CHUNK_TOKENS, sliding_window};
+use super::super::chunker::{Chunk, ChunkKind, chunk_token_cap, sliding_window};
 use crate::search::tokens::estimate_tokens;
 
 /// Parse a `.ipynb` notebook into per-cell chunks.
@@ -48,7 +48,7 @@ pub(super) fn parse_notebook(source: &str, file_path: &str) -> Vec<Chunk> {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("failed to parse notebook {file_path}: {e}");
-            return sliding_window(source, file_path, "notebook", 120, 15);
+            return sliding_window(source, file_path, "notebook", None, None, None);
         }
     };
 
@@ -87,7 +87,7 @@ pub(super) fn parse_notebook(source: &str, file_path: &str) -> Vec<Chunk> {
     }
 
     if chunks.is_empty() {
-        return sliding_window(source, file_path, "notebook", 120, 15);
+        return sliding_window(source, file_path, "notebook", None, None, None);
     }
     chunks
 }
@@ -112,10 +112,19 @@ pub(super) fn parse_markdown(source: &str, file_path: &str) -> Vec<Chunk> {
         if content.trim().is_empty() {
             return;
         }
-        if estimate_tokens(&content) > MAX_CHUNK_TOKENS {
+        if estimate_tokens(&content) > chunk_token_cap() {
             // Section start is 0-based line index `start`; sub-chunk lines are
             // 1-based within the section, so `start` is the correct offset.
-            for mut sub in sliding_window(&content, file_path, "markdown", 120, 15) {
+            // Thread the section heading through as each sub-chunk's name so an
+            // oversized section keeps its title in the embedding text.
+            for mut sub in sliding_window(
+                &content,
+                file_path,
+                "markdown",
+                title.as_deref(),
+                None,
+                None,
+            ) {
                 sub.start_line += start;
                 sub.end_line += start;
                 chunks.push(sub);
@@ -161,7 +170,7 @@ pub(super) fn parse_markdown(source: &str, file_path: &str) -> Vec<Chunk> {
     }
 
     if chunks.is_empty() {
-        return sliding_window(source, file_path, "markdown", 120, 15);
+        return sliding_window(source, file_path, "markdown", None, None, None);
     }
     chunks
 }

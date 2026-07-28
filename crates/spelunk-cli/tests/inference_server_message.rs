@@ -38,11 +38,7 @@ const REGRESSION_SUBSTR: &str = "server_url";
 fn write_no_server_config(dir: &Path) -> PathBuf {
     let db_path = dir.join("index.db");
     let config_path = dir.join("config.toml");
-    fs::write(
-        &config_path,
-        format!("db_path = {db_path:?}\nembedding_model = \"test-model\"\n"),
-    )
-    .expect("write config.toml");
+    fs::write(&config_path, format!("db_path = {db_path:?}\n")).expect("write config.toml");
     config_path
 }
 

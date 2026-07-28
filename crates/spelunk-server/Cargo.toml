@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-server"
-version = "0.9.3"
+version = "0.9.5"
 edition = "2024"
 description = "spelunk shared memory server"
 license = "MIT"
@@ -40,13 +40,13 @@ tracing-subscriber = { workspace = true }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
 reqwest = { workspace = true }
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { workspace = true }
 # In-process TLS (ADR-066): needed only to install the `ring` CryptoProvider as
-# the process default at startup. default-features off keeps aws-lc-rs out of
-# the tree; `ring`/`tls12` match rustls' resolved provider and TLS 1.2+ policy.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# the process default at startup.
+rustls = { workspace = true }
 tower = { version = "0.5", features = ["util", "limit"] }
 tower-http = { version = "0.7", features = ["auth", "timeout", "limit"] }
 async-stream = "0.3"
@@ -76,3 +76,7 @@ wiremock = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
 utoipa = { version = "5", features = ["axum_extras"] }
+# Builds a minimal-but-valid tokenizer.json fixture for embed_hub's
+# corrupt-GGUF test, so it exercises the GGUF parse path instead of failing
+# earlier on tokenizer parsing like the corrupt-tokenizer test.
+tokenizers = { workspace = true }

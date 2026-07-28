@@ -1,22 +1,20 @@
 # spelunk-server HTTP API Contract
 
 **Issue:** #261  
-**Status:** Accepted — pending implementation
+**Status:** Implemented. This is the current reference for the HTTP + SSE
+surface `spelunk-server` exposes. Sections below describe what the running
+server actually does, verified against `crates/spelunk-server/src/handlers.rs`.
 
 ---
 
 ## Overview
 
 This document specifies the HTTP API surface that `spelunk-cli` calls on
-`spelunk-server`, the auth trait that allows us to replace API-key auth with
-OAuth2 in future, and the changes required to existing endpoints.
+`spelunk-server`: the `AuthProvider` trait, and every route the server exposes.
 
-The server already has a working memory API (`src/server/handlers.rs`). This
-document covers:
-
-1. The `AuthProvider` trait (replaces the inline `auth_middleware` function).
-2. Changes to existing endpoints.
-3. New endpoints needed for CLI integration.
+1. The `AuthProvider` trait, which every route the server exposes goes through.
+2. Endpoints present from the server's first API-key auth implementation.
+3. Endpoints added for CLI integration (embedding proxy, explore, LLM completion).
 4. The server's **data promise** to the CLI.
 
 ---
@@ -24,7 +22,7 @@ document covers:
 ## Data promise (server → CLI)
 
 The CLI is the only durable store for index data. The server's behaviour is
-constrained as follows; cloud implementations MUST uphold the same contract.
+constrained as follows.
 
 | Resource | Server may receive | Server may store | Server may cache (in-memory, bounded TTL) |
 |---|:---:|:---:|:---:|
@@ -50,137 +48,20 @@ DB table is empty after `/v1/projects/{id}/index/embed` returns, and that
 
 ## Auth architecture
 
-### Current state (to be refactored)
-
-Auth is currently implemented as a plain axum middleware function
-(`auth_middleware`) that compares a bearer token against `AppState.api_key:
-Option<String>`. This must be replaced with a trait so the auth strategy can be swapped
-(e.g. OAuth2/JWT) without forking the repo.
-
-### Target design
-
-```rust
-// crates/spelunk-server/src/auth.rs
-
-/// Determines whether an incoming request is authorised and returns the
-/// caller's identity. Implement this for each auth strategy.
-#[async_trait::async_trait]
-pub trait AuthProvider: Send + Sync + 'static {
-    async fn authenticate(&self, headers: &HeaderMap) -> Result<AuthContext, AuthError>;
-}
-
-/// Outcome of a successful authentication check.
-pub struct AuthContext {
-    pub principal: Principal,
-}
-
-/// Caller identity. Extensible for alternative auth strategies.
-pub enum Principal {
-    /// Default: bearer token matched the configured key.
-    ApiKey(String),
-    /// Future: authenticated user identity (e.g. OAuth2).
-    User { id: String },
-}
-
-/// Authentication failed. Always maps to HTTP 401.
-#[derive(Debug)]
-pub struct AuthError(pub String);
-```
-
-`AppState` changes:
-
-```rust
-pub struct AppState {
-    pub db: Arc<tokio::sync::Mutex<ServerDb>>,
-    pub auth: Arc<dyn AuthProvider>,        // replaces api_key: Option<String>
-    pub conflict_threshold: f32,
-    pub embedder: Option<Arc<dyn EmbeddingBackend>>,
-}
-```
-
-The auth middleware becomes:
-
-```rust
-async fn auth_middleware(
-    State(state): State<AppState>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    match state.auth.authenticate(request.headers()).await {
-        Ok(ctx) => {
-            request.extensions_mut().insert(ctx);
-            next.run(request).await
-        }
-        Err(AuthError(msg)) => (StatusCode::UNAUTHORIZED, msg).into_response(),
-    }
-}
-```
-
-### OSS implementation: `ApiKeyAuth`
-
-```rust
-// crates/spelunk-server/src/auth.rs
-
-pub struct ApiKeyAuth {
-    /// None → accept all requests (no key configured; safe on a local loopback)
-    key: Option<String>,
-}
-
-#[async_trait::async_trait]
-impl AuthProvider for ApiKeyAuth {
-    async fn authenticate(&self, headers: &HeaderMap) -> Result<AuthContext, AuthError> {
-        match &self.key {
-            None => Ok(AuthContext { principal: Principal::ApiKey(String::new()) }),
-            Some(expected) => {
-                let provided = headers
-                    .get("Authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "));
-                match provided {
-                    Some(t) if t == expected => {
-                        Ok(AuthContext { principal: Principal::ApiKey(t.to_owned()) })
-                    }
-                    _ => Err(AuthError("Unauthorized".into())),
-                }
-            }
-        }
-    }
-}
-```
-
-Any alternative auth strategy supplies its own `impl AuthProvider`. No changes
-to handlers are needed.
-
-### Server construction
-
-```rust
-// Binary entrypoint constructs the provider and passes it in:
-let auth: Arc<dyn AuthProvider> = Arc::new(ApiKeyAuth::from_env());
-let state = AppState { db, auth, conflict_threshold, embedder };
-```
-
-### Implementer wiring checklist
-
-The complete trait and `ApiKeyAuth` impl above are the literal stub. Drop them
-into a new file at:
-
-```
-crates/spelunk-server/src/auth.rs
-```
-
-…and add `pub mod auth;` to `crates/spelunk-server/src/lib.rs`. The existing
-inline `auth_middleware` in `lib.rs` is replaced by the trait-driven version
-shown above; `state.api_key: Option<String>` is removed in the same change.
-No handler files (`handlers.rs`) require edits beyond switching consumers from
-`api_key` reads to `Extension<AuthContext>` extraction where they care about
-the principal (today, none do).
+Requests are authenticated through a pluggable `AuthProvider` trait
+(`crates/spelunk-server/src/auth.rs`), so an alternative auth strategy can be
+added without changing any handler. The shipped implementation, `ApiKeyAuth`,
+checks the `Authorization: Bearer` header against a single configured key
+(`SPELUNK_SERVER_KEY`); with no key configured, every request is accepted,
+which is safe only when the server is bound to loopback (see [Trust
+model](../server-setup.md#trust-model)). No handler currently reads the
+authenticated principal.
 
 ---
 
 ## Error response format
 
-All error responses use a consistent JSON body. Update existing handlers to
-emit this format (currently some return plain text):
+All error responses use a consistent JSON body:
 
 ```json
 { "error": { "code": "unauthorized", "message": "Bearer token required" } }
@@ -196,69 +77,82 @@ emit this format (currently some return plain text):
 
 ---
 
-## Changes to existing endpoints
+## Existing endpoints
 
-### `GET /v1/health` — response format change
+### `GET /v1/health`
 
-**Current:** returns `200 "ok"` (plain text, `&'static str`)
-
-**New:** returns `200` JSON:
+Returns `200` JSON (unauthenticated: no bearer token required or attached):
 
 ```json
 {
   "status": "ok",
-  "version": "0.8.0",
+  "version": "0.9.4",
   "instance_id": "550e8400-e29b-41d4-a716-446655440000",
   "started_by": 501,
+  "embedding_dim": 896,
+  "embedder": { "state": "ready" },
   "capabilities": [
     "memory",
     "index.embed",
     "search.semantic",
     "explore",
     "llm.complete"
-  ]
+  ],
+  "limits": {
+    "embed_request_timeout_secs": 1800,
+    "max_batch_chunks": 256,
+    "embedder_token_cap": null
+  }
 }
 ```
 
 The `capabilities` array lists features this server instance supports. The CLI
 uses this list to degrade gracefully against older server versions (see
-capability-tiers.md). A server that supports only memory operations emits
-`["memory"]`.
+capability-tiers.md). A server with no embedder and no LLM configured emits
+`["memory"]`. `embedder.state` is one of `ready`, `loading`, `unavailable`
+(terminal failure), or `disabled` (no embedder configured at all), present so
+a client can distinguish "still warming up" from "not configured" even before
+`capabilities` reflects readiness. `limits` (verified against `handlers.rs`)
+advertises the server's own `/index/embed` sizing so a client can batch
+correctly against the server it's actually talking to; a server predating this
+field should be assumed to enforce the old blanket 30s request budget with no
+exemption.
 
-This is a **breaking change** for any client checking for the literal string
-`"ok"`. The CLI's health probe must be updated to parse JSON.
+### `POST /v1/projects/{project_id}/memory/search`
 
-### `POST /v1/projects/{project_id}/memory/search` — accept text query
-
-**Current:** `SearchRequest { embedding: Vec<f32>, limit: usize }` — client
-must supply a pre-computed vector.
-
-**New:** `SearchRequest { query: String, limit: usize }` — server encodes the
-query internally using its configured embedder.
+`SearchRequest { query: String, limit: usize }`: the server encodes the query
+internally using its configured embedder; the client never sends a
+pre-computed vector.
 
 ```json
 { "query": "how does authentication work", "limit": 20 }
 ```
 
-The old vector-based field is removed. Any client that was sending raw vectors
-must migrate to text queries. This is safe because the only client is
-`spelunk-cli` and the encoding it used was the same model the server runs.
-
-If the server has no embedder configured, return:
+If the server has no embedder configured, it returns `400`:
 
 ```json
 { "error": { "code": "bad_request", "message": "This server has no embedder configured. Semantic memory search is unavailable." } }
 ```
 
+**Response `429`:** the query embed shares the bounded admission queue in front
+of the mutex-serialized embedder with `/index/embed`; once
+that queue is full the request is shed immediately rather than queued behind a
+running index, with a `Retry-After` (seconds) header:
+
+```json
+{ "error": "embedder busy, retry shortly", "state": "busy" }
+```
+
 ---
 
-## New endpoints
+## Endpoints added for CLI integration
 
 ### `POST /v1/projects/{project_id}/index/embed`
 
-Generate embeddings for code chunks. Called by the CLI during `spelunk index`
-Phase 2. The server encodes each chunk and returns vectors. **The server does
-not store the vectors** — the CLI is the only persistent store for index data.
+Generate embeddings for code chunks. Called by the CLI during `spelunk index`'s
+embed phase. The server encodes each chunk and returns vectors. **The server
+does not store the vectors** (the CLI is the only persistent store for index
+data).
 
 **Request:**
 
@@ -277,17 +171,17 @@ not store the vectors** — the CLI is the only persistent store for index data.
 opaque to the server and is echoed back so the CLI can match responses to its
 local DB rows.
 
-Maximum batch size: **256 chunks per request**. CLI must split larger batches.
+Maximum batch size: **256 chunks per request** (`max_batch_chunks` in
+`/v1/health`'s `limits`, above). CLI must split larger batches.
 
-**Response `200`:**
-
-```json
-{
-  "chunks": [
-    { "chunk_id": "abc123", "vector": [0.012, -0.034, ...] }
-  ]
-}
-```
+**Response `200`:** vectors as `application/octet-stream`: raw little-endian
+`f32` bytes, row-major `[n_chunks × dim]` (896 with the default embedder), in
+request order, with **no per-row framing or JSON envelope**. The client maps
+response row `i` to request chunk `i` by position. This endpoint also has its
+own, much longer request timeout (`embed_request_timeout_secs` in
+`/v1/health`'s `limits`, default 1800s) than the rest of the API (30s), since a
+legitimate batch can genuinely take minutes on slow or CPU-only hardware. See
+`docs/openapi.json` for the full schema.
 
 **Response `400`:** embedder not configured on this server.
 
@@ -296,8 +190,24 @@ Maximum batch size: **256 chunks per request**. CLI must split larger batches.
 If the server has no embedder, it returns 400:
 
 ```json
-{ "error": { "code": "bad_request", "message": "index.embed requires an embedder. Configure SPELUNK_EMBEDDING_URL on the server." } }
+{ "error": { "code": "bad_request", "message": "index.embed requires an embedder, but this server was built without the native embedder (embed-native feature)." } }
 ```
+
+**Response `429`:** the embedder is serialized behind a single mutex (GPU
+memory limits and the CPU thread budget both rule out running batches
+concurrently, see [Embedding CPU thread
+budget](../server-setup.md#embedding-cpu-thread-budget)), so a bounded
+admission queue sits in front of it. Once that queue is full the request is
+shed immediately with `429` and a `Retry-After` (seconds) header, instead of
+parking until the caller's own request timeout fires:
+
+```json
+{ "error": "embedder busy, retry shortly", "state": "busy" }
+```
+
+The CLI's `spelunk index` embed phase retries the same batch after the given
+delay rather than shrinking it (queue depth says nothing about batch sizing);
+see [`spelunk index`](../commands.md#spelunk-index).
 
 ### `POST /v1/projects/{project_id}/explore`
 
@@ -399,6 +309,41 @@ assumptions about message content. `capabilities` array gains `"llm.complete"`.
 is added. Server-side memory KNN continues to use the text-query
 `/memory/search` form above.
 
+### Conflict detection on write
+
+`POST /v1/projects/{project_id}/memory` checks whether a semantically similar
+entry already exists (cosine similarity ≥ `--conflict-threshold`, default
+`0.92`). If a conflict is detected, the response is **HTTP 409** with a JSON
+body:
+
+```json
+{
+  "stored": true,
+  "id": 42,
+  "conflicts": [
+    { "id": 37, "title": "Previous similar entry", "similarity": 0.97 }
+  ]
+}
+```
+
+The new entry is stored with a `contradicts` edge to the conflicting entry;
+409 does not mean the write was rejected, only that the caller should
+surface the warning. Configure the threshold with `--conflict-threshold`
+(0.0–1.0; `1.0` disables conflict detection).
+
+### Polling for new entries
+
+`GET /v1/projects/{project_id}/memory/since?t=<epoch>&limit=N` returns up to
+`N` entries (default 50) created after the given Unix timestamp, sorted
+ascending by creation time. The CLI calls this via `spelunk memory since`.
+
+### Streaming entries
+
+`GET /v1/projects/{project_id}/memory/stream` (Server-Sent Events) subscribes
+to new entries as they arrive; each line is a JSON object for one newly-added
+entry, and the stream persists until the client disconnects. The CLI calls
+this via `spelunk memory watch`.
+
 ---
 
 ## Project identity
@@ -412,11 +357,11 @@ first write.
 
 ## OpenAPI commitment
 
-The server publishes its full contract at `GET /api-docs/openapi.json`
-(already wired via `utoipa`). Every endpoint listed in this document MUST
-appear there, with request/response schema components. The `utoipa::ApiDoc`
-type in `crates/spelunk-server/src/lib.rs` is the source of truth — the
-implementer extends it as endpoints land.
+The server publishes its full contract at `GET /api-docs/openapi.json` (wired
+via `utoipa`). Every endpoint listed in this document appears there, with
+request/response schema components. The `utoipa::ApiDoc` type in
+`crates/spelunk-server/src/lib.rs` is the source of truth; extend it whenever
+an endpoint changes.
 
 CLI integration tests pull `openapi.json` and assert presence + shape of:
 
@@ -426,8 +371,9 @@ CLI integration tests pull `openapi.json` and assert presence + shape of:
   `query: string` (not `embedding: array`).
 
 A snapshot of the generated `openapi.json` is committed under
-`docs/openapi.json` and refreshed by the implementer on every change.
-A CI check diffs the committed file against a freshly generated one.
+`docs/openapi.json`. A CI check diffs the committed file against a freshly
+generated one on every change; regenerate and commit it in the same PR as
+any endpoint change.
 
 ---
 
@@ -435,37 +381,34 @@ A CI check diffs the committed file against a freshly generated one.
 
 | Method | Path | Auth | Tier | Notes |
 |---|---|---|---|---|
-| `GET` | `/v1/health` | None | 0+1 | JSON response (breaking change from plain text) |
-| `GET` | `/api-docs/openapi.json` | None | 0+1 | No change |
-| `GET` | `/v1/projects` | Bearer | 1 | No change |
-| `POST` | `/v1/projects/{id}/memory` | Bearer | 1 | No change |
-| `GET` | `/v1/projects/{id}/memory` | Bearer | 1 | No change |
-| `GET` | `/v1/projects/{id}/memory/{note_id}` | Bearer | 1 | No change |
-| `DELETE` | `/v1/projects/{id}/memory/{note_id}` | Bearer | 1 | No change |
-| `POST` | `/v1/projects/{id}/memory/{note_id}/archive` | Bearer | 1 | No change |
-| `POST` | `/v1/projects/{id}/memory/{note_id}/supersede` | Bearer | 1 | No change |
-| `POST` | `/v1/projects/{id}/memory/search` | Bearer | 1 | **Breaking:** text query replaces vector |
-| `GET` | `/v1/projects/{id}/memory/since` | Bearer | 1 | No change |
-| `GET` | `/v1/projects/{id}/memory/stream` | Bearer | 1 | No change |
-| `GET` | `/v1/projects/{id}/memory/harvested-shas` | Bearer | 1 | No change |
-| `GET` | `/v1/projects/{id}/stats` | Bearer | 1 | No change |
-| `POST` | `/v1/projects/{id}/index/embed` | Bearer | 1 | Embedding proxy; also serves memory query-embed via synthetic chunk |
+| `GET` | `/v1/health` | None | 0+1 | JSON; unauthenticated liveness probe |
+| `GET` | `/api-docs/openapi.json` | None | 0+1 | |
+| `GET` | `/v1/projects` | Bearer | 1 | Enumerates every project slug on the instance (by design, see [Trust model](../server-setup.md#trust-model)) |
+| `POST` | `/v1/projects/{id}/memory` | Bearer | 1 | May return `409` with a `conflicts` body, see [Conflict detection](#conflict-detection-on-write) |
+| `GET` | `/v1/projects/{id}/memory` | Bearer | 1 | `?kind=&limit=&archived=` |
+| `GET` | `/v1/projects/{id}/memory/{note_id}` | Bearer | 1 | |
+| `DELETE` | `/v1/projects/{id}/memory/{note_id}` | Bearer | 1 | |
+| `POST` | `/v1/projects/{id}/memory/{note_id}/archive` | Bearer | 1 | |
+| `POST` | `/v1/projects/{id}/memory/{note_id}/supersede` | Bearer | 1 | |
+| `POST` | `/v1/projects/{id}/memory/search` | Bearer | 1 | Text query; server embeds it |
+| `GET` | `/v1/projects/{id}/memory/since` | Bearer | 1 | `?t=<epoch>&limit=`, see [Polling](#polling-for-new-entries) |
+| `GET` | `/v1/projects/{id}/memory/stream` | Bearer | 1 | SSE, see [Streaming](#streaming-entries) |
+| `GET` | `/v1/projects/{id}/memory/harvested-shas` | Bearer | 1 | |
+| `GET` | `/v1/projects/{id}/stats` | Bearer | 1 | |
+| `POST` | `/v1/projects/{id}/index/embed` | Bearer | 1 | Embedding proxy (`application/octet-stream`); also serves memory query-embed via synthetic chunk |
 | `POST` | `/v1/projects/{id}/search` | Bearer | 1 | Query-embedding proxy for CLI KNN |
 | `POST` | `/v1/projects/{id}/explore` | Bearer | 1 | SSE — LLM reasoning loop |
 | `POST` | `/v1/projects/{id}/llm/complete` | Bearer | 1 | SSE — generic inference primitive (ADR-002) |
 
 ---
 
-## Definition of done
+## Implementation status
 
-- [ ] `AuthProvider` trait defined in `spelunk-server/src/auth.rs`
-- [ ] `ApiKeyAuth` struct implements `AuthProvider` (behaviour unchanged from
-  current `auth_middleware`)
-- [ ] `AppState.api_key` replaced with `AppState.auth: Arc<dyn AuthProvider>`
-- [ ] `GET /v1/health` returns JSON with `capabilities` array
-- [ ] `POST /v1/projects/{id}/memory/search` accepts `{"query": String}`
-- [ ] `POST /v1/projects/{id}/index/embed` implemented
-- [ ] `POST /v1/projects/{id}/explore` implemented (SSE)
-- [ ] Error responses use `{"error": {"code": "...", "message": "..."}}` format
-- [ ] OpenAPI spec updated for all new/changed endpoints
-- [ ] All existing `cargo test` suites pass; `cargo fmt` + `cargo clippy` clean
+Every endpoint and the `AuthProvider` trait above are implemented and tested:
+`AppState.auth: Arc<dyn AuthProvider>`, `GET /v1/health` returns the JSON shown
+above, `memory/search` accepts `{"query": String}`, `index/embed` and
+`explore` are live, error responses use the `{"error": {"code", "message"}}`
+shape throughout, and the OpenAPI spec at `docs/openapi.json` is kept current
+by CI. See [Server setup](../server-setup.md) for deploying a server that
+exposes this API to a team, and `crates/spelunk-server/src/handlers.rs` for
+the implementation this document is verified against.

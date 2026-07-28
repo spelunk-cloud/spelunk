@@ -1,3 +1,4 @@
+use super::color::cprintln;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::IsTerminal as _;
 
@@ -36,7 +37,9 @@ pub(crate) fn print_results_text(results: &[crate::search::SearchResult]) {
 
     for r in results {
         if r.from_graph && !printed_graph_header {
-            println!("\x1b[2m── Graph neighbours ─────────────────────────────────────────\x1b[0m");
+            cprintln!(
+                "\x1b[2m── Graph neighbours ─────────────────────────────────────────\x1b[0m"
+            );
             println!();
             display_idx = 0;
             printed_graph_header = true;
@@ -58,7 +61,7 @@ pub(crate) fn print_results_text(results: &[crate::search::SearchResult]) {
             String::new()
         };
 
-        println!(
+        cprintln!(
             "{:2}. {}\x1b[1m{}\x1b[0m  \x1b[2m{}:{}-{}\x1b[0m  \x1b[33m[{}: {}]\x1b[0m{}",
             display_idx,
             project_prefix,
@@ -78,7 +81,7 @@ pub(crate) fn print_results_text(results: &[crate::search::SearchResult]) {
         }
 
         if !r.governing_specs.is_empty() {
-            println!("    \x1b[2mSpec: {}\x1b[0m", r.governing_specs.join(", "));
+            cprintln!("    \x1b[2mSpec: {}\x1b[0m", r.governing_specs.join(", "));
         }
 
         let lines: Vec<&str> = r.content.lines().collect();
@@ -87,7 +90,7 @@ pub(crate) fn print_results_text(results: &[crate::search::SearchResult]) {
             println!("    {line}");
         }
         if lines.len() > preview_lines {
-            println!(
+            cprintln!(
                 "    \x1b[2m… ({} more lines)\x1b[0m",
                 lines.len() - preview_lines
             );
@@ -99,7 +102,7 @@ pub(crate) fn print_results_text(results: &[crate::search::SearchResult]) {
 pub(crate) fn print_chunks_text(chunks: &[crate::search::SearchResult]) {
     for (i, c) in chunks.iter().enumerate() {
         let name = c.name.as_deref().unwrap_or("<anonymous>");
-        println!(
+        cprintln!(
             "{:2}. \x1b[2m{}:{}-{}\x1b[0m  \x1b[33m[{}: {}]\x1b[0m",
             i + 1,
             c.language,
@@ -114,7 +117,7 @@ pub(crate) fn print_chunks_text(chunks: &[crate::search::SearchResult]) {
             println!("    {line}");
         }
         if lines.len() > preview {
-            println!("    \x1b[2m… ({} more lines)\x1b[0m", lines.len() - preview);
+            cprintln!("    \x1b[2m… ({} more lines)\x1b[0m", lines.len() - preview);
         }
         println!();
     }

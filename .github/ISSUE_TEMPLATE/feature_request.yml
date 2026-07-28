@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest an improvement or new capability
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: >
+        Describe the situation where spelunk falls short — the workflow, not
+        the solution. "When I do X, I can't Y" is more useful than a proposed
+        design.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution (optional)
+      description: If you have a specific idea, sketch it here.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered (optional)
+      description: Workarounds you're using today, or other approaches that could solve it.
+    validations:
+      required: false
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you be interested in implementing this?
+      options:
+        - "Yes, with guidance"
+        - "Yes, independently"
+        - "No"
+    validations:
+      required: false

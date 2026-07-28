@@ -9,7 +9,7 @@ output tokens, turns, and wall seconds. Given a committed price config, we also
 extrapolate cost per cell and project cost for prospective (not-yet-run) cells.
 
 Provenance contract: rows follow bench/agents/README.md "Reproducibility /
-provenance contract" (harness-matrix fields land via the oss^84 harness
+provenance contract" (harness-matrix fields land via the harness
 adapters). Legacy rows with no `harness` field are treated as harness "none".
 
 Reported as tokens-to-outcome, never a headline "tokens saved" (binding P8).

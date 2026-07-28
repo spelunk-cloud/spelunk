@@ -24,10 +24,15 @@ reqwest     = { version = "0.12", default-features = false, features = ["json", 
 # rustls' default aws-lc-rs provider (needs cmake/C/NASM); ring is installed at
 # startup instead — already the resolved provider via reqwest/hf-hub.
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+# Named directly (not just pulled in transitively via reqwest/axum-server) so
+# spelunk-cli can match on `rustls::Error`/`CertificateError` variants when
+# classifying a probe failure. default-features off keeps aws-lc-rs out of the
+# tree; `ring`/`tls12` match the provider already resolved via reqwest.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 uuid        = { version = "1", features = ["v4", "v7", "serde"] }
 tempfile    = "3"
 pretty_assertions = "1"
-serial_test = "3"
+serial_test = "4"
 wiremock    = "0.6"
 dirs        = "6"
 # Native embedder stack (F2LLM-v2-330M via candle). Depended on unconditionally
@@ -38,15 +43,14 @@ candle-nn   = "0.11.0"
 candle-transformers = "0.11.0"
 tokenizers  = "0.23"
 # OS keychain for the CLI bearer credential (macOS Keychain, Linux Secret
-# Service, Windows Credential Manager). `apple-native` / `windows-native` use
-# the platform store directly; `sync-secret-service` covers Linux. The `mock`
-# feature provides an in-memory backend used by tests so CI needs no daemon.
-keyring     = { version = "3", default-features = false, features = [
-    "apple-native",
-    "windows-native",
-    "sync-secret-service",
-    "crypto-rust",
-] }
+# Service via zbus, Windows Credential Manager). `v1` is keyring 4's
+# compatibility shim: same Entry::new/get_password/set_password/
+# delete_credential/Error::NoEntry surface as v3, bundling
+# apple-native-keyring-store + windows-native-keyring-store +
+# zbus-secret-service-keyring-store (replaces v3's dbus-based backend; already
+# builds with its own crypto-rust feature, so no separate crypto feature is
+# needed here).
+keyring     = { version = "4", default-features = false, features = ["v1"] }
 
 [profile.release]
 lto           = true

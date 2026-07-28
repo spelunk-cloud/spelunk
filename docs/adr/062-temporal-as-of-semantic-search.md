@@ -13,14 +13,14 @@
 `spelunk search --as-of <sha>` shipped a storage layer for "semantically search
 the codebase as it was at commit N" but was never wired to indexing. Nothing
 ever called `create_snapshot` / `insert_snapshot_*`, so `list_snapshots()` was
-always empty and every `--as-of` invocation errored. spelunk-oss^67 removed the
+always empty and every `--as-of` invocation errored. A later change removed the
 surface outright (commit `633276682`): it deleted `storage/snapshots.rs`, dropped
 the `--as-of` flag, and added migration `021_drop_snapshots.sql` to remove the
 dead `snapshots` / `snapshot_files` / `snapshot_chunks` / `snapshot_embeddings`
 tables. The original implementation (`69f070fc8`, migrations 016/017) is retained
 in git history.
 
-The task that spawned this ADR (spelunk-oss^69) asks us to confirm the feature is
+The task that spawned this ADR asks us to confirm the feature is
 worth its cost **before** rebuilding it. This is that confirmation. Four
 questions decide it: what triggers a snapshot, how snapshots are reclaimed, what
 net-new value they add over `git show`, and whether the whole thing fits the
@@ -129,7 +129,7 @@ trade against every one of those.
 ## Non-goals
 
 - **No implementation.** No code is written by this ADR. The removal in
-  spelunk-oss^67 stands; migration `021_drop_snapshots.sql` is not reverted.
+  commit `633276682` stands; migration `021_drop_snapshots.sql` is not reverted.
 - **No change to memory temporal features.** `memory --as-of <date>`,
   `timeline`, and `supersede` are unaffected. They are the endorsed temporal
   surface and remain the place the "history" need is served.
@@ -140,8 +140,8 @@ trade against every one of those.
 
 ## Consequences
 
-- The `--as-of` surface stays removed. spelunk-oss^69 closes as `wont_do` once
-  this ADR clears review; no scoped implementation task follows.
+- The `--as-of` surface stays removed. The task that spawned this ADR closes as
+  `wont_do` once this ADR clears review; no scoped implementation task follows.
 - The temporal story for spelunk is memory-layer only: decisions and their
   supersession over time, not code-state over time.
 - **Revisit if:** concrete, repeated user demand appears for semantic search over

@@ -53,10 +53,15 @@ pub fn make_test_state(dim: usize, auth_key: Option<String>) -> spelunk_server::
         auth: std::sync::Arc::new(spelunk_server::auth::ApiKeyAuth::new(auth_key)),
         conflict_threshold: spelunk_server::default_conflict_threshold(),
         embedder: spelunk_server::EmbedderSlot::disabled(),
+        embed_admission: spelunk_server::EmbedAdmission::new(
+            spelunk_server::EMBED_QUEUE_CAPACITY,
+            spelunk_server::EMBED_BUSY_RETRY_AFTER_SECS,
+        ),
         llm: None,
         max_tokens_ceiling: 8192,
         rate_limiter: std::sync::Arc::new(spelunk_server::rate_limiter::RateLimiter::new(1000, 60)),
         instance_id,
         started_by: None,
+        relay: spelunk_server::relay::RelayRegistry::new(),
     }
 }

@@ -481,7 +481,7 @@ mod read_file_boundary_tests {
 
         let db_path = root.join("index.db");
         let db = Database::open(&db_path).unwrap();
-        db.upsert_file("src/foo.rs", Some("rust"), "deadbeef")
+        db.upsert_file("src/foo.rs", Some("rust"), "deadbeef", 0)
             .unwrap();
         drop(db);
         (dir, root, db_path)
@@ -552,7 +552,7 @@ mod read_file_boundary_tests {
         let link = root.join("src/escape.rs");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
         let db = Database::open(&db_path).unwrap();
-        db.upsert_file("src/escape.rs", Some("rust"), "cafef00d")
+        db.upsert_file("src/escape.rs", Some("rust"), "cafef00d", 0)
             .unwrap();
         drop(db);
 
@@ -574,7 +574,7 @@ mod read_file_boundary_tests {
         let link = root.join("src/alias.rs");
         std::os::unix::fs::symlink(root.join("src/foo.rs"), &link).unwrap();
         let db = Database::open(&db_path).unwrap();
-        db.upsert_file("src/alias.rs", Some("rust"), "0000beef")
+        db.upsert_file("src/alias.rs", Some("rust"), "0000beef", 0)
             .unwrap();
         drop(db);
 

@@ -1,4 +1,4 @@
-//! `spelunk login` — WorkOS device-authorization grant, direct (ADR-047).
+//! `spelunk login` — WorkOS device-authorization grant, direct.
 //!
 //! Flow
 //! ----
