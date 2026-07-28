@@ -164,13 +164,13 @@ equivalent, or are deliberately left opt-in because they are slow or need extra 
 | Release script tests | none |
 | Fuzz (weekly) | none |
 
-Two PR-gating jobs are absent from that list because `make check` already covers them.
-The Stability contract job re-runs `schema_contract_checker`, `plumbing_jsonl_contract`
-and `plumbing_exit_codes` on their own so a contract break is a named failure rather
-than one red line in a thousand-test run, but the full suite runs those same binaries.
-The Upgrade corpus job's fixture leg is likewise an ordinary test. Only its second leg
-is out of reach locally: it is `#[ignore]`d and needs a downloaded release binary in
-`SPELUNK_OLD_BINARY`, which is why it has a row above.
+Two more jobs gate every pull request, and `make check` already runs what they assert.
+The Stability contract job runs `schema_contract_checker`, `plumbing_jsonl_contract` and
+`plumbing_exit_codes` on their own so a contract break is a named failure rather than one
+red line in a thousand-test run, but the full suite runs those same binaries. The Upgrade
+corpus job's fixture leg is likewise an ordinary test. Only its second leg is out of reach
+locally, hence its row above: it is `#[ignore]`d and needs a downloaded release binary in
+`SPELUNK_OLD_BINARY`.
 
 For the legs with no local target, run CI on your branch. It does not need a pull
 request:
