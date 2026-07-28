@@ -1,0 +1,7 @@
+{
+  "name": "spelunk",
+  "description": "Use the spelunk CLI to retrieve code context and persist project memory across agent sessions.",
+  "homepage": "https://github.com/spelunk-cloud/spelunk",
+  "license": "MIT",
+  "skills": ["./.claude/skills/spelunk"]
+}

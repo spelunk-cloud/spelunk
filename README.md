@@ -143,7 +143,21 @@ Install git hooks to auto-harvest memory on every commit:
 spelunk hooks install
 ```
 
-spelunk ships with a [Claude Code skill](SKILL.md) and [agent guide](docs/agent-guide.md) for integration with AI coding agents.
+### Claude Code plugin
+
+spelunk ships as a Claude Code plugin, so your agent knows how to use it without you explaining it
+each session:
+
+```bash
+/plugin marketplace add spelunk-cloud/spelunk
+/plugin install spelunk@spelunk
+```
+
+That installs the `spelunk` skill: the session-start orientation loop, search-before-you-write, and
+how to record decisions and handoffs that outlive a session.
+
+For the full command surface see the [skill reference](SKILL.md) and the
+[agent guide](docs/agent-guide.md).
 
 ## Supported languages
 

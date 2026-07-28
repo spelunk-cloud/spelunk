@@ -1,0 +1,17 @@
+{
+  "name": "spelunk",
+  "owner": {
+    "name": "Spelunk"
+  },
+  "plugins": [
+    {
+      "name": "spelunk",
+      "source": "./",
+      "description": "Use the spelunk CLI to retrieve code context and persist project memory across agent sessions.",
+      "homepage": "https://github.com/spelunk-cloud/spelunk",
+      "license": "MIT",
+      "keywords": ["context", "memory", "code-search", "retrieval"],
+      "skills": ["./.claude/skills/spelunk"]
+    }
+  ]
+}
