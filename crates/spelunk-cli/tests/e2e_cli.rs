@@ -1079,89 +1079,10 @@ fn test_search_index_but_no_embedder_falls_back_to_ast_grep() {
     assert.stdout(predicate::str::contains("Make sure the index has embeddings").not());
 }
 
-/// Explicit `--mode hybrid` with no reachable server must fall through to FTS
-/// text search with a notice on stderr — not fail (#303-F2 / spelunk#323).
-#[test]
-fn test_search_explicit_hybrid_no_embedder_falls_back_to_text() {
-    let temp = tempdir().unwrap();
-    let project_dir = temp.path().join("project");
-    fs::create_dir(&project_dir).unwrap();
-    fs::write(project_dir.join("lib.rs"), "pub fn foo() {}").unwrap();
-
-    let config_path = temp.path().join("config.toml");
-    let db_path = temp.path().join("index.db");
-    fs::write(
-        &config_path,
-        format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nllm_model = \"test\"\n",
-            db_path
-        ),
-    )
-    .unwrap();
-
-    spelunk_bin()
-        .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
-        .arg("--config")
-        .arg(&config_path)
-        .arg("index")
-        .arg(&project_dir)
-        .assert()
-        .success();
-
-    // Explicit --mode hybrid with no server → succeeds with text search silently
-    // (ADR-004: inference-only routing; fallback is resolved at capability detection,
-    // no per-query notice is emitted).
-    spelunk_bin()
-        .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
-        .current_dir(&project_dir)
-        .arg("--config")
-        .arg(&config_path)
-        .arg("search")
-        .arg("--mode")
-        .arg("hybrid")
-        .arg("foo")
-        .assert()
-        .success()
-        .stderr(predicate::str::is_empty());
-}
-
-/// Explicit `--mode semantic` with no reachable server must also fall through.
-#[test]
-fn test_search_explicit_semantic_no_server_falls_back_to_text() {
-    let temp = tempdir().unwrap();
-    let project_dir = temp.path().join("project");
-    fs::create_dir(&project_dir).unwrap();
-    fs::write(project_dir.join("lib.rs"), "pub fn foo() {}").unwrap();
-
-    let config_path = temp.path().join("config.toml");
-    let db_path = temp.path().join("index.db");
-    fs::write(&config_path, format!("db_path = {:?}\n", db_path)).unwrap();
-
-    spelunk_bin()
-        .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
-        .arg("--config")
-        .arg(&config_path)
-        .arg("index")
-        .arg(&project_dir)
-        .assert()
-        .success();
-
-    // Explicit --mode semantic with no server configured → silent fallback to
-    // text search (ADR-004: no explicit server_url = inference-only routing,
-    // fallback notice is suppressed; same as the hybrid test above).
-    spelunk_bin()
-        .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
-        .current_dir(&project_dir)
-        .arg("--config")
-        .arg(&config_path)
-        .arg("search")
-        .arg("--mode")
-        .arg("semantic")
-        .arg("foo")
-        .assert()
-        .success()
-        .stderr(predicate::str::is_empty());
-}
+// Note: the no-server behaviour of explicit `--mode semantic`/`--mode hybrid`
+// is now a fail-closed locked-feature gate (they need a server to embed the
+// query), covered end-to-end in `tests/search_semantic_no_server_gate.rs`.
+// Only `--mode auto` degrades to text search, and it announces that on stderr.
 
 // ── spelunk server error-path tests ──────────────────────────────────────────
 
