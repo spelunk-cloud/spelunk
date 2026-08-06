@@ -1,0 +1,27 @@
+[package]
+name = "spelunk-export"
+version = "0.9.7"
+edition = "2024"
+description = "spelunk: export local stores to a portable dump"
+license = "MIT"
+repository = "https://github.com/spelunk-cloud/spelunk"
+homepage = "https://github.com/spelunk-cloud/spelunk"
+
+[[bin]]
+name = "spelunk-export"
+path = "src/main.rs"
+
+# Deliberately depends on no other crate in this workspace. The point of a
+# standalone reader is that it opens stores with plain SQL and column probing
+# instead of the product's schema ladder, so it keeps working against every
+# shape ever written and carries none of the product's runtime.
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11"
+
+[dev-dependencies]
+tempfile = { workspace = true }
