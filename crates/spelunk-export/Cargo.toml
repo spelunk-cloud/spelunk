@@ -24,4 +24,8 @@ serde_json = { workspace = true }
 sha2 = "0.11"
 
 [dev-dependencies]
+# The authorizer callback is a test-only need: it is the only way to pin a
+# concurrent write to an exact point inside a multi-table read instead of
+# racing for it. It is not compiled into the binary.
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = { workspace = true }

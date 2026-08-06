@@ -8,6 +8,10 @@
 //! binaries, which is what the upgrade corpus exists for. These two are
 //! complements, not substitutes, and neither is sufficient alone.
 
+// One copy of this module is compiled into each test binary, and no single
+// binary needs every shape it can build.
+#![allow(dead_code)]
+
 use rusqlite::Connection;
 
 pub const LATEST: i32 = 10;
@@ -100,6 +104,19 @@ pub fn memory_store_at(path: &std::path::Path, version: i32) -> Connection {
 /// every store written before the runner existed.
 pub fn unstamped_memory_store_at(path: &std::path::Path, version: i32) -> Connection {
     stamped(path, version, false)
+}
+
+// A memory store at `version` in write-ahead-log mode, which is the mode every
+// store the product creates runs in. A fixture left in the default rollback
+// journal mode cannot exercise the sidecar files or the concurrent-writer
+// behaviour that only exist under WAL.
+pub fn wal_memory_store_at(path: &std::path::Path, version: i32) -> Connection {
+    let conn = stamped(path, version, true);
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal", "the fixture must really be in WAL mode");
+    conn
 }
 
 fn stamped(path: &std::path::Path, version: i32, stamp: bool) -> Connection {

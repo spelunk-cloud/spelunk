@@ -9,6 +9,31 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`spelunk-export`, a standalone tool that writes a portable dump of a local
+  store.** Everything the product records lives in local SQLite databases with
+  no supported way to get it out, so backing it up, inspecting it, moving it to
+  another machine or leaving the product all required writing SQL by hand
+  against a schema that has changed ten times. The dump is line-delimited JSON,
+  one record per line, expressed as entities and relationships rather than as a
+  copy of any table, and readable without special tooling. Stores are opened
+  read-only and are never modified. Only authored data is carried: full-text
+  indexes, embeddings and import cursors all regenerate, so carrying them would
+  only risk carrying stale state forward. The tool makes no network request and
+  needs no SQLite installed on the host. An `inventory` subcommand reports what
+  a store holds without touching it.
+
+  Every table is read inside a single read transaction, so a dump is a
+  consistent point-in-time view of the whole store. Reading each table
+  separately would let a writer that commits an entry and then a link to it land
+  between the two reads, producing a link that appears to point at nothing:
+  live data that would be dropped, blamed on a broken store, and certified as a
+  clean export. A link whose endpoint really is missing from the store, which
+  data written before foreign keys were enforced can still contain, is reported
+  and left out, and the run states how many links that was alongside what it
+  carried.
+
 ## [0.9.7] — 2026-08-05
 
 ### Added

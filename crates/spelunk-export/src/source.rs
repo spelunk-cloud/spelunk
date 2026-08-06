@@ -25,14 +25,31 @@ pub struct Extract {
     pub warnings: Vec<String>,
 }
 
+/// Open a store for reading and nothing else.
+///
+/// A URI with `immutable=1` would avoid touching the directory at all, but it
+/// lies to SQLite about a file another process may be writing, and a store in
+/// write-ahead-log mode keeps committed rows in the log: reading it as
+/// immutable would silently return a stale database. So the content guarantee
+/// is that no byte of the database or its log is changed, not that the
+/// directory gains no file. Reading a log-mode store nobody has open brings
+/// SQLite's shared-memory index and an empty log into being, and a read-only
+/// connection has no way to decline that.
 pub fn open_read_only(path: &Path) -> Result<Connection> {
-    // A URI with `immutable=1` would be faster but lies to SQLite about a file
-    // another process may be writing. READ_ONLY plus the default locking keeps
-    // the promise that this tool never modifies the source, including its
-    // journal and WAL sidecars.
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("opening {} read-only", path.display()))
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {} read-only", path.display()))?;
+    // A store in the older rollback journal mode locks out readers while a
+    // writer commits. Holding the read open across every table means such a
+    // writer can now block the export where it previously could not, so wait
+    // out a passing one rather than refusing. A store that is locked for longer
+    // than this is held by something that is not passing, and the right answer
+    // there is to stop with a reason.
+    conn.busy_timeout(WRITER_PATIENCE)
+        .context("configuring how long to wait for a writer")?;
+    Ok(conn)
 }
+
+const WRITER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn tables(conn: &Connection) -> Result<BTreeSet<String>> {
     let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
@@ -71,14 +88,34 @@ fn list(value: Option<String>) -> Vec<String> {
     }
 }
 
-/// Read every authored surface the file happens to contain.
+/// Read every authored surface the file happens to contain, as of a single
+/// point in time.
 ///
 /// Content is detected from table shape rather than declared by the caller, so
 /// one code path covers the per project store, the registry, the accumulated
 /// command counts that live beside a code index, and a multi project server
 /// store. A caller that had to name the kind would be a caller that has to be
 /// kept in step with every historic layout.
+///
+/// Every table is read inside one read transaction. Without it each statement
+/// gets its own snapshot, so entries come from one instant and links from a
+/// later one, and a writer committing an entry and then a link referencing it
+/// lands between them. The link then names an entry the read never returned,
+/// which is indistinguishable from a link whose endpoint really is gone: the
+/// live data would be dropped, reported as a broken store, and the export would
+/// still succeed. One transaction is what makes a reported broken link true.
 pub fn extract(conn: &Connection) -> Result<Extract> {
+    let snapshot = conn
+        .unchecked_transaction()
+        .context("opening a read transaction over the store")?;
+    let extracted = extract_snapshot(&snapshot)?;
+    snapshot
+        .rollback()
+        .context("closing the read transaction")?;
+    Ok(extracted)
+}
+
+fn extract_snapshot(conn: &Connection) -> Result<Extract> {
     let tables = tables(conn)?;
     let mut dump = Dump::default();
     let mut warnings = Vec::new();
@@ -229,8 +266,8 @@ fn read_entries(
     for (successor, predecessor) in supersedes {
         if !present.contains(&successor) {
             warnings.push(format!(
-                "entry {predecessor} names a successor ({successor}) that no longer exists; \
-                 the supersede link is not carried"
+                "entry {predecessor} names a successor ({successor}) that is not in the \
+                 store; the supersede link is not carried"
             ));
             continue;
         }
@@ -362,8 +399,8 @@ fn read_namespaced_entries(
     for (successor, predecessor) in supersedes {
         if !present.contains(&successor) {
             warnings.push(format!(
-                "entry {predecessor} names a successor ({successor}) that no longer exists; \
-                 the supersede link is not carried"
+                "entry {predecessor} names a successor ({successor}) that is not in the \
+                 store; the supersede link is not carried"
             ));
             continue;
         }
@@ -419,8 +456,8 @@ fn read_edges(
         let (from, to, kind, created_at) = row?;
         if !present.contains(&from) || !present.contains(&to) {
             warnings.push(format!(
-                "a '{kind}' link between {from} and {to} names an entry that no longer exists; \
-                 it is not carried"
+                "a '{kind}' link between {from} and {to} names an entry that is not in the \
+                 store; it is not carried"
             ));
             continue;
         }

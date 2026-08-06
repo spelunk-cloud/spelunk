@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use spelunk_export::{dump, export, inventory};
+use spelunk_export::{export, inventory};
 
 #[derive(Parser)]
 #[command(
@@ -61,7 +61,7 @@ fn run() -> Result<()> {
             for w in &outcome.warnings {
                 eprintln!("warning: {w}");
             }
-            report(&outcome.counts, &out);
+            print!("{}", outcome.summary(&out));
             Ok(())
         }
         Command::Inventory { stores } => {
@@ -70,19 +70,4 @@ fn run() -> Result<()> {
             Ok(())
         }
     }
-}
-
-fn report(counts: &dump::Counts, out: &std::path::Path) {
-    println!("Wrote {}", out.display());
-    if counts.entity.is_empty() && counts.relationship.is_empty() {
-        println!("  the store held nothing to carry");
-        return;
-    }
-    for (kind, n) in &counts.entity {
-        println!("  {n} {kind}");
-    }
-    for (kind, n) in &counts.relationship {
-        println!("  {n} {kind}");
-    }
-    println!("  verified against the store: counts and per-record checksums match");
 }

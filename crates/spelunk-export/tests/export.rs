@@ -6,7 +6,7 @@ use std::path::Path;
 use rusqlite::Connection;
 use serde_json::Value;
 use spelunk_export::{dump, export, inventory, source};
-use support::{LATEST, add_entry, memory_store_at, unstamped_memory_store_at};
+use support::{LATEST, add_entry, memory_store_at, unstamped_memory_store_at, wal_memory_store_at};
 
 fn tmp() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
@@ -547,6 +547,109 @@ fn the_source_store_is_never_modified() {
     }
 }
 
+// Every store the product creates runs in write-ahead-log mode, so a fixture in
+// the default rollback-journal mode cannot fail for the shape that matters:
+// committed rows can live in the log rather than the database file, and a
+// reader that misses them silently exports a stale store.
+#[test]
+fn a_write_ahead_log_store_is_read_whole_and_left_unchanged() {
+    let dir = tmp();
+    let store = dir.path().join("memory.db");
+    let out = dir.path().join("dump.jsonl");
+    // The connection stays open for the whole test: closing the last one
+    // checkpoints the log away, and a store nobody has open is not the state a
+    // real export runs against.
+    let conn = wal_memory_store_at(&store, LATEST);
+    add_entry(&conn, LATEST, "checkpointed", 1_000);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    add_entry(&conn, LATEST, "still in the log", 2_000);
+
+    let log = dir.path().join("memory.db-wal");
+    assert!(
+        log.exists() && std::fs::metadata(&log).unwrap().len() > 0,
+        "the fixture must leave a committed entry in the log"
+    );
+
+    let before_db = std::fs::read(&store).unwrap();
+    let before_log = std::fs::read(&log).unwrap();
+    let outcome = export_to(&store, &out);
+
+    assert_eq!(
+        outcome.counts.entity.get("memory_entry"),
+        Some(&2),
+        "an entry committed to the log is committed"
+    );
+    let recs = records(&out);
+    let titles: Vec<&str> = entities(&recs, "memory_entry")
+        .iter()
+        .map(|e| e["title"].as_str().unwrap())
+        .collect();
+    assert!(titles.contains(&"still in the log"), "got: {titles:?}");
+
+    assert_eq!(
+        std::fs::read(&store).unwrap(),
+        before_db,
+        "the database file was modified by exporting it"
+    );
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        before_log,
+        "the log was modified by exporting it; no content may be checkpointed \
+         or appended by a read"
+    );
+    assert!(
+        !dir.path().join("memory.db-journal").exists(),
+        "a rollback journal means the store was opened for writing"
+    );
+    drop(conn);
+}
+
+// Reading a write-ahead-log store requires SQLite's shared-memory index, and a
+// read-only connection cannot decline to bring it into being. So a store that
+// nobody currently has open gains an index file and an empty log from being
+// exported. Neither carries any content and the database is untouched, but the
+// files do appear in the user's directory and that is worth pinning rather than
+// discovering. Removing them afterwards is not an option: a second process may
+// have opened the store in the meantime and be coordinating through exactly
+// those files.
+#[test]
+fn reading_a_write_ahead_log_store_adds_no_content_to_the_users_directory() {
+    let dir = tmp();
+    let store = dir.path().join("memory.db");
+    let out = dir.path().join("dump.jsonl");
+    {
+        let conn = wal_memory_store_at(&store, LATEST);
+        add_entry(&conn, LATEST, "only", 1_000);
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "closing the last connection should leave the store alone in the directory"
+    );
+    let before = std::fs::read(&store).unwrap();
+
+    export_to(&store, &out);
+
+    assert_eq!(
+        std::fs::read(&store).unwrap(),
+        before,
+        "the database file was modified by exporting it"
+    );
+    assert!(
+        !dir.path().join("memory.db-journal").exists(),
+        "a rollback journal means the store was opened for writing"
+    );
+    let log = dir.path().join("memory.db-wal");
+    if log.exists() {
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            0,
+            "a read must not append anything to the log"
+        );
+    }
+}
+
 // ── E26 to E31: refusal, emptiness, determinism ──────────────────────────────
 
 #[test]
@@ -583,8 +686,9 @@ fn a_store_with_no_authored_tables_is_refused_rather_than_read_as_entries() {
         conn.execute_batch("CREATE TABLE notes (id INTEGER PRIMARY KEY, headline TEXT);")
             .unwrap();
     }
-    let err = export(&store, &out, 0).unwrap_err().to_string();
+    let err = format!("{:#}", export(&store, &out, 0).unwrap_err());
     assert!(err.contains("missing required columns"), "got: {err}");
+    assert!(err.contains("notes-missing-columns.db"), "got: {err}");
     assert!(!out.exists());
 }
 
@@ -639,7 +743,21 @@ fn a_dump_carries_no_credential_material() {
     }
 }
 
-// ── Dangling references are reported, not dropped silently ───────────────────
+// ── An endpoint that is genuinely absent ─────────────────────────────────────
+//
+// The store is read as of one point in time, so a link whose endpoint is not in
+// the read is a link whose endpoint is not in the store: damage that predates
+// foreign key enforcement, or a build against a SQLite that had it off. It
+// cannot be a write that arrived mid-export.
+//
+// That makes the question a real one rather than an ambiguity to paper over,
+// and the answer is to report and continue rather than refuse. Refusing would
+// mean a user whose store has one orphaned link cannot get any of their entries
+// out, and no other tool can do better, because the format cannot express a
+// link to something that does not exist and the missing row is not recoverable
+// from anywhere. The loss is unavoidable; only the silence was ever the
+// problem. So every entry is carried, the orphaned link is not, and the run
+// says so on the same screen where it reports success.
 
 #[test]
 fn a_link_to_a_missing_entry_is_reported_rather_than_carried_or_hidden() {
@@ -664,13 +782,24 @@ fn a_link_to_a_missing_entry_is_reported_rather_than_carried_or_hidden() {
         )
         .unwrap();
     }
-    let outcome = export_to(&store, &out);
+    let outcome = export(&store, &out, 1_700_000_000)
+        .expect("an orphaned link must not cost the user every entry in the store");
     assert!(outcome.counts.relationship.is_empty());
+    assert_eq!(
+        outcome.counts.entity.get("memory_entry"),
+        Some(&1),
+        "the entries themselves are intact and must all be carried"
+    );
     assert_eq!(
         outcome.warnings.len(),
         2,
-        "both dangling links must be reported: {:?}",
+        "both orphaned links must be reported: {:?}",
         outcome.warnings
+    );
+    let summary = outcome.summary(&out);
+    assert!(
+        summary.contains("2 link(s) were NOT carried"),
+        "the run must not report success without reporting the omission: {summary}"
     );
 }
 
