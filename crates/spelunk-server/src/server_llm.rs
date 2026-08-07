@@ -61,13 +61,20 @@ pub fn check_llm_transport(llm_url: &str, has_key: bool) -> Result<()> {
 /// OpenAI-compatible chat-completions backend.
 ///
 /// `api_key` is `Some` only when a credential resolved; when it is `None` the
-/// request is byte-identical to the unauthenticated one, so keyless local
-/// endpoints that reject unexpected headers keep working.
+/// request carries no `Authorization` header, so keyless local endpoints that
+/// reject unexpected headers keep working.
+///
+/// `reasoning_effort` is sent on every request when `Some` (default `"none"`)
+/// to suppress chain-of-thought on reasoning models: our uses (memory harvest,
+/// explore) want the JSON answer, not the model's thinking, and an unbounded
+/// reasoning pass burns the whole `max_tokens` budget before any `content`
+/// arrives. `None` omits the field for endpoints that reject it.
 pub struct ServerLlm {
     pub client: reqwest::Client,
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -89,6 +96,8 @@ impl spelunk_core::llm::LlmBackend for ServerLlm {
             max_tokens: usize,
             temperature: f32,
             #[serde(skip_serializing_if = "Option::is_none")]
+            reasoning_effort: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             response_format: Option<serde_json::Value>,
         }
         #[derive(serde::Serialize)]
@@ -107,6 +116,12 @@ impl spelunk_core::llm::LlmBackend for ServerLlm {
         #[derive(serde::Deserialize)]
         struct Delta {
             content: Option<String>,
+            // Reasoning models (DeepSeek, etc.) stream chain-of-thought here,
+            // as a sibling of `content`. It is intermediate output, never the
+            // answer, so it is parsed only to be dropped: forwarding it would
+            // corrupt a JSON-schema-constrained completion.
+            #[serde(default)]
+            reasoning_content: Option<String>,
         }
 
         let chat_messages: Vec<ChatMsg> = messages
@@ -126,6 +141,7 @@ impl spelunk_core::llm::LlmBackend for ServerLlm {
             stream: true,
             max_tokens,
             temperature: 0.7,
+            reasoning_effort: self.reasoning_effort.as_deref(),
             response_format,
         };
 
@@ -146,7 +162,9 @@ impl spelunk_core::llm::LlmBackend for ServerLlm {
             .bytes_stream();
 
         let mut buffer = String::new();
-        while let Some(chunk) = stream.next().await {
+        let mut saw_content = false;
+        let mut saw_reasoning = false;
+        'stream: while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("reading SSE byte chunk")?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -160,23 +178,45 @@ impl spelunk_core::llm::LlmBackend for ServerLlm {
                         None => continue,
                     };
                     if data == "[DONE]" {
-                        return Ok(());
+                        break 'stream;
                     }
                     if data.is_empty() {
                         continue;
                     }
                     if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                         for choice in chunk.choices {
-                            if let Some(content) = choice.delta.content
+                            let Delta {
+                                content,
+                                reasoning_content,
+                            } = choice.delta;
+                            if reasoning_content.is_some_and(|r| !r.is_empty()) {
+                                saw_reasoning = true;
+                            }
+                            if let Some(content) = content
                                 && !content.is_empty()
-                                && tx.send(content).await.is_err()
                             {
-                                return Ok(());
+                                saw_content = true;
+                                if tx.send(content).await.is_err() {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+
+        // A reasoning model that ignored `reasoning_effort` can spend the whole
+        // `max_tokens` budget thinking and emit no `content` at all. Downstream
+        // that surfaces as an opaque parse failure on an empty string; name the
+        // real cause here instead.
+        if saw_reasoning && !saw_content {
+            tracing::warn!(
+                max_tokens,
+                "LLM streamed only reasoning_content and no content: the reasoning \
+                 model likely exhausted the token budget before answering. Raise \
+                 max_tokens, or disable reasoning (--llm-reasoning-effort=none)."
+            );
         }
 
         Ok(())
@@ -337,6 +377,7 @@ mod tests {
             base_url,
             model: "test-model".to_string(),
             api_key,
+            reasoning_effort: Some("none".to_string()),
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         llm.generate(
@@ -378,6 +419,101 @@ mod tests {
         assert!(
             requests[0].headers.get("authorization").is_none(),
             "a keyless endpoint must keep receiving the request it gets today"
+        );
+    }
+
+    // ── reasoning control ────────────────────────────────────────────────────
+
+    async fn mount_sse(server: &wiremock::MockServer, body: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn generate_collect(base_url: String, reasoning_effort: Option<String>) -> String {
+        let llm = ServerLlm {
+            client: reqwest::Client::new(),
+            base_url,
+            model: "test-model".to_string(),
+            api_key: None,
+            reasoning_effort,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let collector = tokio::spawn(async move {
+            let mut out = String::new();
+            while let Some(t) = rx.recv().await {
+                out.push_str(&t);
+            }
+            out
+        });
+        llm.generate(
+            &[spelunk_core::llm::Message {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            64,
+            tx,
+            None,
+        )
+        .await
+        .unwrap();
+        collector.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_is_sent_when_configured() {
+        let server = wiremock::MockServer::start().await;
+        mount_sse(&server, "data: [DONE]\n\n").await;
+
+        let _ = generate_collect(server.uri(), Some("none".to_string())).await;
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["reasoning_effort"], "none",
+            "reasoning_effort must be sent so reasoning models skip chain-of-thought"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_is_omitted_when_unset() {
+        let server = wiremock::MockServer::start().await;
+        mount_sse(&server, "data: [DONE]\n\n").await;
+
+        let _ = generate_collect(server.uri(), None).await;
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "with reasoning control disabled the field must not appear at all"
+        );
+    }
+
+    // A reasoning model streams chain-of-thought (reasoning_content) before the
+    // real answer (content). Only the answer may reach the caller: reasoning
+    // deltas prepended to a JSON-schema completion would break parsing.
+    #[tokio::test]
+    async fn reasoning_content_is_dropped_and_content_is_forwarded() {
+        let server = wiremock::MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" harder\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\":\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"true}\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        mount_sse(&server, body).await;
+
+        let out = generate_collect(server.uri(), Some("none".to_string())).await;
+
+        assert_eq!(
+            out, "{\"ok\":true}",
+            "only content deltas may be forwarded; reasoning_content must be dropped"
         );
     }
 }
