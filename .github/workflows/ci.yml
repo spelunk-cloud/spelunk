@@ -127,6 +127,69 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y libdbus-1-dev pkg-config
 
+      # Windows real-time antimalware scanning, not Windows itself, is what
+      # makes this leg the slowest job in CI. On one run the same 2187 tests
+      # summed to 364s of per-test time on Linux and 3694s here, and the gap
+      # tracks I/O, not compute: `spelunk-server`'s in-process tests cost
+      # 0.09s on Linux and 0.11s here, while the CLI integration tests that
+      # spawn the freshly built, unsigned `spelunk.exe` and build git repos
+      # and SQLite databases under the temp dir run 100x slower or worse
+      # (`dep_question_is_never_surfaced_cross_project`: 0.09s against 45.8s
+      # for roughly two process spawns). Every spawn of an unscanned binary
+      # and every file those tests write is scanned, and nextest runs one
+      # worker per core, so the scans pile up.
+      #
+      # Only the paths CI creates are excluded: the workspace, the cargo and
+      # rustup homes, and the temp dirs the suite writes into. Scanning stays
+      # on for everything else the runner touches, including anything fetched
+      # from the network.
+      #
+      # Non-fatal by design. The cmdlet is absent on images without Defender
+      # and tamper protection can refuse the change; a slow job beats a job
+      # that fails on an unrelated platform detail.
+      - name: Exclude CI paths from antimalware real-time scanning
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (-not (Get-Command Add-MpPreference -ErrorAction SilentlyContinue)) {
+            Write-Host 'Add-MpPreference is unavailable; leaving scanning settings untouched.'
+            exit 0
+          }
+
+          try {
+            $status = Get-MpComputerStatus
+            Write-Host "before: RealTimeProtectionEnabled=$($status.RealTimeProtectionEnabled) AntivirusEnabled=$($status.AntivirusEnabled) AMRunningMode=$($status.AMRunningMode)"
+          } catch {
+            Write-Host "Get-MpComputerStatus failed: $($_.Exception.Message)"
+          }
+
+          # $env:TEMP can carry an 8.3 short name, which an exclusion path does
+          # not match, so the long form is listed alongside it.
+          $paths = @(
+            $env:GITHUB_WORKSPACE
+            $env:RUNNER_TEMP
+            $env:TEMP
+            "$env:USERPROFILE\AppData\Local\Temp"
+            "$env:USERPROFILE\.cargo"
+            "$env:USERPROFILE\.rustup"
+          ) | Where-Object { $_ } | Select-Object -Unique
+
+          foreach ($path in $paths) {
+            try {
+              Add-MpPreference -ExclusionPath $path -ErrorAction Stop
+              Write-Host "excluded: $path"
+            } catch {
+              Write-Host "could not exclude ${path}: $($_.Exception.Message)"
+            }
+          }
+
+          try {
+            Write-Host "exclusions now: $((Get-MpPreference).ExclusionPath -join '; ')"
+          } catch {
+            Write-Host "Get-MpPreference failed: $($_.Exception.Message)"
+          }
+
       # One command per step: this job's matrix includes windows-latest, and a
       # Windows step's exit status does not reflect a failing native
       # executable (only a failing PowerShell cmdlet), so chaining two rustup
