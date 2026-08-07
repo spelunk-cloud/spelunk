@@ -103,6 +103,15 @@ struct Args {
     #[arg(long, env = "SPELUNK_LLM_MODEL", default_value = "")]
     llm_model: String,
 
+    /// `reasoning_effort` sent on every LLM request, to suppress chain-of-thought
+    /// on reasoning models (DeepSeek, Gemini, o-series, …). Defaults to `none`
+    /// (reasoning off), because harvest/explore want the answer, not the model's
+    /// thinking, and an unbounded reasoning pass exhausts the token budget before
+    /// any content is emitted. Set `minimal`/`low`/`medium`/`high` to allow it, or
+    /// `default` to omit the field entirely for endpoints that reject it.
+    #[arg(long, env = "SPELUNK_LLM_REASONING_EFFORT", default_value = "none")]
+    llm_reasoning_effort: String,
+
     /// Credential for the `--llm-url` endpoint, passed inline. Visible in the
     /// process table: prefer `--llm-key-file` or `SPELUNK_LLM_KEY`. Distinct
     /// from `--key`, which is this server's own inbound bearer.
@@ -124,6 +133,18 @@ struct Args {
     /// `--host` is probed over loopback.
     #[arg(long)]
     health_check: bool,
+}
+
+/// Map the `--llm-reasoning-effort` value to what travels on the wire: `default`
+/// / `model` / blank means "omit the field, use the model's own default";
+/// anything else is sent verbatim (`none` suppresses reasoning).
+fn normalize_reasoning_effort(v: &str) -> Option<String> {
+    let v = v.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("default") || v.eq_ignore_ascii_case("model") {
+        None
+    } else {
+        Some(v.to_string())
+    }
 }
 
 fn main() -> Result<()> {
@@ -286,6 +307,7 @@ async fn run(budget: ThreadBudget) -> Result<()> {
             base_url,
             model,
             api_key: llm_key,
+            reasoning_effort: normalize_reasoning_effort(&args.llm_reasoning_effort),
         }))
     } else {
         None
@@ -726,8 +748,38 @@ fn effective_uid() -> Option<u32> {
 
 #[cfg(test)]
 mod arg_tests {
-    use super::Args;
+    use super::{Args, normalize_reasoning_effort};
     use clap::Parser;
+
+    // Reasoning is off by default: harvest/explore want the answer, and an
+    // unbounded reasoning pass exhausts the token budget before any content
+    // (the DeepSeek-v4 harvest failure). The default must send `none`.
+    #[test]
+    fn reasoning_is_disabled_by_default() {
+        let args = Args::parse_from(["spelunk-server"]);
+        assert_eq!(args.llm_reasoning_effort, "none");
+        assert_eq!(
+            normalize_reasoning_effort(&args.llm_reasoning_effort),
+            Some("none".to_string()),
+            "the default must be sent on the wire as reasoning_effort=none"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_default_and_model_and_blank_omit_the_field() {
+        for opt_out in ["default", "Default", "model", "  ", ""] {
+            assert_eq!(
+                normalize_reasoning_effort(opt_out),
+                None,
+                "'{opt_out}' must omit reasoning_effort so strict endpoints aren't sent it"
+            );
+        }
+        assert_eq!(
+            normalize_reasoning_effort("minimal"),
+            Some("minimal".to_string()),
+            "an explicit effort level passes through verbatim"
+        );
+    }
 
     /// The server binary default host must be loopback (127.0.0.1), not the
     /// wildcard (0.0.0.0). The wildcard bind is an explicit `--host 0.0.0.0`
