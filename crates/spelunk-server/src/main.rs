@@ -308,6 +308,7 @@ async fn run(budget: ThreadBudget) -> Result<()> {
             model,
             api_key: llm_key,
             reasoning_effort: normalize_reasoning_effort(&args.llm_reasoning_effort),
+            structured_mode: std::sync::atomic::AtomicU8::new(0),
         }))
     } else {
         None
