@@ -234,8 +234,10 @@ class TestCellLabel(unittest.TestCase):
 
 class TestLoadTasks(unittest.TestCase):
     def _write(self, obj):
-        p = tempfile.mktemp(suffix=".json")
-        with open(p, "w") as f:
+        # mkstemp (not mktemp) creates the file atomically: no window between
+        # generating the name and opening it for a symlink to land in.
+        fd, p = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
             json.dump(obj, f)
         self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
         return p

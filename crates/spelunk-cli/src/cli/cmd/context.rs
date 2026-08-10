@@ -6,7 +6,10 @@ use super::color::cprintln;
 use super::memory::cross_project::collect_dep_cross_cutting;
 use super::memory::print_note_summary;
 use crate::storage::memory::Note;
-use crate::{config::Config, storage::open_memory_backend};
+use crate::{
+    config::Config,
+    storage::{NoteId, open_memory_backend},
+};
 
 /// Fallback per-section limit when `--kind` names a kind not in SECTIONS.
 const DEFAULT_UNKNOWN_KIND_LIMIT: usize = 20;
@@ -172,19 +175,19 @@ pub async fn context(args: ContextArgs, cfg: Config) -> Result<()> {
         None => crate::config::require_project_db(&cfg.db_path, false)?.with_file_name("memory.db"),
     };
 
-    // `git fetch` lands teammates' notes on a tracking ref that nothing else
-    // merges, so without this they stay invisible (ADR-069 D5). Local-only, no
-    // network; a no-op outside a git repo or with nothing fetched.
-    crate::storage::merge_tracking_notes(None).await;
-
-    // Discovery nudge: warn once when unimported server.db notes exist.
-    crate::cli::cmd::memory::reconcile::maybe_emit_nudge(&mem_path, &cfg);
-    crate::cli::cmd::memory::outbox::poll_and_apply(&cfg, &mem_path).await;
-
     let be = match args.backend.as_str() {
         "git-notes" => Some("git-notes"),
         _ => None,
     };
+
+    // A teammate's `git fetch` lands their notes on a tracking ref that nothing
+    // else merges into `memory.db`, so without this they stay invisible on the
+    // default context path (ADR-077 D1).
+    crate::cli::cmd::memory::reconcile::refresh_read_path_from_git_notes(&cfg, &mem_path, be).await;
+
+    // Discovery nudge: warn once when unimported server.db notes exist.
+    crate::cli::cmd::memory::reconcile::maybe_emit_nudge(&mem_path, &cfg);
+    crate::cli::cmd::memory::outbox::poll_and_apply(&cfg, &mem_path).await;
     let backend = open_memory_backend(&cfg, &mem_path, be).await?;
 
     let mut sections = collect_sections(
@@ -203,12 +206,12 @@ pub async fn context(args: ContextArgs, cfg: Config) -> Result<()> {
             .index_db
             .clone()
             .unwrap_or_else(|| crate::config::resolve_db(None, &cfg.db_path));
-        let mut seen: std::collections::HashSet<(String, i64)> = Default::default();
+        let mut seen: std::collections::HashSet<(String, NoteId)> = Default::default();
         // Seed seen from all local notes to avoid printing a dep note that
         // somehow shares an ID with a local note.
         for (_, notes) in &sections {
             for n in notes {
-                seen.insert((String::new(), n.id));
+                seen.insert((String::new(), n.id.clone()));
             }
         }
         let dep_notes = collect_dep_cross_cutting(&index_db_path, &mut seen).await;
@@ -376,7 +379,7 @@ mod tests {
 
     fn note(id: i64, kind: &str, title: &str, body: &str) -> Note {
         Note {
-            id,
+            id: NoteId::from_i64(id),
             kind: kind.to_string(),
             title: title.to_string(),
             body: body.to_string(),
@@ -394,6 +397,32 @@ mod tests {
             source_project_path: None,
             remote_id: None,
         }
+    }
+
+    // Anti-drift guard: every kind a retrieval path selects on must be a
+    // canonical kind that `memory add --kind` accepts. Retrieval selects on a
+    // subset of NOTE_KINDS (not every valid kind appears in the default context
+    // view), so this asserts membership, not equality — but it means a kind
+    // that `context` filters on can never be one `memory add` would reject,
+    // which is exactly the silent-drop the kind-validation fix closes.
+    #[test]
+    fn every_retrieval_kind_is_a_canonical_kind() {
+        use spelunk_core::storage::is_valid_note_kind;
+        for section in SECTIONS {
+            assert!(
+                is_valid_note_kind(section.kind),
+                "context section kind {:?} is not a canonical memory kind",
+                section.kind
+            );
+        }
+        for kind in PACK_PRIORITY {
+            assert!(
+                is_valid_note_kind(kind),
+                "pack-priority kind {kind:?} is not a canonical memory kind"
+            );
+        }
+        // `memory failures` selects on this kind; it must be canonical too.
+        assert!(is_valid_note_kind("antipattern"));
     }
 
     #[test]
@@ -423,7 +452,7 @@ mod tests {
         )];
         cap_sections(&mut sections, None);
         assert_eq!(sections[0].1.len(), 10);
-        assert_eq!(sections[0].1.first().unwrap().id, 0);
+        assert_eq!(sections[0].1.first().unwrap().id, NoteId::from_i64(0));
     }
 
     #[test]
@@ -570,7 +599,11 @@ mod tests {
         let mut conv: Vec<ConventionRecord> = vec![];
         let used = apply_budget(&mut sections, &mut conv, 150);
         assert_eq!(sections[0].1.len(), 1);
-        assert_eq!(sections[0].1[0].id, 1, "the smaller later entry survives");
+        assert_eq!(
+            sections[0].1[0].id,
+            NoteId::from_i64(1),
+            "the smaller later entry survives"
+        );
         assert_eq!(used, 101);
     }
 
@@ -689,11 +722,15 @@ mod tests {
         assert_eq!(kept.len(), 10);
         // All 8 locals survive...
         for (idx, expected) in (0..8).enumerate() {
-            assert_eq!(kept[idx].id, expected, "local {expected} must survive");
+            assert_eq!(
+                kept[idx].id,
+                NoteId::from_i64(expected),
+                "local {expected} must survive"
+            );
         }
         // ...and only the first two dep notes (the overflow tail is trimmed).
-        assert_eq!(kept[8].id, 100);
-        assert_eq!(kept[9].id, 101);
+        assert_eq!(kept[8].id, NoteId::from_i64(100));
+        assert_eq!(kept[9].id, NoteId::from_i64(101));
     }
 
     #[test]

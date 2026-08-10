@@ -101,7 +101,7 @@ const SERVER_BUDGET_TARGET_FRACTION: f64 = 2.0 / 3.0;
 /// 408-triggered shrink in `run_embed_phase` is the fallback.
 fn resolve_target_batch_seconds(server_limits: Option<ServerLimits>) -> u64 {
     let budget_secs = server_limits
-        .map(|l| l.embed_request_timeout_secs)
+        .and_then(|l| l.embed_request_timeout_secs)
         .unwrap_or(LEGACY_SERVER_REQUEST_BUDGET_SECS);
     let safe_budget = (budget_secs as f64 * SERVER_BUDGET_TARGET_FRACTION).floor() as u64;
     TARGET_BATCH_SECONDS.min(safe_budget.max(1))
@@ -411,7 +411,7 @@ async fn run_embed_phase_with_backoff(
 
     // Ceiling the calibrated batch size may grow to (see `next_batch_size`),
     // clamped to the server's advertised `max_batch_chunks` when known.
-    let server_max_batch_chunks = server_limits.map(|l| l.max_batch_chunks);
+    let server_max_batch_chunks = server_limits.and_then(|l| l.max_batch_chunks);
     let ceiling = resolve_batch_ceiling(batch_size, server_max_batch_chunks);
 
     // Target batch duration, clamped to the server's advertised (or legacy)
@@ -694,6 +694,7 @@ async fn run_embed_phase_with_backoff(
             })
             .collect();
         db.insert_embeddings(&embeddings)?;
+        super::crash_test_hook::pause_at("after_embed_batch", &batch_num.to_string());
 
         // The batch is now durable; advance the counters and repaint the ETA
         // per chunk so it still counts down through a batch, not once per request.
@@ -875,6 +876,27 @@ mod tests {
         assert_eq!(resolve_batch_ceiling(16, Some(256)), 16);
     }
 
+    // Only reachable now when a peer advertises no cap at all: a peer that
+    // advertises one keeps it even if a sibling member is unreadable (see
+    // one_unreadable_limit_keeps_the_readable_limits_beside_it). For a peer
+    // that advertises nothing, 256 is not "no limit": it is the hard cap that
+    // server family enforces (`MAX_EMBED_BATCH`, `413` above it), so it is the
+    // legacy profile on this axis exactly as 30s is on the time axis. The two
+    // still have to be judged separately, because only the time axis derives
+    // its fallback from a documented budget rather than from a shared ceiling.
+    #[test]
+    fn absent_server_limits_leave_the_chunk_ceiling_at_this_clis_own_maximum() {
+        let advertised = resolve_batch_ceiling(0, Some(16));
+        let degraded = resolve_batch_ceiling(0, None);
+        assert_eq!(advertised, 16);
+        assert_eq!(degraded, MAX_BATCH);
+        assert!(
+            degraded > advertised,
+            "losing a small advertised cap raises the ceiling rather than \
+             lowering it, which is the opposite of a conservative fallback"
+        );
+    }
+
     // ── resolve_target_batch_seconds: server-limits-aware target clamping ───
 
     #[test]
@@ -882,8 +904,8 @@ mod tests {
         // A server advertising the new EMBED_REQUEST_TIMEOUT (1800s) budget
         // comfortably fits the default 240s target — no clamping needed.
         let limits = ServerLimits {
-            embed_request_timeout_secs: 1800,
-            max_batch_chunks: 256,
+            embed_request_timeout_secs: Some(1800),
+            max_batch_chunks: Some(256),
             embedder_token_cap: None,
         };
         assert_eq!(
@@ -898,8 +920,8 @@ mod tests {
         // forces a smaller target, at SERVER_BUDGET_TARGET_FRACTION of that
         // budget (leaving headroom rather than targeting the hard edge).
         let limits = ServerLimits {
-            embed_request_timeout_secs: 60,
-            max_batch_chunks: 256,
+            embed_request_timeout_secs: Some(60),
+            max_batch_chunks: Some(256),
             embedder_token_cap: None,
         };
         assert_eq!(resolve_target_batch_seconds(Some(limits)), 40); // 60 * 2/3
@@ -2229,8 +2251,8 @@ mod tests {
 
         let cfg = Config::default();
         let limits = ServerLimits {
-            embed_request_timeout_secs: 1800,
-            max_batch_chunks: 8,
+            embed_request_timeout_secs: Some(1800),
+            max_batch_chunks: Some(8),
             embedder_token_cap: None,
         };
         let tier = server_tier_with_limits(mock.uri(), Some(limits));

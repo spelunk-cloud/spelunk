@@ -102,7 +102,7 @@ fn knn_returns_jsonl_results_for_valid_vector() {
 
     std::fs::write(
         &config,
-        "llm_model = \"x\"\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"text-embedding-nomic-embed-text-v1.5\"\n",
+        "llm_model = \"x\"\napi_base_url = \"http://127.0.0.1:1234\"\n",
     )
     .unwrap();
 
@@ -151,7 +151,7 @@ fn knn_lang_filter_restricts_to_language() {
 
     std::fs::write(
         &config,
-        "llm_model = \"x\"\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"text-embedding-nomic-embed-text-v1.5\"\n",
+        "llm_model = \"x\"\napi_base_url = \"http://127.0.0.1:1234\"\n",
     )
     .unwrap();
 
@@ -201,7 +201,7 @@ fn knn_min_score_filter_respects_threshold() {
 
     std::fs::write(
         &config,
-        "llm_model = \"x\"\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"text-embedding-nomic-embed-text-v1.5\"\n",
+        "llm_model = \"x\"\napi_base_url = \"http://127.0.0.1:1234\"\n",
     )
     .unwrap();
 

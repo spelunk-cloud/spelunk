@@ -348,7 +348,7 @@ Exit codes across all plumbing commands:
 - **1** — no results (empty set, not an error)
 - **2** — hard error (bad flags, missing DB, I/O failure) — diagnostics on stderr
 
-Commands marked **(requires server)** need an embedding model running on the configured endpoint.
+Commands marked **(requires server)** need a running `spelunk-server` with its embedder ready.
 
 ### cat-chunks *(requires index)*
 
@@ -515,9 +515,9 @@ Example output:
 {"model":"f2llm-v2-330m","dimensions":896,"vector":[0.021,-0.043,...]}
 ```
 
-(The model name reflects the `embedding_model` config value and the
-dimensionality reflects whichever embedder the server is using — the bundled
-native embedder is codefuse-ai/F2LLM-v2-330M at 896 dimensions.)
+(The model name is the pinned model id, and the dimensionality reflects the
+bundled native embedder: codefuse-ai/F2LLM-v2-330M at 896 dimensions.
+Neither is configurable.)
 
 ---
 

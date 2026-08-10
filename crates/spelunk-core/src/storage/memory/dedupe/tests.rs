@@ -186,7 +186,7 @@ fn survivor_adopts_lone_superseded_by_from_group() {
 
     store.dedupe_entity_ids(false).unwrap();
     let note = store.get(survivor).unwrap().unwrap();
-    assert_eq!(note.superseded_by, Some(elsewhere));
+    assert_eq!(note.superseded_by, sup(elsewhere));
 }
 
 // ── AC17: conflicting superseded_by values -> earliest wins, warn, no error ─
@@ -214,7 +214,7 @@ fn conflicting_superseded_by_earliest_wins_no_error() {
     let note = store.get(survivor).unwrap().unwrap();
     assert_eq!(
         note.superseded_by,
-        Some(target_a),
+        sup(target_a),
         "the earliest-created row's (survivor's own) value must win"
     );
 }
@@ -237,7 +237,7 @@ fn edge_elsewhere_pointing_at_loser_is_repointed_to_survivor() {
     let summary = store.dedupe_entity_ids(false).unwrap();
     assert_eq!(summary.supersede_edges_repointed, 1);
     let note = store.get(dependent).unwrap().unwrap();
-    assert_eq!(note.superseded_by, Some(survivor));
+    assert_eq!(note.superseded_by, sup(survivor));
 }
 
 // ── AC19: a rewrite that would self-point is dropped to NULL instead ────
@@ -497,12 +497,12 @@ fn multiple_external_rows_pointing_at_different_losers_all_repoint_to_survivor()
     assert_eq!(summary.supersede_edges_repointed, 2);
     assert_eq!(
         store.get(dep_a).unwrap().unwrap().superseded_by,
-        Some(survivor),
+        sup(survivor),
         "dep_a's edge to loser_a must repoint to the survivor"
     );
     assert_eq!(
         store.get(dep_b).unwrap().unwrap().superseded_by,
-        Some(survivor),
+        sup(survivor),
         "dep_b's edge to loser_b must repoint to the survivor, independently of dep_a"
     );
 }

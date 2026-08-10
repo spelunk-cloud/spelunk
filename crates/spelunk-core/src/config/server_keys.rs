@@ -113,7 +113,11 @@ pub fn bearer_for(
     }
     let origin = normalize_origin(server_url)?;
     if origin == cloud_origin()? {
-        return Ok(auth.map(|a| a.access_token.clone()));
+        // An empty (or absent) access token means "not logged in": resolve to
+        // no bearer rather than an empty-string `Some("")`.
+        return Ok(auth
+            .map(|a| a.access_token.clone())
+            .filter(|token| !token.is_empty()));
     }
     server_key_for_origin(&origin, store)
 }

@@ -84,7 +84,6 @@ fn write_config(dir: &Path, server_url: &str) -> std::path::PathBuf {
         &config_path,
         format!(
             "db_path = {db_path:?}\n\
-             embedding_model = \"test-model\"\n\
              llm_model = \"test-chat\"\n"
         ),
     )

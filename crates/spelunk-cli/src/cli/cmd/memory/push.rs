@@ -23,7 +23,7 @@
 use anyhow::{Context, Result};
 
 use super::MemoryPushArgs;
-use super::sync::push_local_oneway;
+use super::sync::{LocalEmbedPolicy, local_embed_summary, push_local_oneway, unembedded_warning};
 use crate::{
     capability,
     cli::cmd::auth_api,
@@ -64,13 +64,18 @@ pub async fn memory_push(
     // Attach the local fp32/896 vector only when the server advertises it;
     // otherwise the push is text-only and the server re-embeds.
     let accepts_pushed_vectors = tier.caps().is_some_and(|c| c.accepts_pushed_vectors);
+    let local_embed = LocalEmbedPolicy::for_push(cfg, src_path);
     let summary = push_local_oneway(
         &local,
         &client,
         args.include_archived,
         accepts_pushed_vectors,
+        &local_embed,
     )
     .await?;
+    if summary.without_local_vector > 0 {
+        eprintln!("{}", unembedded_warning(summary.without_local_vector));
+    }
     if summary.attempted == 0 {
         if summary.already_synced > 0 {
             println!(
@@ -103,13 +108,20 @@ pub async fn memory_push(
         );
     } else if summary.failed > 0 {
         println!(
-            "Done. Pushed {} entries (created {}, skipped {}, {} failed).",
-            summary.attempted, summary.created, summary.skipped, summary.failed
+            "Done. Pushed {} entries (created {}, skipped {}, {} failed).{}",
+            summary.attempted,
+            summary.created,
+            summary.skipped,
+            summary.failed,
+            local_embed_summary(&summary)
         );
     } else {
         println!(
-            "Done. Pushed {} entries (created {}, skipped {}).",
-            summary.attempted, summary.created, summary.skipped
+            "Done. Pushed {} entries (created {}, skipped {}).{}",
+            summary.attempted,
+            summary.created,
+            summary.skipped,
+            local_embed_summary(&summary)
         );
     }
     Ok(())

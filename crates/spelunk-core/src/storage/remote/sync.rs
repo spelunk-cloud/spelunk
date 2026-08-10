@@ -143,6 +143,63 @@ pub struct BatchPushResult {
     pub results: Vec<BatchItemResult>,
 }
 
+/// One relationship edge pushed to `POST /memory/batch` via the request's
+/// `edges[]` array.
+///
+/// Each endpoint is addressed by its `external_id` (the entry's stable uuid,
+/// the only id the batch edge route resolves), never the machine-local row id.
+/// `kind` is a fixed edge kind: sync pushes only `"relates_to"`, since a
+/// `supersedes` edge already travels with its entry's lifecycle and
+/// `contradicts` is server-generated. Mirrors cloud-api's batch `edges[]`
+/// element and `CloudApiMemoryBackend::supersede`'s single-edge post.
+#[derive(Debug, Serialize)]
+pub struct SyncEdgePush {
+    pub from_external_id: String,
+    pub to_external_id: String,
+    pub kind: &'static str,
+}
+
+/// An edge-only batch body: `entries` is required by the route but stays empty,
+/// so this posts edges without touching entries.
+#[derive(Debug, Serialize)]
+struct BatchEdgePushBody {
+    entries: [(); 0],
+    edges: Vec<SyncEdgePush>,
+}
+
+/// Per-edge acknowledgement in the 207 `edges[]` response.
+#[derive(Debug, Deserialize)]
+struct BatchEdgeAck {
+    status: String,
+}
+
+/// Result of an edge batch push: the per-edge acknowledgements the server
+/// returned in the 207 `edges[]` array.
+#[derive(Debug, Deserialize, Default)]
+pub struct EdgePushResult {
+    #[serde(default)]
+    edges: Vec<BatchEdgeAck>,
+}
+
+impl EdgePushResult {
+    /// Count of edges the server actually stored. An `unresolved` edge (an
+    /// endpoint the server does not know yet) is a no-op to retry on a later
+    /// sync, not a success, so it is not counted here: this matches
+    /// `CloudApiMemoryBackend`'s supersede `edge_applied`.
+    pub fn applied(&self) -> usize {
+        self.edges
+            .iter()
+            .filter(|e| matches!(e.status.as_str(), "created" | "applied" | "updated"))
+            .count()
+    }
+
+    /// Total edges the server acknowledged, applied or not (the length of the
+    /// returned `edges[]` array).
+    pub fn acknowledged(&self) -> usize {
+        self.edges.len()
+    }
+}
+
 /// One entry returned by `GET /memory/since`.
 ///
 /// Mirrors cloud-api's `EntryResponse`; the embedding vector is never sent by
@@ -293,6 +350,38 @@ impl CloudSyncClient {
             .context("parsing /memory/batch response")
     }
 
+    /// Push a batch of relationship edges via the same `POST /memory/batch`
+    /// route, carrying them in the request's `edges[]` array with an empty
+    /// `entries[]`.
+    ///
+    /// Idempotent server-side (the batch edge route dedupes on `ON CONFLICT DO
+    /// NOTHING`), so a re-push is harmless. An edge naming an endpoint the
+    /// server does not know yet comes back `unresolved`, which
+    /// [`EdgePushResult::applied`] reports as not-applied rather than an error:
+    /// the endpoint just is not synced yet, and a later sync retries it. An
+    /// empty input is a no-op with no request.
+    pub async fn push_edges(&self, edges: Vec<SyncEdgePush>) -> Result<EdgePushResult> {
+        if edges.is_empty() {
+            return Ok(EdgePushResult::default());
+        }
+        let body = BatchEdgePushBody { entries: [], edges };
+        let resp = self
+            .authed(self.client.post(self.url("memory/batch")))
+            .json(&body)
+            .send()
+            .await
+            .context("POST /memory/batch (edges)")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("POST /memory/batch edges failed ({status}): {text}");
+        }
+        resp.json::<EdgePushResult>()
+            .await
+            .context("parsing /memory/batch edges response")
+    }
+
     /// Tombstone a cloud entry by its cloud-minted id (`DELETE /memory/{id}`).
     ///
     /// Propagates a local archive to the cloud. Already-archived or
@@ -312,11 +401,44 @@ impl CloudSyncClient {
         anyhow::bail!("DELETE /memory/{remote_id} failed ({status}): {text}")
     }
 
-    /// Pull entries after the UUIDv7 cursor `since_id` (the max cloud
-    /// `remote_id` already synced locally — decision #183). When `since_id` is
-    /// `None` (nothing synced yet) this is a full catch-up: the
-    /// nil UUID `00000000-…` sorts before every UUIDv7, so it returns all
-    /// entries.
+    /// Maximum `limit` the server accepts on `GET /memory/since`
+    /// (`ServerDb::notes_since_id`'s `limit.clamp(1, 500)`). A request's
+    /// `limit` only needs to satisfy `limit <= MEMORY_SINCE_MAX_LIMIT`; the
+    /// server silently clamps down to this value if it's violated. Scoped to
+    /// this one endpoint, not a generic page-size ceiling.
+    pub const MEMORY_SINCE_MAX_LIMIT: i64 = 500;
+
+    /// `limit` this client requests per `/memory/since` page. Matches the
+    /// server's own default (`default_since_limit()` in handlers.rs), so
+    /// sending it explicitly behaves identically to omitting the param; sent
+    /// explicitly anyway so pagination's "did this page prove nothing
+    /// remains" check has a fixed value to compare against that can't
+    /// silently drift if the server's own default ever changes. Well under
+    /// [`MEMORY_SINCE_MAX_LIMIT`](Self::MEMORY_SINCE_MAX_LIMIT): a larger
+    /// per-page request is a pure throughput/latency tradeoff (fewer, bigger
+    /// requests vs. more, smaller ones), not a correctness lever — a
+    /// pagination loop that stops on a short page is already immune to
+    /// backlog size regardless of page size, so there is no correctness
+    /// reason to request more, and a smaller page is kinder to slow
+    /// connections and unusually large individual entries.
+    pub const MEMORY_SINCE_PULL_LIMIT: i64 = 100;
+
+    /// Pull one page of entries after the UUIDv7 cursor `since_id` (the max
+    /// cloud `remote_id` already synced locally — decision #183). When
+    /// `since_id` is `None` (nothing synced yet) this is a full catch-up
+    /// start: the nil UUID `00000000-…` sorts before every UUIDv7, so it
+    /// returns from the very beginning.
+    ///
+    /// Requests [`MEMORY_SINCE_PULL_LIMIT`](Self::MEMORY_SINCE_PULL_LIMIT)
+    /// entries and returns at most that many. This method does not paginate
+    /// on its own; a caller pulling a store's entire backlog must loop (see
+    /// `pull_and_apply_since` in spelunk-cli), calling again with the cursor
+    /// advanced to the last entry's `id` until a page comes back shorter than
+    /// the requested limit — the definitive "nothing left" signal, including
+    /// the empty-page case. A response exactly at the limit does not by
+    /// itself prove more remain, but it can never be treated as the last page
+    /// either, since the server never returns more than requested even when
+    /// more exist.
     ///
     /// A project that does not exist on the server yet (404) is treated as
     /// having nothing to pull, not an error: a spelunk-server-backed project
@@ -328,9 +450,10 @@ impl CloudSyncClient {
         // The all-zero UUID precedes every UUIDv7 in `id > $cursor` order, so it
         // is the natural "from the beginning" cursor for a first sync.
         let cursor = since_id.unwrap_or("00000000-0000-0000-0000-000000000000");
+        let limit = Self::MEMORY_SINCE_PULL_LIMIT.to_string();
         let resp = self
             .authed(self.client.get(self.url("memory/since")))
-            .query(&[("since_id", cursor)])
+            .query(&[("since_id", cursor), ("limit", limit.as_str())])
             .send()
             .await
             .context("GET /memory/since")?;
@@ -508,6 +631,85 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+    fn relates_edge(from: &str, to: &str) -> SyncEdgePush {
+        SyncEdgePush {
+            from_external_id: from.into(),
+            to_external_id: to.into(),
+            kind: "relates_to",
+        }
+    }
+
+    // A relates_to push must hit the same `/memory/batch` route the entry push
+    // uses, but as an edge-only body: `entries` empty, one `edges[]` element
+    // keyed by external_id. A 207 `{"edges":[{"status":"created"}]}` counts as
+    // applied.
+    #[tokio::test]
+    async fn push_edges_posts_an_edge_only_relates_to_batch_body() {
+        use wiremock::matchers::body_json;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/memory/batch"))
+            .and(body_json(serde_json::json!({
+                "entries": [],
+                "edges": [{
+                    "from_external_id": "ext-from",
+                    "to_external_id": "ext-to",
+                    "kind": "relates_to",
+                }],
+            })))
+            .respond_with(
+                ResponseTemplate::new(207)
+                    .set_body_json(serde_json::json!({"edges": [{"status": "created"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = CloudSyncClient::new(&server.uri(), "proj", None, None).unwrap();
+        let res = client
+            .push_edges(vec![relates_edge("ext-from", "ext-to")])
+            .await
+            .unwrap();
+        assert_eq!(res.applied(), 1, "a created edge must count as applied");
+    }
+
+    // An edge naming an endpoint the server does not know yet comes back
+    // `unresolved`. That is "not yet, retry later", not a failure: the call
+    // must succeed and simply not count the edge as applied.
+    #[tokio::test]
+    async fn an_unresolved_edge_push_is_graceful_and_not_counted_as_applied() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/memory/batch"))
+            .respond_with(
+                ResponseTemplate::new(207)
+                    .set_body_json(serde_json::json!({"edges": [{"status": "unresolved"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = CloudSyncClient::new(&server.uri(), "proj", None, None).unwrap();
+        let res = client
+            .push_edges(vec![relates_edge("ext-from", "ext-to")])
+            .await
+            .expect("an unresolved edge must not surface as an error");
+        assert_eq!(res.applied(), 0, "unresolved must not read as applied");
+        assert_eq!(
+            res.acknowledged(),
+            1,
+            "the edge was acknowledged, just not resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_edges_empty_is_a_noop_with_no_request() {
+        let server = MockServer::start().await;
+        let client = CloudSyncClient::new(&server.uri(), "proj", None, None).unwrap();
+        let res = client.push_edges(vec![]).await.unwrap();
+        assert_eq!(res.applied(), 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn push_batch_reports_skipped_for_idempotent_repush() {
         let server = MockServer::start().await;
@@ -534,6 +736,12 @@ mod tests {
             .and(query_param(
                 "since_id",
                 "01890000-0000-7000-8000-000000000000",
+            ))
+            .and(query_param(
+                "limit",
+                CloudSyncClient::MEMORY_SINCE_PULL_LIMIT
+                    .to_string()
+                    .as_str(),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "entries": [{
@@ -574,6 +782,58 @@ mod tests {
         assert!(entries.is_empty());
     }
 
+    #[test]
+    fn memory_since_max_limit_matches_the_server_clamp_ceiling() {
+        // `ServerDb::notes_since_id` clamps `limit` to `1..=500`. This is a
+        // regression guard on that server-side fact, not a claim about what
+        // this client requests (see `MEMORY_SINCE_PULL_LIMIT` for that).
+        assert_eq!(CloudSyncClient::MEMORY_SINCE_MAX_LIMIT, 500);
+    }
+
+    #[test]
+    fn memory_since_pull_limit_matches_the_server_default_and_stays_under_the_max() {
+        // 100 matches `default_since_limit()` (handlers.rs) — the value the
+        // server already applies with no `limit` param — chosen for slow
+        // connections and large entries, not for minimizing round trips.
+        // (100 <= 500 is self-evident from this and the sibling test above,
+        // so isn't asserted separately: both sides are compile-time
+        // constants and clippy rejects an assertion with a constant value.)
+        assert_eq!(CloudSyncClient::MEMORY_SINCE_PULL_LIMIT, 100);
+    }
+
+    #[tokio::test]
+    async fn pull_since_requests_the_page_limit_explicitly() {
+        // Sent explicitly (rather than omitted and left to the server's own
+        // default) so a caller looping pages has a fixed value to compare
+        // each page's length against, insulated from the server's default
+        // ever changing. Match on path only (not `limit`) so a wrong/missing
+        // value surfaces in the captured request instead of being masked by
+        // wiremock's 404-no-match default, which `pull_since` itself treats
+        // as an empty-but-successful pull.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/projects/proj/memory/since"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "entries": [], "count": 0 })),
+            )
+            .mount(&server)
+            .await;
+        let client = CloudSyncClient::new(&server.uri(), "proj", None, None).unwrap();
+        client.pull_since(None).await.unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let query: std::collections::HashMap<_, _> = reqs[0].url.query_pairs().collect();
+        assert_eq!(
+            query.get("limit").map(|v| v.as_ref()),
+            Some(
+                CloudSyncClient::MEMORY_SINCE_PULL_LIMIT
+                    .to_string()
+                    .as_str()
+            )
+        );
+    }
+
     #[tokio::test]
     async fn pull_since_none_uses_nil_uuid_cursor() {
         let server = MockServer::start().await;
@@ -594,6 +854,28 @@ mod tests {
         let client = CloudSyncClient::new(&server.uri(), "proj", None, None).unwrap();
         let entries = client.pull_since(None).await.unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// Only 404 (project not yet created) reads as "nothing to pull". A real
+    /// server error (500, or any other non-2xx/404 status) must surface as
+    /// `Err`, not be swallowed the same way — a caller looping pages (see
+    /// `pull_and_apply_since` in spelunk-cli) depends on this distinction to
+    /// tell "server has nothing yet" apart from "the request actually
+    /// failed mid-pagination".
+    #[tokio::test]
+    async fn pull_since_server_error_propagates_distinct_from_the_404_empty_case() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/projects/proj/memory/since"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = CloudSyncClient::new(&server.uri(), "proj", None, None).unwrap();
+        let err = client
+            .pull_since(None)
+            .await
+            .expect_err("a 500 must not be treated as an empty page like a 404 is");
+        assert!(format!("{err:#}").contains("memory/since"), "err: {err:#}");
     }
 
     #[tokio::test]
@@ -662,6 +944,21 @@ mod tests {
         assert!(
             CloudSyncClient::new("http://localhost:7777", "proj", Some("secret"), None).is_ok()
         );
+    }
+
+    #[test]
+    fn new_with_key_rejects_spoofed_loopback_authorities() {
+        for url in [
+            "http://127.0.0.1.evil.example",
+            "http://127.0.0.1@evil.example",
+            "http://127.0.0.1:1234@evil.example",
+        ] {
+            let err = match CloudSyncClient::new(url, "proj", Some("secret"), None) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{url} must not be accepted as loopback"),
+            };
+            assert!(err.contains("plaintext http"), "{url}: {err}");
+        }
     }
 
     #[test]

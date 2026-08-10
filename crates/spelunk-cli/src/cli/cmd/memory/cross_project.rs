@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::registry::{Project, Registry};
 use crate::storage::memory::Note;
-use crate::storage::{LocalMemoryBackend, MemoryBackend, MemoryStore};
+use crate::storage::{LocalMemoryBackend, MemoryBackend, MemoryStore, NoteId};
 
 /// Cross-cutting kinds that are eligible for cross-project surfacing (§1 ADR-003).
 const CROSS_CUTTING_KINDS: &[&str] = &["decision", "requirement"];
@@ -124,7 +124,7 @@ fn is_cross_cutting(tags: &[String]) -> bool {
 /// list order.
 pub(crate) async fn collect_dep_cross_cutting(
     index_db_path: &Path,
-    seen: &mut std::collections::HashSet<(String, i64)>,
+    seen: &mut std::collections::HashSet<(String, NoteId)>,
 ) -> Vec<Note> {
     let deps = resolve_dep_projects(index_db_path);
     let mut result = Vec::new();
@@ -132,7 +132,7 @@ pub(crate) async fn collect_dep_cross_cutting(
         let root_key = dep.root_path.to_string_lossy().into_owned();
         for note in query_dep_cross_cutting(dep).await {
             // Deduplicate by (source project root, entry id).
-            if seen.insert((root_key.clone(), note.id)) {
+            if seen.insert((root_key.clone(), note.id.clone())) {
                 result.push(note);
             }
         }

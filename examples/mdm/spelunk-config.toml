@@ -28,7 +28,8 @@
 server_url = "https://spelunk.internal"
 
 # Human-readable project slug. Required when server_url points at a non-loopback
-# host. The CLI resolves the slug to the server's internal id on first use.
+# host. It is sent to the server exactly as configured, slug or UUID: nothing is
+# looked up and nothing is cached.
 project_id = "acme/my-app"
 
 # Sync mode: "offline" | "local_first" | "cloud_first".
@@ -37,12 +38,13 @@ project_id = "acme/my-app"
 # fleet to always behave the same way regardless of server reachability.
 mode = "local_first"
 
-# --- Optional: point at your own inference endpoint --------------------------
-# By default spelunk-server bundles a native embedder, so most fleets leave
-# these unset. Set them only if you run a shared OpenAI-compatible endpoint
-# (LM Studio, Ollama, vLLM, ...) for embeddings/LLM.
-# embedding_model = "text-embedding-embeddinggemma-300m-qat"
-# llm_model       = "google/gemma-3n-e4b"
+# --- Optional: point at your own LLM endpoint ---------------------------------
+# Embeddings have no config here: the model and its compute path are pinned
+# product-wide to spelunk-server's bundled native embedder. LLM features
+# (explore, summaries, harvest) are different: the server has no LLM of its
+# own, so set this only if you run a shared OpenAI-compatible chat-completions
+# endpoint (LM Studio, Ollama, vLLM, ...) for the server to use.
+# llm_model = "google/gemma-3n-e4b"
 
 # --- Optional: git-notes memory ----------------------------------------------
 # `spelunk memory add` also appends entries to refs/notes/spelunk by default.

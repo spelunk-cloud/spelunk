@@ -291,6 +291,20 @@ is safe: chunks without embeddings remain in the DB and will be embedded on
 the next `spelunk index` run. Phase 1 is never re-run for unchanged files
 (blake3 hash check is unaffected).
 
+Phase 1 itself is also crash-safe. The content-hash write and the chunk
+writes are not spanned by one transaction, so a kill between them can leave a
+file recorded as hash-current with zero chunks. `Database::file_has_chunks`
+(`storage/files.rs`) makes the skip check require actual stored chunks, not
+just a matching hash, so the next plain run detects that half-indexed state
+and reprocesses the file instead of skipping it forever.
+
+The whole `spelunk index` process, both phases, is serialized per project by
+a cross-process advisory lock (`cli/cmd/index/run_lock.rs`), taken as the
+first thing a run does and released on process exit. Two concurrent runs
+against the same project previously could interleave writes and corrupt
+`index.db`; a second run that finds the lock held now exits immediately with
+a clean error instead of racing the first run's writes.
+
 Progress output during Phase 2:
 
 ```

@@ -1,0 +1,19 @@
+{
+  "capabilities": [
+    "memory"
+  ],
+  "embedder": {
+    "detail": "loading embedding model",
+    "state": "loading"
+  },
+  "embedding_dim": 0,
+  "instance_id": "019fa798-b3e2-7a53-8f02-f08253d55299",
+  "limits": {
+    "embed_request_timeout_secs": 1800,
+    "embedder_token_cap": null,
+    "max_batch_chunks": 256
+  },
+  "started_by": 501,
+  "status": "ok",
+  "version": "0.9.5"
+}

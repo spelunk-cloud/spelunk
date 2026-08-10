@@ -13,11 +13,11 @@ pub(super) async fn memory_supersede(
     backend_override: Option<&str>,
 ) -> Result<()> {
     let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
-    let Some(new_note) = backend.get(args.new_id).await? else {
+    let Some(new_note) = backend.get(args.new_id.clone()).await? else {
         anyhow::bail!("No memory entry with id {} (new).", args.new_id);
     };
     if backend
-        .supersede(args.old_id, args.new_id)
+        .supersede(args.old_id.clone(), args.new_id.clone())
         .await
         .map_err(backend_err)?
     {
@@ -37,7 +37,7 @@ pub(super) async fn memory_supersede(
         // never reaches here: `supersede` above already returned `Err`).
         let write_through = cfg.store_in_git_notes && backend_override != Some("git-notes");
         if write_through {
-            match backend.get(args.old_id).await {
+            match backend.get(args.old_id.clone()).await {
                 Ok(Some(old_note)) => {
                     let new_entity_id = note_entity_id(&new_note);
                     let invalid_at = old_note.invalid_at.or_else(|| Some(now_secs()));

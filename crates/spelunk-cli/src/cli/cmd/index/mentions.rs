@@ -277,7 +277,7 @@ pub(super) fn extract_mention_tokens(content: &str, language: &str) -> Vec<Strin
 
     for i in 0..=n {
         let ch = if i < n { chars[i] } else { ' ' };
-        let is_ident = ch.is_ascii_alphanumeric() || ch == '_';
+        let is_ident = ch.is_alphanumeric() || ch == '_';
 
         if is_ident {
             if start.is_none() {
@@ -285,9 +285,11 @@ pub(super) fn extract_mention_tokens(content: &str, language: &str) -> Vec<Strin
             }
         } else if let Some(s) = start.take() {
             let tok: String = chars[s..i].iter().collect();
-            // Keep tokens that look like symbols: 3-50 chars, not all digits, not a stopword
-            if tok.len() >= 3
-                && tok.len() <= 50
+            // Keep tokens that look like symbols: 3-50 chars, not all digits, not a stopword.
+            // Length is counted in chars, not bytes, so multibyte identifiers are bounded
+            // the same as ASCII ones.
+            let len = tok.chars().count();
+            if (3..=50).contains(&len)
                 && !tok.chars().all(|c| c.is_ascii_digit())
                 && !stop.contains(tok.as_str())
                 && seen.insert(tok.clone())
@@ -407,6 +409,42 @@ fn getDirectoryTree(dirPath: string) { const subTree = walk(dirPath); return sub
         for stopword in ["fn", "let", "pub", "self"] {
             assert!(!tokens.iter().any(|t| t == stopword));
         }
+    }
+
+    #[test]
+    fn extract_mention_tokens_keeps_non_ascii_identifiers() {
+        let content = "fn función() { let número = 1; procesar(número); } fn 日本語() {}";
+        let tokens = extract_mention_tokens(content, "rust");
+        for real in ["función", "número", "procesar", "日本語"] {
+            assert!(
+                tokens.iter().any(|t| t == real),
+                "missing expected token: {real}"
+            );
+        }
+        // The old ASCII-only scanner split these at the first non-ASCII byte,
+        // yielding these fragments instead of the whole identifier.
+        for fragment in ["funci", "mero"] {
+            assert!(
+                !tokens.iter().any(|t| t == fragment),
+                "unexpected truncated token: {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_mention_tokens_char_length_bound_and_digits() {
+        let content = "let n = 12345; call(日本, café);";
+        let tokens = extract_mention_tokens(content, "rust");
+        assert!(tokens.iter().any(|t| t == "café"));
+        assert!(tokens.iter().any(|t| t == "call"));
+        assert!(
+            !tokens.iter().any(|t| t == "日本"),
+            "two-char identifier is below the 3-char minimum"
+        );
+        assert!(
+            !tokens.iter().any(|t| t == "12345"),
+            "all-digit tokens are dropped"
+        );
     }
 
     #[test]

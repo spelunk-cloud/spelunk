@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: ["main"]
 
+# Deny by default; every job below grants only what it needs. None of these
+# jobs push commits, comment on PRs, or create releases, so `contents: read`
+# (checkout only) covers all of them.
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
   # Force the file-backed secret store in all CI runs. The OS keychain
@@ -22,15 +27,20 @@ jobs:
   check:
     name: Check & Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
     env:
       # clippy/check/build in this job need no debug info from the dev
-      # profile; the full workspace build (all-targets, rich-formats, incl.
-      # the embedder dep tree) has been observed to exhaust runner disk
-      # (ENOSPC) with debug info on. Mirrors CARGO_PROFILE_TEST_DEBUG below.
+      # profile; the full workspace build (rich-formats, incl. the embedder
+      # dep tree) has been observed to exhaust runner disk (ENOSPC) with debug
+      # info on. Mirrors CARGO_PROFILE_TEST_DEBUG below.
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v7
+
+      - name: Git isolation lint
+        run: scripts/check-git-isolation.sh
 
       - name: Disk usage (baseline)
         run: df -h
@@ -61,14 +71,19 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
+      # --lib --bins --tests --benches (not --all-targets): examples are never
+      # part of the regular build/lint/test gates. Several examples
+      # (chunk_quality_eval, embed_bench) directly depend on the native
+      # embedder and are meant to be run explicitly with the right features,
+      # not swept in by a workspace-wide command that doesn't grant them.
       - name: Clippy (rich-formats)
-        run: cargo clippy --all-targets --features rich-formats -- -D warnings
+        run: cargo clippy --lib --bins --tests --benches --features rich-formats -- -D warnings
 
       - name: Check (rich-formats)
-        run: cargo check --all-targets --features rich-formats
+        run: cargo check --lib --bins --tests --benches --features rich-formats
 
       - name: Build (rich-formats)
-        run: cargo build --all-targets --features rich-formats
+        run: cargo build --lib --bins --tests --benches --features rich-formats
 
       - name: Disk usage (after build)
         if: always()
@@ -77,6 +92,8 @@ jobs:
   test:
     name: Test
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     timeout-minutes: 30
     env:
       # Test binaries don't need full debug info; this shrinks compile times
@@ -127,20 +144,33 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # `-v2` bump abandons the poisoned pre-2026-06-24 macOS caches that
-          # held stale native-embedder link directives. Keep restore-keys on the
-          # same `-v2-` prefix so we never fall back into a poisoned cache.
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          # `-v3` bump abandons the pre-2026-07-31 caches, which still carry
+          # `target/` artifacts for candle/candle-transformers linked into
+          # spelunk-cli (whole extra test binaries, on Windows a full
+          # companion `.pdb` per binary) from before that dependency edge was
+          # dropped: spelunk-cli now only reaches the embedder over HTTP. The
+          # `Cargo.lock` change that dropped it wasn't enough on its own to
+          # shed those artifacts, because `restore-keys` matches on prefix:
+          # every run kept rehydrating the same bloated `target/` and layering
+          # new output on top of it, since cargo has no built-in GC for
+          # artifacts of a dependency edge that no longer exists. Same reason
+          # as the earlier `-v1` -> `-v2` bump (poisoned macOS native-embedder
+          # caches): jump the prefix so restore-keys can't fall back into what
+          # it's meant to abandon.
+          key: ${{ runner.os }}-cargo-v3-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v2-
+            ${{ runner.os }}-cargo-v3-
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-nextest
 
+      # --lib --bins --tests --benches (not the nextest default, which also
+      # builds examples): examples are never part of the regular test gate,
+      # see the Check & Lint job's Clippy step comment above.
       - name: Run tests
-        run: cargo nextest run ${{ matrix.test-flags }}
+        run: cargo nextest run --lib --bins --tests --benches ${{ matrix.test-flags }}
 
       - name: Run doctests
         run: cargo test --doc ${{ matrix.test-flags }}
@@ -148,6 +178,8 @@ jobs:
   release-scripts:
     name: Release script tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -160,6 +192,8 @@ jobs:
   docker-build:
     name: Docker image build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     # The image compiles the release server (candle embedder) from scratch with
     # no cargo cache, so allow a generous ceiling.
     timeout-minutes: 45
@@ -220,6 +254,8 @@ jobs:
   openapi-snapshot:
     name: OpenAPI snapshot check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

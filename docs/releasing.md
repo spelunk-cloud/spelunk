@@ -43,7 +43,40 @@ Two install paths live outside this workflow:
 > hardware six years ago. Intel Mac users build from source (see
 > `docs/building.md`).
 
-## Cutting a release
+## Local dry run before tagging
+
+The release workflow only triggers on a pushed `v*.*.*` tag: there is no
+`workflow_dispatch`, so the packaging pipeline (glibc-floor container build,
+the `.deb`'s `dpkg-shlibdeps`-derived `Depends`, and the floor install/smoke
+test) otherwise gets exercised for the first time at real tag-push, after
+which a passing run cascades straight into a GitHub Release and the
+Homebrew/Scoop publish steps.
+
+`scripts/release-dry-run.sh` reproduces the Linux x86_64 leg of that
+pipeline locally, with Docker as the only prerequisite:
+
+```bash
+scripts/release-dry-run.sh
+```
+
+It builds `spelunk` + `spelunk-server` inside `debian:11` (the glibc 2.31
+floor), runs the same glibc-ceiling check as CI, assembles and builds the
+`.deb` (with `Depends` derived inside `debian:11`, matching the workflow),
+and installs + smoke-tests the result in fresh `debian:11` / `ubuntu:20.04`
+/ `ubuntu:24.04` containers.
+
+**What it proves:** the Linux x86_64 build links against the glibc floor,
+the `.deb` installs and its shipped binaries actually run (not just link)
+on the support floor.
+
+**What it does not prove:** macOS/Windows builds, the arm64 Linux leg, the
+real GitHub Release, or the Homebrew/Scoop publish steps. Those are only
+exercised by `.github/workflows/release.yml` at real tag-push time. The
+script has no code path that can create a GitHub release, push to the
+`homebrew-spelunk` tap, or write `bucket/spelunk.json`.
+
+Run it before tagging; a failure here is cheaper to fix than one discovered
+after a tag is already pushed.
 
 ### 1. Bump the version in `Cargo.toml`
 

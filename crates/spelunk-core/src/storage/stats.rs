@@ -124,34 +124,52 @@ impl Database {
             .context("querying language stats")
     }
 
-    /// Sample up to `n` random files and compare on-disk blake3 hashes to stored hashes.
-    /// Designed to be fast (<10 ms for n=20).
-    pub fn sample_staleness_check(&self, n: usize) -> Result<StalenessReport> {
+    /// Compare stored file hashes against on-disk content, resolving each stored
+    /// path against `root`.
+    ///
+    /// Indexed paths are stored *relative* to the project root, so `root` must be
+    /// the root they hang off: the cwd for an in-project probe, but the linked
+    /// project's own root for the cross-project check (`links check` / `links
+    /// list`), which runs from a different directory. Passing the wrong root
+    /// resolves every file to a nonexistent path and misreports it as changed. A
+    /// legacy absolute stored path is returned unchanged by `Path::join`.
+    ///
+    /// `sample`: `Some(n)` probes up to `n` random files (a fast estimate);
+    /// `None` checks every indexed file.
+    pub fn staleness_report(
+        &self,
+        root: &std::path::Path,
+        sample: Option<usize>,
+    ) -> Result<StalenessReport> {
         let last_indexed_at: Option<i64> = self
             .conn
             .query_row("SELECT MAX(indexed_at) FROM files", [], |r| r.get(0))
             .ok()
             .flatten();
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, path, hash FROM files ORDER BY RANDOM() LIMIT ?1")?;
-        let rows = stmt.query_map(rusqlite::params![n as i64], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
+        let row = |r: &rusqlite::Row| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?));
+        let sampled_rows: Vec<(String, String)> = match sample {
+            Some(n) => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT path, hash FROM files ORDER BY RANDOM() LIMIT ?1")?;
+                stmt.query_map(rusqlite::params![n as i64], row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = self.conn.prepare("SELECT path, hash FROM files")?;
+                stmt.query_map([], row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
 
-        let sampled_rows: Vec<(i64, String, String)> =
-            rows.collect::<rusqlite::Result<Vec<_>>>()?;
         let sampled = sampled_rows.len();
         let mut stale = 0usize;
         let mut stale_paths: Vec<String> = Vec::new();
 
-        for (_id, path, stored_hash) in &sampled_rows {
-            let is_stale = match std::fs::read(path) {
+        for (path, stored_hash) in &sampled_rows {
+            let on_disk = root.join(path);
+            let is_stale = match std::fs::read(&on_disk) {
                 Ok(bytes) => format!("{}", blake3::hash(&bytes)) != *stored_hash,
                 Err(_) => true,
             };
@@ -277,4 +295,114 @@ pub fn record_usage_at(db_path: &Path, command: &str) {
         "INSERT INTO usage (command, called_at) VALUES (?1, ?2)",
         rusqlite::params![command, now],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Database;
+    use std::sync::OnceLock;
+
+    // `Database::open` creates a `vec0` virtual table, which requires the
+    // sqlite-vec extension to be registered before any connection is opened.
+    fn register_sqlite_vec() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            #[allow(clippy::missing_transmute_annotations)]
+            unsafe {
+                rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                    sqlite_vec::sqlite3_vec_init as *const (),
+                )));
+            }
+        });
+    }
+
+    fn open_db() -> Database {
+        register_sqlite_vec();
+        Database::open(std::path::Path::new(":memory:")).expect("open in-memory Database")
+    }
+
+    // Index `rel` under `root`: write the file and store the root-relative path
+    // plus the real blake3 hash of its content, exactly as the indexer does.
+    fn seed_indexed_file(db: &Database, root: &std::path::Path, rel: &str, content: &[u8]) {
+        std::fs::write(root.join(rel), content).expect("write file");
+        let hash = format!("{}", blake3::hash(content));
+        db.upsert_file(rel, Some("rust"), &hash, 0).expect("upsert");
+    }
+
+    // A freshly-indexed file, probed against its own root, is not stale — for
+    // both the sampled and the exhaustive form.
+    #[test]
+    fn fresh_index_reports_no_stale_files() {
+        let db = open_db();
+        let root = tempfile::TempDir::new().unwrap();
+        seed_indexed_file(&db, root.path(), "shared.rs", b"pub fn shared() {}\n");
+
+        let sampled = db.staleness_report(root.path(), Some(5)).unwrap();
+        let exhaustive = db.staleness_report(root.path(), None).unwrap();
+
+        assert_eq!(sampled.sampled, 1);
+        assert_eq!(sampled.stale, 0, "fresh file must not be stale (sampled)");
+        assert_eq!(exhaustive.stale, 0, "fresh file must not be stale (all)");
+        assert!(sampled.stale_paths.is_empty());
+    }
+
+    // Root resolution is the whole bug: the same fresh index probed against the
+    // WRONG root (a different project's cwd) sees every file as missing/changed.
+    // This is exactly what the cross-project `links check` used to do.
+    #[test]
+    fn wrong_root_misreports_every_file_as_stale() {
+        let db = open_db();
+        let root = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        seed_indexed_file(&db, root.path(), "shared.rs", b"pub fn shared() {}\n");
+
+        let correct = db.staleness_report(root.path(), None).unwrap();
+        let wrong = db.staleness_report(other.path(), None).unwrap();
+
+        assert_eq!(correct.stale, 0, "correct root is fresh");
+        assert_eq!(
+            wrong.stale, wrong.sampled,
+            "wrong root resolves every file to a nonexistent path"
+        );
+        assert!(wrong.sampled > 0);
+    }
+
+    // A file modified since indexing is stale; a deleted one is too. The
+    // sampled and exhaustive forms agree on the verdict.
+    #[test]
+    fn modified_and_deleted_files_report_stale() {
+        let db = open_db();
+        let root = tempfile::TempDir::new().unwrap();
+        seed_indexed_file(&db, root.path(), "a.rs", b"fn a() {}\n");
+        seed_indexed_file(&db, root.path(), "b.rs", b"fn b() {}\n");
+
+        // Modify a.rs, delete b.rs.
+        std::fs::write(root.path().join("a.rs"), b"fn a() { changed }\n").unwrap();
+        std::fs::remove_file(root.path().join("b.rs")).unwrap();
+
+        let exhaustive = db.staleness_report(root.path(), None).unwrap();
+        assert_eq!(exhaustive.sampled, 2);
+        assert_eq!(
+            exhaustive.stale, 2,
+            "both a modified and a deleted file are stale"
+        );
+
+        let sampled = db.staleness_report(root.path(), Some(5)).unwrap();
+        assert_eq!(
+            sampled.stale, sampled.sampled,
+            "sampled probe agrees every sampled file is stale"
+        );
+    }
+
+    // An empty index is fresh, never stale (guards the 0-file edge case behind
+    // the CI gate).
+    #[test]
+    fn empty_index_is_fresh() {
+        let db = open_db();
+        let root = tempfile::TempDir::new().unwrap();
+        let report = db.staleness_report(root.path(), None).unwrap();
+        assert_eq!(report.sampled, 0);
+        assert_eq!(report.stale, 0);
+        assert_eq!(report.estimated_stale_pct, 0.0);
+    }
 }

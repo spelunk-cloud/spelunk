@@ -28,10 +28,26 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use tempfile::TempDir;
 
-/// A `git` invocation in `dir` with an isolated identity and config.
-fn git_cmd(dir: &Path) -> std::process::Command {
+// A `git` invocation in `dir` with an isolated identity and config.
+//
+// `git push` and `git commit` here can run an installed spelunk hook, which
+// execs a spelunk child. Anything this helper leaves unset is inherited from
+// the test process, so the child's config dir and secret store have to be
+// pinned on the git command itself: pinning them on the spelunk commands a test
+// runs directly leaves the hook's child ambient.
+//
+// `HOME` alone is not enough, because `spelunk_config_dir()` returns
+// `SPELUNK_CONFIG_DIR` before it consults `dirs::home_dir()`. A runner that
+// exports `SPELUNK_CONFIG_DIR` to isolate the suite from a developer's own
+// config would otherwise win over `HOME` and point the hook's child at a
+// directory no test seeded.
+fn git_cmd(home: &Path, dir: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(dir)
+        .env("HOME", home)
+        .env("SPELUNK_CONFIG_DIR", home.join(".config").join("spelunk"))
+        .env("SPELUNK_SECRET_STORE", "file")
+        .env_remove("XDG_CONFIG_HOME")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@example.com")
         .env("GIT_COMMITTER_NAME", "t")
@@ -41,12 +57,12 @@ fn git_cmd(dir: &Path) -> std::process::Command {
     cmd
 }
 
-fn git_out(dir: &Path, args: &[&str]) -> Output {
-    git_cmd(dir).args(args).output().expect("spawn git")
+fn git_out(home: &Path, dir: &Path, args: &[&str]) -> Output {
+    git_cmd(home, dir).args(args).output().expect("spawn git")
 }
 
-fn git(dir: &Path, args: &[&str]) -> Output {
-    let out = git_out(dir, args);
+fn git(home: &Path, dir: &Path, args: &[&str]) -> Output {
+    let out = git_out(home, dir, args);
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -55,17 +71,17 @@ fn git(dir: &Path, args: &[&str]) -> Output {
     out
 }
 
-fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    String::from_utf8_lossy(&git_out(dir, args).stdout)
+fn git_stdout(home: &Path, dir: &Path, args: &[&str]) -> String {
+    String::from_utf8_lossy(&git_out(home, dir, args).stdout)
         .trim()
         .to_string()
 }
 
-/// The hooks directory git itself resolves for `dir` (honors `core.hooksPath`
-/// and worktrees). The independent reference the tests check installs
-/// against, rather than re-deriving spelunk's own resolution logic.
-fn git_hooks_dir(dir: &Path) -> PathBuf {
-    let raw = git_stdout(dir, &["rev-parse", "--git-path", "hooks"]);
+// The hooks directory git itself resolves for `dir` (honors `core.hooksPath`
+// and worktrees). The independent reference the tests check installs
+// against, rather than re-deriving spelunk's own resolution logic.
+fn git_hooks_dir(home: &Path, dir: &Path) -> PathBuf {
+    let raw = git_stdout(home, dir, &["rev-parse", "--git-path", "hooks"]);
     let path = PathBuf::from(raw);
     if path.is_absolute() {
         path
@@ -74,14 +90,14 @@ fn git_hooks_dir(dir: &Path) -> PathBuf {
     }
 }
 
-/// A repo with a real identity and one commit.
-fn init_repo(dir: &Path) {
-    git(dir, &["init", "-q", "-b", "main"]);
-    git(dir, &["config", "user.email", "t@example.com"]);
-    git(dir, &["config", "user.name", "Test"]);
+// A repo with a real identity and one commit.
+fn init_repo(home: &Path, dir: &Path) {
+    git(home, dir, &["init", "-q", "-b", "main"]);
+    git(home, dir, &["config", "user.email", "t@example.com"]);
+    git(home, dir, &["config", "user.name", "Test"]);
     std::fs::write(dir.join("f.txt"), "x\n").unwrap();
-    git(dir, &["add", "."]);
-    git(dir, &["commit", "-q", "-m", "init"]);
+    git(home, dir, &["add", "."]);
+    git(home, dir, &["commit", "-q", "-m", "init"]);
 }
 
 /// A `spelunk` command with an isolated HOME and no server contact.
@@ -122,8 +138,9 @@ fn install_post_commit_lands_at_the_core_hooks_path_location() {
     let custom_hooks = tmp.path().join("external-hooks");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::create_dir_all(&custom_hooks).unwrap();
-    init_repo(&repo);
+    init_repo(home.path(), &repo);
     git(
+        home.path(),
         &repo,
         &["config", "core.hooksPath", custom_hooks.to_str().unwrap()],
     );
@@ -131,7 +148,7 @@ fn install_post_commit_lands_at_the_core_hooks_path_location() {
     // Setup control: confirm git itself resolves hooks to the custom dir, so
     // the assertions below are about the real target, not a guess.
     assert_eq!(
-        git_hooks_dir(&repo),
+        git_hooks_dir(home.path(), &repo),
         custom_hooks,
         "setup: git must resolve hooks to the custom dir"
     );
@@ -167,11 +184,20 @@ fn pre_push_hook_installed_at_core_hooks_path_is_actually_invoked_by_git_push() 
     std::fs::create_dir_all(&dev).unwrap();
     std::fs::create_dir_all(&custom_hooks).unwrap();
 
-    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
-    init_repo(&dev);
-    git(&dev, &["remote", "add", "origin", origin.to_str().unwrap()]);
-    git(&dev, &["push", "-q", "-u", "origin", "main"]);
     git(
+        home.path(),
+        &origin,
+        &["init", "-q", "--bare", "-b", "main"],
+    );
+    init_repo(home.path(), &dev);
+    git(
+        home.path(),
+        &dev,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(home.path(), &dev, &["push", "-q", "-u", "origin", "main"]);
+    git(
+        home.path(),
         &dev,
         &["config", "core.hooksPath", custom_hooks.to_str().unwrap()],
     );
@@ -192,15 +218,15 @@ fn pre_push_hook_installed_at_core_hooks_path_is_actually_invoked_by_git_push() 
 
     memory_add(home.path(), &dev, "custom-hooks-path-decision");
     std::fs::write(dev.join("f2.txt"), "y\n").unwrap();
-    git(&dev, &["add", "."]);
-    git(&dev, &["commit", "-q", "-m", "second"]);
-    git(&dev, &["push", "-q", "origin", "main"]);
+    git(home.path(), &dev, &["add", "."]);
+    git(home.path(), &dev, &["commit", "-q", "-m", "second"]);
+    git(home.path(), &dev, &["push", "-q", "origin", "main"]);
 
     // The proof that matters: git actually ran the hook from the custom
     // location, so the notes ref reached origin. A hook that only exists on
     // disk but is never invoked would leave this ref absent.
     assert!(
-        git_out(&origin, &["rev-parse", "refs/notes/spelunk"])
+        git_out(home.path(), &origin, &["rev-parse", "refs/notes/spelunk"])
             .status
             .success(),
         "the pre-push hook installed at the core.hooksPath location must \
@@ -223,8 +249,9 @@ fn init_summary_agrees_with_pre_push_installer_when_core_hooks_path_is_set() {
     let custom_hooks = tmp.path().join("external-hooks");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::create_dir_all(&custom_hooks).unwrap();
-    init_repo(&repo);
+    init_repo(home.path(), &repo);
     git(
+        home.path(),
         &repo,
         &["config", "core.hooksPath", custom_hooks.to_str().unwrap()],
     );
@@ -276,8 +303,8 @@ fn install_refuses_when_core_hooks_path_is_inside_the_tracked_working_tree() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    init_repo(&repo);
-    git(&repo, &["config", "core.hooksPath", ".husky"]);
+    init_repo(home.path(), &repo);
+    git(home.path(), &repo, &["config", "core.hooksPath", ".husky"]);
 
     let out = bin(home.path(), &repo)
         .args(["hooks", "install"])
@@ -311,8 +338,9 @@ fn install_still_succeeds_when_core_hooks_path_is_outside_the_repository() {
     let custom_hooks = tmp.path().join("outside-hooks");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::create_dir_all(&custom_hooks).unwrap();
-    init_repo(&repo);
+    init_repo(home.path(), &repo);
     git(
+        home.path(),
         &repo,
         &["config", "core.hooksPath", custom_hooks.to_str().unwrap()],
     );
@@ -350,10 +378,11 @@ fn hooks_resolve_to_the_shared_main_repo_hooks_dir_from_a_linked_worktree() {
     let base = spelunk_core::utils::canonicalize(tmp.path());
     let main_root = base.join("main");
     std::fs::create_dir_all(&main_root).unwrap();
-    init_repo(&main_root);
+    init_repo(home.path(), &main_root);
 
     let linked = base.join("linked");
     git(
+        home.path(),
         &main_root,
         &[
             "worktree",
@@ -367,7 +396,7 @@ fn hooks_resolve_to_the_shared_main_repo_hooks_dir_from_a_linked_worktree() {
 
     // Setup control: confirm git itself shares the hooks dir across worktrees.
     assert_eq!(
-        git_hooks_dir(&linked),
+        git_hooks_dir(home.path(), &linked),
         main_root.join(".git").join("hooks"),
         "setup: git must resolve a linked worktree's hooks to the main repo's"
     );

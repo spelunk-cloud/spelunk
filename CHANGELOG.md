@@ -9,6 +9,502 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`spelunk-export`, a standalone tool that writes a portable dump of a local
+  store.** The dump is line-delimited JSON, one record per line, expressed as
+  entities and relationships rather than as a copy of any table, and readable
+  without special tooling. Stores are opened read-only and are never modified.
+  Only authored data is carried: full-text indexes, embeddings and import
+  cursors all regenerate, so carrying them would only risk carrying stale state
+  forward. Every table is read inside a single read transaction, so a dump is a
+  consistent point-in-time view of the whole store.
+
+  An `inventory` subcommand reports what a store holds without touching it.
+
+## [0.9.7] — 2026-08-05
+
+### Added
+
+- **`spelunk sync` now propagates `relates_to` links to a hosted project.**
+  `memory add --relates-to` records the link locally, but sync never sent it
+  upstream, so a shared knowledge graph showed related entries as unconnected
+  nodes. Sync now pushes those links as part of the normal push, once both ends
+  of a link have themselves synced, and posts nothing when there is nothing new.
+  Link push is best-effort: a failure warns and is retried on a later sync
+  rather than failing the entry push. `supersedes` links continue to travel with
+  their entry, and `contradicts` links are still generated server-side.
+
+### Changed
+
+- **The team `spelunk-server`'s memory read endpoints now return an object
+  envelope instead of a bare JSON array.** `GET /memory` and `POST
+  /memory/search` return `{ "entries": [...], "total": N }`, and `GET
+  /memory/harvested-shas` returns `{ "shas": [...] }`. A JSON response root is
+  now always an object, never a bare array (ADR-076: the memory wire contract).
+
+  The CLI reads both shapes, so a newer CLI keeps working against an older team
+  server across the version-skew support window. A CLI released before this
+  change cannot read the envelope from a newer server on these three endpoints;
+  upgrade the CLI to match. See `docs/version-skew.md`. The `GET
+  /memory/since?t=` legacy mode is unchanged, and still returns a bare array.
+
+### Fixed
+
+- **Symbols with non-ASCII characters are now reachable from `spelunk graph`.**
+  A reference to a symbol such as `café` was split at the first non-ASCII
+  character into a fragment that matched nothing, so non-ASCII identifiers
+  produced no graph edges and were invisible to reverse lookups, even though
+  their definitions were indexed correctly. Identifiers now accept Unicode
+  alphanumerics, and the length bound counts characters rather than bytes so
+  multibyte names are bounded the same way as ASCII ones. Re-index to pick up
+  edges for existing code.
+- **`spelunk links check` / `spelunk links list` no longer report a freshly
+  indexed linked project as stale.** The cross-project freshness probe resolved
+  each linked index's stored (root-relative) file paths against the *linking*
+  project's working directory instead of the linked project's own root, so every
+  sampled file looked "changed" and the documented CI gate ("`links check` exits
+  non-zero if any linked index is stale or missing") false-failed on a clean
+  checkout. Both the cross-project probe and the in-project `spelunk check` now
+  run through one shared staleness function anchored at the correct project root,
+  so they agree: a freshly indexed linked project reports fresh, while a linked
+  project with a file modified since indexing still reports stale.
+- **A teammate's fetched memory now reaches the default `memory.db` read
+  paths, not just the git ref.** Team memory lives on git notes
+  (`refs/notes/spelunk`) and is queried through the project's SQLite
+  `memory.db`, but nothing imported a fetched teammate's notes into that store
+  except `spelunk init`, so their newly-published entries stayed invisible on
+  the default read path until a manual re-`init`. Now `memory list`, `memory
+  search`, `memory show`, and `context` fold the fetched tracking ref into your
+  notes and import it into `memory.db` — but only when the notes ref has moved
+  since the last import, gated by an OID marker persisted in `memory.db`, so the
+  steady-state read spawns no git subprocess and does no import walk. `memory
+  search` and `memory show` previously did not consult the tracking ref at all
+  and now do. Reading needs no `--backend git-notes` and no re-`init` (ADR-077).
+- **A single `spelunk init` after a clone now hydrates the team's memory.**
+  `init` configures the notes fetch refspec and does a one-time, best-effort
+  fetch of the notes ref *before* its import pass, so the fresh-clone
+  `init → git fetch → init again` dance is gone. Offline `init` still succeeds
+  and still configures the refspec; the fetch is non-fatal.
+- **`spelunk init` no longer risks silently staging `.spelunk/config.toml`.**
+  `init` writes the project slug to `.spelunk/config.toml` and takes no git
+  action on it — no `git add`, no commit — and prints a one-line reminder to
+  commit the file yourself so the slug travels with the repo. The docs describe
+  committing it as an explicit user step (ADR-077 D5).
+
+- **`spelunk memory list --source-ref <sha>` now finds entries anchored to a
+  commit by git notes, not just harvested entries.** Every entry written by
+  `spelunk memory add` (with the default git-notes write-through) is anchored to
+  a commit — its memory note is attached to that commit in `refs/notes/spelunk`
+  — but that anchor was recorded only as the git-notes attachment, never in the
+  SQLite `source_ref` column (which carries a commit SHA only for *harvested*
+  entries). `--source-ref` filtered on that column alone, so it returned zero
+  results for every commit whose entries came from `memory add`, even with the
+  notes plainly present under `git notes --ref=spelunk show <sha>`. The filter
+  now also resolves, from the notes ref, which entries are anchored to the
+  requested commit (exact SHA or prefix) and reads the authoritative local rows
+  back, so those entries are found while their ids and status stay consistent
+  with a plain `memory list`. Harvested `source_ref`-column matches are
+  unchanged. On the `--backend git-notes` (and pre-init) path the git-notes
+  backend now serves `--source-ref` directly by the same commit anchor instead
+  of returning an unsupported-operation error.
+
+- **`spelunk check --format porcelain` now emits only the stable `key=value`
+  summary on stdout.** It previously also wrote the human diagnostics — the
+  `Server: … ✓` reachability line, the "Active agent sessions" list, and the
+  `⚠ Overlap:` warning (with their Unicode glyphs) — to the same stdout stream,
+  so a script doing `spelunk check --format porcelain | while read -r line`
+  had to filter out prose. Those diagnostics now go to **stderr** in porcelain
+  mode, keeping the signal for a human watching the terminal while leaving
+  stdout machine-parseable. Text (human) mode is unchanged: the diagnostics
+  still print to stdout. Exit codes are unchanged in both modes (0 fresh,
+  1 stale).
+- **`spelunk explore` is now listed in the top-level `spelunk --help` command
+  list.** The agentic-search command was hidden from `--help` whenever no chat
+  model was configured, so a user or agent enumerating capabilities from
+  `--help` never discovered it — even though `spelunk explore --help` and the
+  command itself always worked. It now always lists, like the other commands
+  that need infrastructure the user may not have (`sync`, `login`, `org`).
+  Running `spelunk explore` without an LLM still fails with the same
+  locked-feature message as before; only its visibility in `--help` changed.
+- **`spelunk init` now git-ignores the per-run index lock (`index.lock`) and its
+  pid sidecar (`index.lock.pid`).** The generated `.spelunk/.gitignore` listed
+  the SQLite files and logs but not the lock, so a `git add -A` staged and
+  committed `index.lock.pid` — which holds a machine-local process id that churns
+  and conflicts across machines. New projects ignore both via an `index.lock*`
+  line. Existing projects (whose `.gitignore` init never overwrites) can add it
+  manually:
+
+  ```sh
+  echo "index.lock*" >> .spelunk/.gitignore
+  ```
+- **`spelunk plumbing embed` now finds a running `spelunk-server` the same way
+  every other server-backed command does.** It reported `requires
+  spelunk-server` even while a healthy local server was running and `search
+  --mode semantic` / `memory search` used it, because `embed` gated directly on
+  a configured `server_url` and skipped the capability-tier resolution the other
+  commands run. It now honours the auto-started / auto-discovered loopback
+  server (and `SPELUNK_SERVER_URL`), so `echo "text" | spelunk plumbing embed`
+  emits the vector whenever a ready server is reachable, restoring the
+  `echo … | spelunk plumbing embed --query | spelunk plumbing knn` pipeline. The
+  locked-feature error is unchanged when no server is reachable.
+- **`spelunk memory harvest` no longer crashes on a repo with fewer than 11
+  commits.** The default `HEAD~10..HEAD` range named `HEAD~10`, a commit that
+  does not exist in a shallow history, so `git log` aborted with a raw
+  `fatal: bad revision 'HEAD~10..HEAD'`. The range is now clamped to the commits
+  that actually exist (the most recent `min(10, commit_count)`, root included),
+  so harvest works on any repo with at least one commit. A custom `--git-range`
+  or `--branch` is passed through unchanged. Harvest also runs its
+  LLM-capability precheck before resolving the git range now, matching `spelunk
+  explore`: with no LLM configured the actionable locked-feature message is
+  shown regardless of repo size, rather than a raw git error on a short history.
+- **A partial `[auth]` table in `config.toml` no longer bricks every command.**
+  `[auth]` is login-managed, but `--org` is an optional scoping flag and
+  hand-editing the config is a documented workflow, so a login without an org
+  (no `org_id`) or a trimmed table left the CLI unable to run anything —
+  including commands that need no credentials (`status`, `search`, `context`).
+  Every `[auth]` field is now optional: a missing/empty `access_token` reads as
+  "not logged in" (no bearer sent), a missing `expires_at` as expired, and a
+  missing `org_id` applies no scoping, instead of a hard parse error.
+- **A `config.toml` that fails to parse now names the file, the offending key,
+  and the remedy** instead of a bare, unactionable `Error: parsing config.toml`.
+  An unrecognised `mode` value names the bad value and lists the valid modes
+  (`offline`, `local_first`, `cloud_first`), matching the `SPELUNK_MODE`
+  message.
+- **`spelunk search --mode semantic` (and `--mode hybrid`) now fail with an
+  actionable error when no server is reachable, instead of silently reporting
+  "No results found." and exiting 0.** These modes need a server to embed the
+  query, so with none reachable (including under `SPELUNK_NO_SERVER=1`) they now
+  emit the same locked-feature error as the other inference-backed commands.
+  The default `auto` mode is unchanged: it still announces its degradation and
+  falls back to ast-grep.
+- **`spelunk memory add --relates-to <id>` now records the relationship.** The
+  flag was accepted and the entry stored, but it was never wired to the edge
+  layer, so no `relates_to` edge was written and neither `memory graph` nor
+  `memory show` showed any link from either side. It now creates a `relates_to`
+  edge that is visible from both entries, and — unlike `--supersedes` — archives
+  neither of them (a relates_to link is non-superseding). A `--relates-to`
+  pointing at an id that doesn't exist is now rejected before anything is
+  written, rather than storing an entry with a dangling link.
+- **`spelunk memory add --kind` now rejects an unknown kind instead of silently
+  storing it.** Previously any string was accepted, so a typo (`--kind
+  decisions`, `--kind desicion`) stored an entry with no retrieval path. The
+  default (`note`) and every valid kind are unaffected.
+- **`spelunk search --mode text` now scores query words as independent terms
+  instead of matching the whole query as a contiguous phrase.** A multi-word
+  query ranks chunks that contain the terms in **any order**, and a chunk
+  containing more of the terms ranks above one containing fewer (BM25
+  bag-of-words, as documented). Previously the raw query was passed to FTS5 as a
+  single quoted phrase, so word order alone decided whether there was a hit —
+  e.g. `leaky bucket` matched a chunk but `bucket leaky` returned nothing.
+  Matching stays case-insensitive and unstemmed (`bursts` matches `bursts`, not
+  `burst`), following the FTS tokenizer.
+- **`spelunk logout --server <url>` no longer signs you out of spelunk.cloud.**
+- **`spelunk memory list --as-of` and `spelunk memory search --as-of` now
+  reconstruct the past correctly, without needing `--archived`.** A
+  point-in-time query asks "what was the state of memory at instant T", so it
+  must return every entry that was live at T regardless of its status today.
+  Two defects broke that. An entry superseded or archived *after* T was hidden
+  unless you also passed `--archived`, so the then-current decision went
+  missing from the very query meant to surface it. And an entry created with no
+  explicit `--valid-at` stored a NULL validity start, which the filter read as
+  "valid since forever", so entries created *after* T still appeared in queries
+  about the past. The as-of window is now exactly `valid_at <= T AND
+  (invalid_at IS NULL OR invalid_at > T)`, with a missing `valid_at` defaulting
+  to the entry's creation time, evaluated independently of archived status
+  across list, text, semantic, and hybrid search. `--archived` again controls
+  only the current-state view, orthogonal to `--as-of`.
+- **`spelunk memory timeline <topic>` now filters by the topic instead of
+  dumping the whole store.** The topic argument was ignored: every query
+  returned every entry (a nonsense topic returned the same set as a real one),
+  because the local path fetched the nearest-neighbour set sized to `--limit`
+  and, for any store smaller than the limit, that was simply everything. Timeline
+  now routes the topic through the same no-server full-text path as `memory
+  search --mode text`, so a topic returns only its related entries and an
+  unrelated topic returns none — still sorted ascending by `valid_at`, and still
+  including superseded/archived entries so you can see how understanding evolved.
+  As a bonus, `memory timeline` no longer needs a running inference server: it
+  matches on text, not embeddings.
+
+## [0.9.6] — 2026-07-31
+
+### Added
+
+- **A configurable LLM endpoint and a place to keep its credential.** You can now set `llm_url` and `llm_model` in
+  `~/.config/spelunk/config.toml`, override either with `SPELUNK_LLM_URL` /
+  `SPELUNK_LLM_MODEL` or per launch with `spelunk server start
+  --llm-url/--llm-model`, and store the endpoint's credential with `spelunk auth
+  set-key --llm` (read from stdin or a prompt, kept in the OS secret store,
+  overridable with `SPELUNK_LLM_KEY`).
+
+  `spelunk-server` gained `--llm-key` and `--llm-key-file` alongside
+  `SPELUNK_LLM_KEY`, sends a resolved credential as a bearer token upstream, and
+  refuses to start when a credential is configured against a plaintext `http://`
+  endpoint on a non-loopback host, naming the URL. That check applies only when a
+  credential is present, so an existing keyless LAN endpoint (LM Studio or Ollama
+  on your network) keeps working exactly as before, and an endpoint with no
+  credential is still sent no `Authorization` header at all.
+
+- **`mode = "cloud_first"` now serves memory against the hosted API, not only a
+  self-hosted spelunk-server.**
+
+  `project_id` may be a slug or a UUID against either peer for every memory
+  operation, including `spelunk memory show` and `spelunk memory archive`.
+
+### Changed
+
+- **A memory entry's id is now an opaque token rather than an integer.** The
+  local store and a self-hosted server number entries sequentially; the hosted
+  API identifies them by UUID, which no integer can carry. Ids are therefore
+  passed through as opaque values and narrowed back to an integer only by the
+  stores that have one. Commands that take an id accept whichever form the
+  project's own store uses, and an id from the wrong kind of store now says so
+  instead of reporting the entry as missing.
+
+  `--format json` output is unchanged for existing projects: a numeric id still
+  serializes as a JSON number, and only a non-numeric id serializes as a string.
+
+### Fixed
+
+- **`spelunk index` no longer skips every chunk summary, and says something you
+  can act on when it genuinely cannot make one.** Summaries were gated on
+  configuration that had nothing to do with whether an LLM was reachable, so
+  the summary pass was effectively off for everyone. LLM availability is now
+  decided by what your server actually reports, not by your config: if you've
+  set `llm_url` but your local server isn't currently serving an LLM, spelunk
+  asks you to restart it rather than silently falling back to a remote one.
+  `spelunk explore` and `spelunk memory harvest` share the same fix. Summaries
+  stay optional and `index` still exits 0 (`--no-summaries` silences the
+  notice); `explore` and `memory harvest` now fail loudly instead of silently
+  doing nothing.
+
+- **`spelunk server start` no longer blames your firewall for a daemon that
+  refused to start.** It waited out the full 30-second liveness timeout and then
+  suggested a firewall whatever had gone wrong, including when the daemon had
+  already exited over its own configuration. It now notices the process is gone,
+  says so immediately, and points at the log; the firewall suggestion is kept for
+  the case it actually describes, a daemon still running and still not answering.
+
+- **A written stability contract, [docs/stability.md](docs/stability.md), and
+  tests that enforce it.** Until now the plumbing JSONL schemas were held stable
+  by convention alone, and nothing stated which config keys, flags, exit codes,
+  or on-disk formats you may rely on across versions. The contract now declares,
+  per surface, whether it is stable (semver-bound, additive-only), best-effort,
+  or internal, covering CLI commands and flags, plumbing JSONL fields, the `/v1/`
+  HTTP API, `config.toml` keys, and the on-disk stores
+  (`index.db`/`memory.db` migrations, `registry.db`, git-notes
+  `schema_version`, and the `.spelunk/` layout). For config it also freezes
+  *which file* a key may be set in, which is not the same question as whether
+  the key is supported: `server_url` is ignored in the personal global config
+  and `server_key` is ignored in the checked-in project config, both
+  deliberately. It is equally explicit about what is *not* stable:
+  human-readable porcelain text, log and diagnostic output, and the internal
+  crate APIs. The structured `--format json`/`jsonl` modes of porcelain
+  commands are a third category, called out separately: `spelunk status
+  --format json` is stable for its core fields, and every other `--format`
+  mode is best-effort. A deprecation policy (alias, then warn while the alias
+  lives, then remove) sets the sequence for future changes; the removed
+  `memory_server_url` key is documented as the precedent, including where it
+  fell short of it. Enforcement is real, not aspirational: a committed golden schema
+  covers every plumbing command's JSONL output, so adding a field passes while
+  removing, renaming, or retyping one fails; exit codes 0/1/2 are asserted per
+  command, including that exit 2 leaves stdout empty; a guard derived from the
+  CLI's own help refuses to let a new plumbing command ship without a declared
+  schema; and the checker itself is tested, so it cannot pass by accepting
+  everything.
+
+- **`spelunk-server --model-dir <PATH>` (or `SPELUNK_MODEL_DIR`) loads the
+  bundled F2LLM-v2-330M embedder from a pre-provisioned local directory, with
+  zero network access.** For hosts with no route to `huggingface.co` (an
+  air-gapped network, a strict corp firewall, a build image with no egress),
+  the previous online-only Hugging Face Hub fetch had no fallback. Provision
+  the flat directory (the GGUF plus `tokenizer.json`; `config.json` is
+  optional) on a connected machine first and transfer it over; see [Server
+  setup → Air-gapped / no-egress install](docs/server-setup.md#air-gapped--no-egress-install)
+  for the full fetch-and-transfer procedure. Unset by default, so the online
+  path is unchanged for the common case.
+
+- **A version-skew support policy, [docs/version-skew.md](docs/version-skew.md),
+  and a CI job that runs two real binaries against each other.** A new `version-skew` 
+  workflow puts the current build and the previous release on a socket together in 
+  both directions and drives the full memory flow (add, list, search, push, sync, and 
+  pull into a fresh checkout), verifying each downloaded release asset against its 
+  published digest before running it.
+
+### Removed
+
+- **`SPELUNK_NO_SLUG_CACHE` no longer does anything, and
+  `.spelunk/cloud-project-id.lock` is no longer written or read.** Both existed
+  only to serve the slug-to-UUID translation removed under Fixed below. The lock
+  file was deliberately left out of `.spelunk/.gitignore` so a team would share
+  one resolved identity, so a repo that reached the hosted API this way now
+  carries a tracked file that means nothing. Delete it whenever you like:
+  nothing reads it, nothing regenerates it, and there is no migration to run,
+  because the resolver and the passthrough that replaced it key on the same
+  org-unique slug and select the same project.
+- **`spelunk-server --embedding-url` / `SPELUNK_EMBEDDING_URL` and the deprecated
+  `--embedding-model` / `SPELUNK_EMBEDDING_MODEL` no longer exist.** The
+  embedding model is pinned product-wide to the bundled native embedder
+  (F2LLM-v2-330M@896); there is no longer any way to relocate where embeddings
+  are computed, only where LLM inference runs (`--llm-url` / `--llm-model` are
+  unaffected). Starting the server with either removed flag now fails with
+  clap's unknown-argument error instead of being accepted or silently ignored;
+  the corresponding environment variables have no effect. The CLI's
+  `embedding_model` config key is also removed: `spelunk plumbing embed` now
+  always reports the pinned model id instead of a config-configurable label.
+  Existing `config.toml` files that still carry `embedding_model` continue to
+  parse unchanged (the key is silently ignored, same as other pruned keys).
+  This is a breaking change to `spelunk-server`'s CLI surface, shipped pre-1.0.
+
+### Fixed
+
+- **One unreadable field in a server's health response no longer costs you
+  every capability that server advertised.** The CLI reads `GET /v1/health` to
+  learn what a server can do. The guarantee is now that no single field can take
+  the whole body down, and it is enforced by a test that mutates every member 
+  of a recorded server response in turn.
+
+- **`spelunk memory push` and `spelunk sync` now embed what they push, so a
+  pushed entry stays findable by `spelunk memory search` locally.** A push
+  shipped entries that had never been embedded (a `memory add` with no embedder
+  running, an import, a pulled entry) and left the local `memory.db` exactly as
+  it found it. The push reported `created`, and those rows remained invisible to
+  semantic `memory search` on your own machine, with nothing saying so and no
+  hint that `spelunk memory reindex` was the cure. Both commands now embed every
+  entry in the push set that lacks a usable local vector before the batch is
+  built, through the same local embedder and the same document text
+  `memory reindex` uses, and commit each vector as it completes. Note this
+  changes nothing about what travels: `kind`, `title`, and `body` were always
+  sent on every push, and the optional vector fields are additive. What changes
+  is that the local store is left correct, and that a destination advertising
+  `accepts_pushed_vectors` can now store the entry as-is instead of re-embedding
+  it. With no local embedder reachable the push still runs to completion exactly
+  as before, text-only, and says how many entries went out unembedded and how to
+  fix them; the summary line reports how many were embedded locally. Skipped in
+  `cloud_first` mode with a `server_url` set, where `memory.db` is not the store
+  of record and `memory reindex` does not apply either. Rows that were already
+  synced are outside the push set and are not embedded by this change.
+
+- **The local `spelunk-server` no longer goes unreachable while it is
+  embedding.** During a `spelunk index` run, `/v1/health` could take seconds
+  instead of well under a millisecond, `spelunk server status` reported a
+  perfectly healthy server as `(unreachable)`, and unrelated endpoints stopped
+  answering too. The liveness probe read the embedder's per-chunk token cap
+  through the same lock the embedder holds for a whole batch of forward
+  passes, and because that read was synchronous inside an async handler it
+  tied up a request-serving thread rather than releasing it, so each
+  concurrent probe made the stall worse. The cap is fixed at model load and
+  never changes, so it no longer sits behind that lock: liveness probes,
+  `spelunk server status`, and any other endpoint now stay responsive for the
+  whole index. The `/v1/health` payload is unchanged, `limits.embedder_token_cap`
+  included.
+- **`mode = "cloud_first"` against a self-hosted team server no longer fails
+  before it starts.** With a non-loopback `server_url` and a human
+  `project_id`, every memory command tried to translate the slug into an
+  internal UUID by calling `GET /v1/projects` first, and then keyed the whole
+  session by whatever came back. A self-hosted spelunk-server keys projects by
+  the slug itself and answers that endpoint in a different shape, so the
+  translation could not succeed and the command died with a parse error before
+  touching memory at all. `project_id` is now sent exactly as configured, slug
+  or UUID: both a self-hosted server and the hosted cloud API accept either, so
+  there was never anything to translate. The documented three-line
+  `cloud_first` config works as written.
+- **`spelunk index` no longer skips a crash-half-indexed file forever.** If a
+  previous run was killed after recording a file's new content hash but
+  before writing its chunks, the hash-only skip check treated the file as
+  already up to date and never reprocessed it, silently leaving it
+  unsearchable until someone thought to pass `--force`. A plain `spelunk
+  index` now also checks that the file actually has stored chunks, so it
+  self-heals on the very next run.
+- **Two `spelunk index` runs on the same project could corrupt the index
+  database; a second run now fails cleanly instead.** Racing writes from two
+  concurrent `index` processes on the same project could reproducibly corrupt
+  `index.db`. A per-project lock now serializes runs: a second `spelunk
+  index` started while one is already in progress exits immediately with
+  `index already running (pid N), try again once it finishes` rather than
+  writing to the database alongside the first run.
+- **`spelunk search` and other read-only commands could fail with "database is
+  locked" while `spelunk index` was running.** Every database open re-stamped
+  a schema-version pragma even when nothing needed migrating, and that stamp
+  always opens a write transaction, so a purely read-only command could
+  contend for the write lock against a concurrent `index` run. Opening an
+  already-current database is now read-only.
+- **`spelunk sync` and `spelunk memory pull` no longer silently stop after
+  the server's first page of entries.** A pull request never sent an
+  explicit page size, so the server applied its own 100-entry default; on a
+  first sync into an established project with more than 100 pending
+  entries, the command reported success and printed a count, but only the
+  first page ever landed locally, with no error and no indication anything
+  was missing. Both commands share the same pull path, which now requests
+  the server's maximum page size and keeps paginating, applying each page
+  as it arrives, until a page comes back short of that size. A large first
+  sync or pull now completes fully in one command instead of requiring
+  several repeated runs to converge.
+- **`spelunk index`'s embed phase now embeds locally in `local_first` mode
+  even when a team `server_url` is configured.** Both the foreground (default)
+  embed phase and the `--detach-embed` background worker's embedder-readiness
+  poll resolved their embedding target from the raw tier-probing functions
+  (`get_tier`, `probe_tier_fresh`) instead of the mode-aware
+  `get_inference_tier`/`get_inference_tier_fresh`: a `local_first` project
+  with an explicit `server_url` sent every embed batch to that `server_url`
+  instead of the local, auto-discovered embedder, silently skipping embedding
+  when the configured server has no `/index/embed` route. Both call sites now
+  route through `get_inference_tier`/`get_inference_tier_fresh`, the same fix
+  already applied to `memory add`/`reindex`/`search`/`timeline`/`harvest`/
+  `reconcile` and `explore`. `cloud_first` is unchanged. See [ADR-004's
+  2026-07-23 amendment](docs/adr/004-unified-memory-storage.md).
+- **`spelunk sync` and `spelunk memory push` now succeed on the first sync of a
+  project that has never synced before.** A sync round always pulled before
+  pushing to avoid shadowing a concurrent write, but on a project that never
+  existed server-side yet, the pre-push pull failed with an HTTP 400 against
+  the unprovisioned project. On a first sync (detected by checking whether any
+  local entry has ever synced), the sequence now reverses: push first to
+  provision the project server-side, then run a post-push pull to converge with
+  any backlog already on the server. The fix also handles adversarial server
+  crashes during first-sync push and concurrent first-sync attempts from
+  multiple clients.
+
+### Security
+
+- **A `server_url` whose host only *looks* like loopback no longer clears the
+  plaintext-transport guard.** Deciding "is this loopback?" was a prefix test,
+  `host.starts_with("127.")`, applied to a string from which URL userinfo had
+  never been stripped. Two authority shapes therefore passed as loopback while
+  naming somebody else's host: `http://127.0.0.1.evil.example`, where the real
+  host is `evil.example` and only the leading label looks like an address, and
+  `http://127.0.0.1@evil.example`, where everything before the `@` is a
+  credential and the real host is again `evil.example`. Because that predicate
+  is what decides whether a bearer token may travel over plaintext `http://`,
+  configuring either shape sent the bearer in the clear to a host the operator
+  did not intend, at every call site that gates on it: opening a remote memory
+  backend, the sync client's keyed constructor, the CLI capability probe, and
+  the inference client. The authority is now parsed rather than pattern-matched:
+  it ends at the first `/`, `?`, `#` or `\`, userinfo is removed at the last
+  `@`, the port and IPv6 brackets are stripped, and the remaining host must be
+  `localhost` or an address literal the standard library parses and reports as
+  loopback. The backslash is part of that delimiter set because the URL parser
+  that opens the connection treats it as a path separator for `http`/`https`,
+  so `http://evil.example\@127.0.0.1` names `evil.example`, not loopback.
+  One user-visible consequence: only a full dotted quad counts as a loopback
+  literal now, so IPv4 spellings that previously rode in on the `127.` prefix
+  are rejected, whether they were invalid (`127.999.0.1`), non-canonical
+  (`0127.0.0.1`, `127.0.0.001`) or merely abbreviated (`127.1`). Write the
+  address out as `127.0.0.1` if you were using one of those. Unchanged, and
+  still deliberate: this check does no DNS resolution, so a `/etc/hosts` alias
+  that resolves to loopback but isn't spelled as a loopback literal is still
+  rejected rather than accepted.
+
+### Internal
+
+- **`memory.db` now opens through the same forward-only, `PRAGMA
+  user_version`-gated migration runner `index.db` already uses**, replacing
+  ad-hoc re-execution of the schema SQL with idempotency inferred from
+  `ALTER TABLE` error strings. A pre-existing store has its version inferred
+  once from table/column shape, then only the missing steps run; a store
+  stamped with a version newer than the binary supports refuses to open
+  instead of mis-running steps. No CLI flag, config key, or user-facing
+  behavior changed.
+
 ## [0.9.5] — 2026-07-24
 
 ### Changed

@@ -275,15 +275,14 @@ pub enum EmbedderState {
     /// Native embedder build/download in progress. Not ready — embed endpoints
     /// return `503 + Retry-After` and the CLI should keep polling.
     Loading,
-    /// Model loaded (or an external embedding backend is configured); embed
-    /// endpoints will serve.
+    /// Model loaded; embed endpoints will serve.
     Ready,
     /// The background load failed (download error, OOM, …). Terminal for this
     /// process; embed endpoints return `503` and the CLI should stop polling.
     Unavailable,
-    /// No in-process model to load — the server was built without an embedder
-    /// and has no external `--embedding-url`. Embed endpoints return `400`
-    /// (permanent misconfiguration for that request).
+    /// No in-process model to load — the server was built without the
+    /// `embed-native` feature. Embed endpoints return `400` (permanent
+    /// misconfiguration for that request).
     Disabled,
 }
 
@@ -318,8 +317,8 @@ impl EmbedderSlot {
         })))
     }
 
-    /// A slot that is immediately ready with the given backend (e.g. an external
-    /// `--embedding-url` that has no local model to warm up).
+    /// A slot that is immediately ready with the given backend (e.g. in tests,
+    /// where a mock backend has no local model to warm up).
     pub fn ready(backend: Arc<dyn spelunk_core::embeddings::EmbeddingBackend>) -> Self {
         Self(Arc::new(RwLock::new(EmbedderSlotInner {
             state: EmbedderState::Ready,
@@ -328,8 +327,8 @@ impl EmbedderSlot {
         })))
     }
 
-    /// A slot with no embedder at all (no feature / no external URL). Embed
-    /// endpoints treat this as a permanent `400` misconfiguration.
+    /// A slot with no embedder at all (built without the `embed-native`
+    /// feature). Embed endpoints treat this as a permanent `400` misconfiguration.
     pub fn disabled() -> Self {
         Self(Arc::new(RwLock::new(EmbedderSlotInner {
             state: EmbedderState::Disabled,
@@ -388,8 +387,8 @@ pub struct AppState {
     pub conflict_threshold: f32,
     /// Server-side embedder readiness cell. The native embedder loads on a
     /// background task after the listener binds, flipping this slot
-    /// `loading → ready | unavailable`; an external `--embedding-url` starts
-    /// `ready`; no embedder at all starts `disabled`. Handlers read the current
+    /// `loading → ready | unavailable`; a server built without the
+    /// `embed-native` feature starts `disabled`. Handlers read the current
     /// state without blocking. See [`EmbedderSlot`].
     pub embedder: EmbedderSlot,
     /// Bounded admission gate in front of the embedder, shared by every
@@ -460,6 +459,7 @@ pub fn default_conflict_threshold() -> f32 {
         handlers::SearchRequest,
         handlers::BoolResponse,
         handlers::CountResponse,
+        handlers::NoteListResponse,
         handlers::SupersedeRequest,
         handlers::BatchNoteItem,
         handlers::BatchPushRequest,
@@ -468,6 +468,7 @@ pub fn default_conflict_threshold() -> f32 {
         handlers::SinceQuery,
         handlers::SinceIdEntry,
         handlers::SinceIdResponse,
+        handlers::HarvestedShasResponse,
         handlers::StreamQuery,
         handlers::HealthResponse,
         handlers::EmbedderStatus,

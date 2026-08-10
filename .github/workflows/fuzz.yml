@@ -6,13 +6,28 @@ on:
     - cron: "0 9 * * 1"
   workflow_dispatch:
 
+# Deny by default; the job below only checks out and uploads its own crash
+# artifacts on failure, neither of which needs write access to the repo.
+permissions: {}
+
 jobs:
   fuzz-parser:
     name: cargo-fuzz fuzz_parser
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+
+      # The fuzz crate is a standalone workspace (fuzz/Cargo.toml has its own
+      # empty [workspace]) with its own Cargo.lock, which drifts from the main
+      # workspace and can pin dependency versions that no longer compile on the
+      # current toolchain (e.g. gix-hash 0.25.1). Seed it from the workspace lock
+      # so cargo-fuzz's minimal resolve reuses exactly the versions the project
+      # uses for every shared package, only adding the fuzz-only crates.
+      - name: Align fuzz lockfile with the workspace
+        run: cp Cargo.lock fuzz/Cargo.lock
 
       # The fuzz targets link spelunk-core, which pulls keyring's
       # sync-secret-service backend (libdbus-sys); without this its build script

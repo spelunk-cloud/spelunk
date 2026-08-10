@@ -6,14 +6,57 @@ use anyhow::{Context, Result};
 use candle_core::quantized::{QMatMul, QTensor, gguf_file};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Activation, Embedding, Module, RmsNorm, rotary_emb::rope};
-use candle_transformers::models::qwen3::Config as Qwen3Config;
-use candle_transformers::utils::repeat_kv;
 use tokenizers::Tokenizer;
 
 use crate::error::EmbedError;
 
 /// Embedding dimension produced by F2LLM-v2-330M (hidden_size = 896).
 pub const DIM: usize = 896;
+
+/// Qwen3 `config.json` shape, deserialized directly from the model's config
+/// file. Copied from `candle_transformers::models::qwen3::Config` rather than
+/// depending on the `candle-transformers` crate for it: that crate bundles
+/// ~125 unrelated model architectures (llama, whisper, stable-diffusion,
+/// clip, ...) with no per-model feature gating, so pulling it in just for this
+/// struct and `repeat_kv` below costs real compile time and `target/` disk
+/// space even though the unused code is eliminated from the final linked
+/// binary by LTO. Field set must stay in sync with upstream if ever bumped.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct Config {
+    vocab_size: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    head_dim: usize,
+    attention_bias: bool,
+    num_key_value_heads: usize,
+    max_position_embeddings: usize,
+    sliding_window: Option<usize>,
+    max_window_layers: usize,
+    tie_word_embeddings: bool,
+    rope_theta: f64,
+    rms_norm_eps: f64,
+    use_sliding_window: bool,
+    hidden_act: Activation,
+}
+
+/// Repeats each of `xs`'s key/value heads `n_rep` times along the head axis
+/// (grouped-query attention). Copied from `candle_transformers::utils::repeat_kv`;
+/// see the `Config` doc comment above for why this isn't a dependency.
+fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
+    if n_rep == 1 {
+        Ok(xs)
+    } else {
+        let (b_sz, n_kv_head, seq_len, head_dim) = xs.dims4()?;
+        Ok(Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((
+            b_sz,
+            n_kv_head * n_rep,
+            seq_len,
+            head_dim,
+        ))?)
+    }
+}
 
 /// Hard ceiling for token sequences (max_position_embeddings).
 const MAX_SEQ_LEN: usize = 40960;
@@ -68,6 +111,17 @@ fn derive_token_cap(budget_bytes: u64, n_head: usize) -> usize {
     cap.clamp(1, MAX_SEQ_LEN)
 }
 
+/// The per-chunk truncation length actually applied to a tokenized input:
+/// the load-time `token_cap` clamped by the model's `MAX_SEQ_LEN` ceiling.
+/// A `token_cap` of 0 (unit-test fixtures) means "no extra cap".
+fn effective_token_cap(token_cap: usize) -> usize {
+    if token_cap == 0 {
+        MAX_SEQ_LEN
+    } else {
+        token_cap.min(MAX_SEQ_LEN)
+    }
+}
+
 /// Total physical system RAM in bytes, best-effort and cross-platform.
 ///
 /// macOS uses the `hw.memsize` sysctl; Linux reads `MemTotal` from
@@ -116,16 +170,24 @@ fn total_system_ram() -> u64 {
 
 pub struct NativeEmbedder {
     inner: Arc<Mutex<EmbedderInner>>,
+    /// Max tokens per single chunk before the attention scratch would exceed the
+    /// memory budget. Oversized chunks are truncated to this length (see
+    /// `derive_token_cap` / `single_chunk_budget`). 0 means "no extra cap"
+    /// (only the `MAX_SEQ_LEN` ceiling applies) — used in unit tests.
+    ///
+    /// Deliberately a plain field and not part of [`EmbedderInner`]: `inner` is
+    /// held for a request's entire batch, and `token_cap()` is read by
+    /// `/v1/health` on every liveness probe from a synchronous lock inside an
+    /// `async fn`, which blocks a tokio worker rather than yielding it. Putting
+    /// this back behind that mutex makes a liveness probe wait out a full
+    /// forward-pass batch and takes the whole server down with it. Written once
+    /// at load and never mutated, so it needs no synchronisation at all.
+    token_cap: usize,
 }
 
 struct EmbedderInner {
     weights: Qwen3EmbedWeights,
     tokenizer: Tokenizer,
-    /// Max tokens per single chunk before the attention scratch would exceed the
-    /// memory budget. Oversized chunks are truncated to this length (see
-    /// `derive_token_cap` / `single_chunk_budget`). 0 means "no extra cap"
-    /// (only the `MAX_SEQ_LEN` ceiling applies) — used in unit tests.
-    token_cap: usize,
 }
 
 // ── no-KV-cache Qwen3 embedder (Q8_0 quantized) ───────────────────────────────
@@ -166,7 +228,7 @@ impl Qwen3EmbedWeights {
     /// Build the model from the cached Q8_0 GGUF, placing every tensor on
     /// `device`. Q8_0 projection weights become `QMatMul`; the embedding table
     /// is dequantized to F16 for the gather; RMSNorm weights are F32.
-    fn from_gguf(path: &Path, cfg: &Qwen3Config, device: &Device) -> Result<Self> {
+    fn from_gguf(path: &Path, cfg: &Config, device: &Device) -> Result<Self> {
         let mut file = std::fs::File::open(path)
             .with_context(|| format!("opening quantized GGUF {}", path.display()))?;
         let content = gguf_file::Content::read(&mut file)
@@ -530,7 +592,7 @@ impl NativeEmbedder {
             anyhow::anyhow!("loading tokenizer from {}: {e}", tokenizer_path.display())
         })?;
 
-        let config: Qwen3Config = serde_json::from_str(
+        let config: Config = serde_json::from_str(
             &std::fs::read_to_string(config_path)
                 .with_context(|| format!("reading config.json {}", config_path.display()))?,
         )
@@ -545,7 +607,7 @@ impl NativeEmbedder {
     fn from_files(
         gguf_path: &Path,
         tokenizer: Tokenizer,
-        config: Qwen3Config,
+        config: Config,
         device: Device,
     ) -> Result<Self> {
         let on_gpu = !matches!(device, Device::Cpu);
@@ -579,11 +641,8 @@ impl NativeEmbedder {
         );
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(EmbedderInner {
-                weights,
-                tokenizer,
-                token_cap,
-            })),
+            inner: Arc::new(Mutex::new(EmbedderInner { weights, tokenizer })),
+            token_cap,
         })
     }
 }
@@ -647,6 +706,7 @@ impl crate::EmbeddingBackend for NativeEmbedder {
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         let owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
         let inner = Arc::clone(&self.inner);
+        let effective_cap = effective_token_cap(self.token_cap);
 
         tokio::task::spawn_blocking(move || {
             let guard = inner
@@ -672,11 +732,6 @@ impl crate::EmbeddingBackend for NativeEmbedder {
             // RAM; a ~40 k-token chunk would otherwise allocate ~100 GB and OOM
             // the whole index, so truncate (preserving the leading signal).
             // (token_cap == 0 in unit-test fixtures means "no extra cap".)
-            let effective_cap = if guard.token_cap == 0 {
-                MAX_SEQ_LEN
-            } else {
-                guard.token_cap.min(MAX_SEQ_LEN)
-            };
             let mut id_vecs: Vec<Vec<u32>> = Vec::with_capacity(owned.len());
             for text in &owned {
                 let encoding = guard
@@ -765,8 +820,11 @@ impl crate::EmbeddingBackend for NativeEmbedder {
     /// batch's total token budget realistically. `None` when running under
     /// the `token_cap == 0` test fixture ("no extra cap").
     fn token_cap(&self) -> Option<usize> {
-        let cap = self.inner.lock().ok()?.token_cap;
-        if cap == 0 { None } else { Some(cap) }
+        if self.token_cap == 0 {
+            None
+        } else {
+            Some(self.token_cap)
+        }
     }
 }
 
@@ -1037,6 +1095,202 @@ mod tests {
         assert!(
             expected_cap <= MAX_SEQ_LEN,
             "derived cap must not exceed the model's position-embedding ceiling"
+        );
+    }
+
+    // ── token_cap must not depend on the forward-pass mutex ───────────────────
+    //
+    // `/v1/health` reads `token_cap()` on every liveness probe. The forward-pass
+    // mutex is held for a request's entire batch (up to 32 sequential passes),
+    // and it is taken synchronously from an `async fn`, so a probe that waits on
+    // it blocks a tokio worker rather than yielding it. These tests build an
+    // embedder with a dummy inner (no model, no forward pass ever run) purely so
+    // the accessor can be exercised against a genuinely held lock.
+    //
+    // These are the only tests in the workspace that fail if the accessor goes
+    // back behind that mutex. The server-side liveness suite runs against a
+    // mock backend and stays green through such a change, so do not weaken or
+    // delete these on the assumption that something downstream is watching.
+    // `embedder_with_cap` constructs `NativeEmbedder` by struct literal on
+    // purpose: moving `token_cap` back into `EmbedderInner` breaks this file at
+    // compile time rather than silently.
+
+    fn dummy_weights() -> Qwen3EmbedWeights {
+        let device = Device::Cpu;
+        Qwen3EmbedWeights {
+            embed_tokens: Embedding::new(
+                Tensor::zeros((2, 2), DType::F16, &device).expect("embed table"),
+                2,
+            ),
+            layers: Vec::new(),
+            final_norm: RmsNorm::new(Tensor::ones(2, DType::F32, &device).expect("norm"), 1e-6),
+            rope_cos: Tensor::zeros((2, 1), DType::F32, &device).expect("rope cos"),
+            rope_sin: Tensor::zeros((2, 1), DType::F32, &device).expect("rope sin"),
+            n_head: N_HEAD,
+            n_kv_head: 8,
+            head_dim: 64,
+            device,
+        }
+    }
+
+    fn embedder_with_cap(token_cap: usize) -> NativeEmbedder {
+        NativeEmbedder {
+            inner: Arc::new(Mutex::new(EmbedderInner {
+                weights: dummy_weights(),
+                tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            })),
+            token_cap,
+        }
+    }
+
+    // Hold the forward-pass mutex on a separate thread until the returned
+    // sender is used, exactly as an in-flight embed batch does.
+    fn hold_forward_pass_lock(
+        embedder: &Arc<NativeEmbedder>,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let holder = Arc::clone(embedder);
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _guard = holder.inner.lock().expect("forward-pass mutex");
+            taken_tx.send(()).expect("signal that the lock is held");
+            let _ = release_rx.recv();
+        });
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder thread must acquire the forward-pass mutex");
+        (release_tx, handle)
+    }
+
+    // Read the cap on its own thread so a re-coupled accessor fails the bound
+    // instead of hanging the whole test suite.
+    fn token_cap_within(
+        embedder: &Arc<NativeEmbedder>,
+        bound: std::time::Duration,
+    ) -> Option<usize> {
+        use crate::EmbeddingBackend;
+
+        let reader = Arc::clone(embedder);
+        let (cap_tx, cap_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = cap_tx.send(reader.token_cap());
+        });
+        cap_rx.recv_timeout(bound).unwrap_or_else(|_| {
+            panic!(
+                "token_cap() did not return within {bound:?} while the forward-pass mutex was \
+                 held: the accessor is back behind the embed lock"
+            )
+        })
+    }
+
+    #[test]
+    fn token_cap_returns_while_the_forward_pass_lock_is_held() {
+        let embedder = Arc::new(embedder_with_cap(5792));
+        let (release, holder) = hold_forward_pass_lock(&embedder);
+
+        let cap = token_cap_within(&embedder, std::time::Duration::from_millis(250));
+        assert_eq!(
+            cap,
+            Some(5792),
+            "the advertised cap must be readable while a batch holds the forward-pass mutex"
+        );
+
+        release.send(()).expect("release the holder thread");
+        holder.join().expect("holder thread");
+    }
+
+    #[test]
+    fn token_cap_is_independent_of_embedder_busyness() {
+        use crate::EmbeddingBackend;
+
+        let embedder = Arc::new(embedder_with_cap(8192));
+        let at_rest = embedder.token_cap();
+
+        let (release, holder) = hold_forward_pass_lock(&embedder);
+        let while_busy = token_cap_within(&embedder, std::time::Duration::from_millis(250));
+        release.send(()).expect("release the holder thread");
+        holder.join().expect("holder thread");
+
+        assert_eq!(at_rest, Some(8192), "cap at rest");
+        assert_eq!(
+            while_busy, at_rest,
+            "the reported cap must not change with embedder busyness"
+        );
+    }
+
+    #[test]
+    fn zero_cap_fixture_reports_none_and_a_real_cap_reports_some() {
+        use crate::EmbeddingBackend;
+
+        assert_eq!(
+            embedder_with_cap(0).token_cap(),
+            None,
+            "the 0 fixture means 'no extra cap' and must stay `None`"
+        );
+        assert_eq!(
+            embedder_with_cap(5792).token_cap(),
+            Some(5792),
+            "a real host-derived cap must be reported verbatim"
+        );
+    }
+
+    #[test]
+    fn effective_cap_is_the_smaller_of_the_token_cap_and_max_seq_len() {
+        assert_eq!(
+            effective_token_cap(0),
+            MAX_SEQ_LEN,
+            "0 means 'no extra cap': only the MAX_SEQ_LEN ceiling applies"
+        );
+        assert_eq!(
+            effective_token_cap(1),
+            1,
+            "the smallest cap `derive_token_cap` can produce must survive verbatim, not be \
+             rounded up or treated like the 0 sentinel"
+        );
+        assert_eq!(
+            effective_token_cap(5792),
+            5792,
+            "a cap below the ceiling wins"
+        );
+        assert_eq!(
+            effective_token_cap(MAX_SEQ_LEN),
+            MAX_SEQ_LEN,
+            "a cap exactly at the ceiling is not off-by-one clamped below it"
+        );
+        assert_eq!(
+            effective_token_cap(MAX_SEQ_LEN - 1),
+            MAX_SEQ_LEN - 1,
+            "one below the ceiling is still the cap, not the ceiling"
+        );
+        assert_eq!(
+            effective_token_cap(MAX_SEQ_LEN + 1),
+            MAX_SEQ_LEN,
+            "a cap above the ceiling must be clamped to MAX_SEQ_LEN"
+        );
+        assert_eq!(
+            effective_token_cap(usize::MAX),
+            MAX_SEQ_LEN,
+            "no cap value can push the truncation length past the model's position-embedding \
+             ceiling"
+        );
+    }
+
+    #[test]
+    fn host_derived_cap_survives_the_move_off_the_forward_pass_mutex() {
+        use crate::EmbeddingBackend;
+
+        let derived = derive_token_cap(single_chunk_budget(total_system_ram()), N_HEAD);
+        let embedder = embedder_with_cap(derived);
+
+        assert_eq!(
+            embedder.token_cap(),
+            Some(derived),
+            "the accessor must surface exactly the cap derived at load time"
+        );
+        assert_eq!(
+            effective_token_cap(derived),
+            derived.min(MAX_SEQ_LEN),
+            "truncation must still use min(token_cap, MAX_SEQ_LEN)"
         );
     }
 }

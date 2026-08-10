@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::entity_id::entity_id;
-use super::memory::Note;
+use super::memory::{Note, NoteId};
 
 /// Serialised form stored as JSON in a memory backend (git-notes blob or SQLite).
 ///
@@ -60,7 +60,7 @@ impl NoteRecord {
 
 pub fn record_to_note(r: NoteRecord) -> Note {
     Note {
-        id: r.id,
+        id: NoteId::from_i64(r.id),
         kind: r.kind,
         title: r.title,
         body: r.body,
@@ -68,7 +68,7 @@ pub fn record_to_note(r: NoteRecord) -> Note {
         linked_files: r.linked_files,
         created_at: r.created_at,
         status: r.status,
-        superseded_by: r.superseded_by,
+        superseded_by: r.superseded_by.map(NoteId::from_i64),
         source_ref: r.source_ref,
         valid_at: r.valid_at,
         invalid_at: r.invalid_at,

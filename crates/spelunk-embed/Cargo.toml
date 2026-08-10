@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-embed"
-version = "0.9.5"
+version = "0.9.7"
 edition = "2024"
 description = "Native F2LLM-v2-330M embedder (candle) for spelunk"
 license = "MIT"
@@ -11,32 +11,50 @@ name = "spelunk_embed"
 path = "src/lib.rs"
 
 [features]
+default = ["native"]
+# native: the candle-based NativeEmbedder (F2LLM-v2-330M, Qwen3 decoder). A
+# consumer that only needs the EmbeddingBackend trait + MODEL_ID (spelunk-core,
+# so its downstream spelunk-cli isn't statically linking candle/tokenizers for
+# an embedder it only ever calls over HTTP) depends on this crate with
+# `default-features = false`. spelunk-server keeps the default on: it's the
+# one binary that actually constructs a NativeEmbedder.
+native = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:tokenizers",
+    "dep:tokio",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tracing",
+    "dep:libc",
+]
 # metal: enable Metal GPU acceleration on macOS. Add this when building the macOS binary.
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+metal = ["native", "candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-# candle is an unconditional dep: depending on this crate at all means you want
-# its native embedder, so gating candle behind a feature bought nothing. This
-# crate still carries no download dep (no hf-hub) — it loads local files only
-# via `load_from_path`; the HF-Hub acquisition path lives in spelunk-server's
-# `embed_hub` module.
-candle-core = { workspace = true }
-candle-nn = { workspace = true }
-candle-transformers = { workspace = true }
-tokenizers = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+# No candle-transformers dep: the only two items spelunk-embed ever needed from
+# it (Qwen3's `Config` struct, `repeat_kv`) are copied directly into
+# embedder_native.rs. That crate bundles ~125 unrelated model architectures
+# with no per-model feature gating, so depending on it for two small items
+# cost real compile time and `target/` disk space (the unused models are only
+# eliminated from the final *linked binary* by LTO, not from the build itself).
+tokenizers = { workspace = true, optional = true }
 
 # macOS-only: `hw.memsize` sysctl in `total_system_ram` (Linux reads
 # /proc/meminfo, no FFI). Not in [workspace.dependencies] since spelunk-embed
 # is the only consumer; a bare version here keeps the cfg gate unambiguous
 # (Cargo has no way to gate workspace.dependencies itself by target).
 [target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

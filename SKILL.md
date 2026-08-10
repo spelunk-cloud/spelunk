@@ -11,7 +11,7 @@ code and prior decisions, then reason over the results yourself.
 
 Core features (memory, full-text and ast-grep search, code graph, conventions) work without any inference server.
 
-**Semantic search and AI features** go through `spelunk-server`, which is autostarted locally on demand from v0.8.0. It bundles a native embedder (codefuse-ai/F2LLM-v2-330M, 896-dim, GPU-accelerated on macOS) — no external embedding server is required by default. Manage it with `spelunk server start|stop|status|logs`. Commands that need the server are marked **(requires server)** below; with `SPELUNK_NO_SERVER=1` they fall back to text/ast-grep search or error clearly. To use your own OpenAI-compatible endpoint instead of the native embedder, set `api_base_url` in `~/.config/spelunk/config.toml`.
+**Semantic search and AI features** go through `spelunk-server`, which is autostarted locally on demand from v0.8.0. It bundles a native embedder (codefuse-ai/F2LLM-v2-330M, 896-dim, GPU-accelerated on macOS); the embedding model and its compute path are both pinned product-wide, with no external embedding endpoint or config option. Manage it with `spelunk server start|stop|status|logs`. Commands that need the server are marked **(requires server)** below; with `SPELUNK_NO_SERVER=1` they fall back to text/ast-grep search or error clearly.
 
 ---
 

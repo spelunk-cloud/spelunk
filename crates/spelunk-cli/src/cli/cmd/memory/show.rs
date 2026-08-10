@@ -3,7 +3,10 @@ use anyhow::Result;
 use super::super::color::{color_enabled, cprintln};
 use super::super::status::format_age;
 use super::MemoryShowArgs;
-use crate::{config::Config, storage::open_memory_backend};
+use crate::{
+    config::Config,
+    storage::{NoteId, open_memory_backend},
+};
 
 pub(super) async fn memory_show(
     args: MemoryShowArgs,
@@ -11,10 +14,15 @@ pub(super) async fn memory_show(
     cfg: &Config,
     backend_override: Option<&str>,
 ) -> Result<()> {
+    // Fold in any fetched teammate notes before the lookup, so an entry a
+    // teammate just published is visible by id on the default path without a
+    // re-init (ADR-077 D1).
+    super::reconcile::refresh_read_path_from_git_notes(cfg, mem_path, backend_override).await;
+
     super::outbox::poll_and_apply(cfg, mem_path).await;
 
     let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
-    match backend.get(args.id).await? {
+    match backend.get(args.id.clone()).await? {
         None => anyhow::bail!("No memory entry with id {}.", args.id),
         Some(n) => match crate::utils::effective_format(&args.format) {
             "json" => println!("{}", serde_json::to_string_pretty(&n)?),
@@ -52,7 +60,10 @@ pub(super) async fn memory_show(
                 println!();
                 println!("{}", n.body);
 
-                let (outgoing, incoming) = backend.get_edges(n.id).await?;
+                let (outgoing, incoming) = match n.id.as_i64() {
+                    Some(rowid) => backend.get_edges(rowid).await?,
+                    None => (vec![], vec![]),
+                };
                 if !outgoing.is_empty() || !incoming.is_empty() {
                     println!();
                     cprintln!("\x1b[2m── relationships ──\x1b[0m");
@@ -64,7 +75,7 @@ pub(super) async fn memory_show(
                             _ => "→",
                         };
                         let target_title = backend
-                            .get(e.to_id)
+                            .get(NoteId::from_i64(e.to_id))
                             .await?
                             .map(|n| n.title)
                             .unwrap_or_else(|| "(deleted)".to_string());
@@ -78,7 +89,7 @@ pub(super) async fn memory_show(
                             _ => "←",
                         };
                         let src_title = backend
-                            .get(e.from_id)
+                            .get(NoteId::from_i64(e.from_id))
                             .await?
                             .map(|n| n.title)
                             .unwrap_or_else(|| "(deleted)".to_string());

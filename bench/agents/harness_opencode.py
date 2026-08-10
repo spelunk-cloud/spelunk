@@ -258,7 +258,7 @@ def main() -> None:
         parser.error(f"repo-path does not exist: {repo_path}")
 
     api_key = args.api_key or os.environ.get("DEEPSEEK_API_KEY")
-    api_key_source = "flag:--api-key" if args.api_key else "env:DEEPSEEK_API_KEY"
+    provenance_label = "flag:--api-key" if args.api_key else "env:DEEPSEEK_API_KEY"
     if not api_key:
         parser.error(
             "No API key provided. Use --api-key or set DEEPSEEK_API_KEY env var."
@@ -319,7 +319,7 @@ def main() -> None:
         "model": args.model,
         "model_source": "api",
         "api_base_url": args.api_base_url,
-        "api_key_source": api_key_source,
+        "api_key_source": provenance_label,
         # Null only on baseline, where no spelunk tools are wired in.
         "spelunk_version": (
             get_spelunk_version() if args.condition in SPELUNK_CONDITIONS else None

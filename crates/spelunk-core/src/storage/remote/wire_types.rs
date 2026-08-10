@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::super::memory::Note;
+use super::super::memory::{Note, NoteId};
 
 // ── Wire types (match server JSON schema) ─────────────────────────────────────
 
@@ -20,7 +20,7 @@ pub(super) struct AddNoteRequest {
 
 #[derive(Deserialize)]
 pub(super) struct AddNoteResponse {
-    pub(super) id: i64,
+    pub(super) id: NoteId,
     #[serde(default)]
     pub(super) conflicts: Vec<ConflictInfo>,
     /// Server-assigned cross-machine id, if the server minted one. Absent on
@@ -33,14 +33,14 @@ pub(super) struct AddNoteResponse {
 /// close to an existing active entry (HTTP 409).
 #[derive(Debug, Deserialize, Clone)]
 pub struct ConflictInfo {
-    pub id: i64,
+    pub id: NoteId,
     pub title: String,
     pub similarity: f32,
 }
 
 #[derive(Deserialize)]
 pub(super) struct NoteResponse {
-    pub(super) id: i64,
+    pub(super) id: NoteId,
     pub(super) kind: String,
     pub(super) title: String,
     pub(super) body: String,
@@ -48,7 +48,7 @@ pub(super) struct NoteResponse {
     pub(super) linked_files: Vec<String>,
     pub(super) created_at: i64,
     pub(super) status: String,
-    pub(super) superseded_by: Option<i64>,
+    pub(super) superseded_by: Option<NoteId>,
     #[serde(default)]
     pub(super) source_ref: Option<String>,
     #[serde(default)]
@@ -87,6 +87,56 @@ impl From<NoteResponse> for Note {
     }
 }
 
+/// Tolerant reader for the `list` and `search` read endpoints.
+///
+/// A team `spelunk-server` at or after the wire-contract fix wraps notes in an
+/// `{ "entries": [...], "total": N }` object (ADR-076: a JSON response root
+/// must be an object, never a bare array). Older servers still in the
+/// version-skew support window emit a bare `[...]` array. Accepting both is
+/// what keeps a newer CLI working against an older team server: the common
+/// real-world skew, since a CLI is upgraded ahead of a team server running on
+/// someone else's schedule. See `docs/version-skew.md`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum NoteListPayload {
+    Enveloped {
+        #[serde(default)]
+        entries: Vec<NoteResponse>,
+    },
+    Bare(Vec<NoteResponse>),
+}
+
+impl NoteListPayload {
+    pub(super) fn into_notes(self) -> Vec<NoteResponse> {
+        match self {
+            NoteListPayload::Enveloped { entries } => entries,
+            NoteListPayload::Bare(notes) => notes,
+        }
+    }
+}
+
+/// Tolerant reader for the `harvested-shas` endpoint. Same rationale as
+/// [`NoteListPayload`]: newer servers send `{ "shas": [...] }`, older ones a
+/// bare `["sha", ...]` array of primitives.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum HarvestedShasPayload {
+    Enveloped {
+        #[serde(default)]
+        shas: Vec<String>,
+    },
+    Bare(Vec<String>),
+}
+
+impl HarvestedShasPayload {
+    pub(super) fn into_shas(self) -> Vec<String> {
+        match self {
+            HarvestedShasPayload::Enveloped { shas } => shas,
+            HarvestedShasPayload::Bare(shas) => shas,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub(super) struct SearchRequest {
     pub(super) query: String,
@@ -95,7 +145,7 @@ pub(super) struct SearchRequest {
 
 #[derive(Serialize)]
 pub(super) struct SupersedeRequest {
-    pub(super) new_id: i64,
+    pub(super) new_id: NoteId,
 }
 
 #[derive(Deserialize)]
@@ -106,23 +156,4 @@ pub(super) struct BoolResponse {
 #[derive(Deserialize)]
 pub(super) struct CountResponse {
     pub(super) count: i64,
-}
-
-// ── Cloud project listing (ADR-005 slug→UUID resolution) ──────────────────────
-
-/// One entry from cloud-api `GET /v1/projects` (`listProjects`).
-///
-/// Only `id` and `slug` are needed to resolve a human slug to its UUID; the
-/// other fields the endpoint returns (name, visibility, …) are ignored.
-#[derive(Deserialize)]
-pub(super) struct CloudProjectItem {
-    pub(super) id: uuid::Uuid,
-    #[serde(default)]
-    pub(super) slug: Option<String>,
-}
-
-/// Response body of cloud-api `GET /v1/projects`.
-#[derive(Deserialize)]
-pub(super) struct CloudProjectListResponse {
-    pub(super) projects: Vec<CloudProjectItem>,
 }

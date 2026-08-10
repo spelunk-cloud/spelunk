@@ -21,7 +21,7 @@ const LOCAL_TITLE: &str = "local only entry";
 fn write_cfg(dir: &Path, name: &str, db_path: &Path, extra: &str) -> PathBuf {
     let cfg = format!(
         "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\n\
-         embedding_model = \"test-model\"\nllm_model = \"test-chat\"\n{extra}",
+         llm_model = \"test-chat\"\n{extra}",
         db_path
     );
     let path = dir.join(name);

@@ -1,7 +1,7 @@
 # spelunk Threat Model
 
 **Method:** Lightweight threat modeling (STRIDE-informed)  
-**Last reviewed:** July 2026 (transport model updated to native in-process HTTPS, ADR-066; egress model corrected to the server-owned embedding path, ADR-002; `api_base_url` retired)  
+**Last reviewed:** July 2026 (transport model updated to native in-process HTTPS, ADR-066; egress model corrected to the server-owned embedding path, ADR-002; `api_base_url` retired; the embedding model and its compute path pinned product-wide, `--embedding-url` / `SPELUNK_EMBEDDING_URL` removed: embedding can no longer egress to a third party)  
 **Reviewed by:** Architect  
 **Next review:** v1.0 release or after any new network-facing feature
 
@@ -36,12 +36,14 @@ cases, both of which change the data-egress threat profile:
 
 - **Explicit team `server_url`** in config points the CLI at a remote
   `spelunk-server`. Chunk text and query text then cross the network to that
-  server (which may itself embed natively or proxy to a third party).
-- **Server-side external shim:** a `spelunk-server` operator may set
-  `--embedding-url` / `--llm-url` (`SPELUNK_EMBEDDING_URL` / `SPELUNK_LLM_URL`)
-  so the server forwards to a third-party OpenAI-compatible service (OpenAI,
-  Anthropic, Cohere, etc.) instead of embedding natively. This is configured on
-  the server, not by the client.
+  server, which embeds them natively in-process (embedding has no external
+  relocation option; see below).
+- **Server-side external LLM shim:** a `spelunk-server` operator may set
+  `--llm-url` (`SPELUNK_LLM_URL`) so the server forwards LLM calls to a
+  third-party OpenAI-compatible service (OpenAI, Anthropic, Cohere, etc.).
+  This is configured on the server, not by the client, and applies to LLM
+  features only: embedding has no equivalent flag and always runs on the
+  server that receives the chunk/query text.
 
 The default auto-discovered loopback server embeds natively in-process with no
 external egress.
@@ -80,7 +82,7 @@ User filesystem
   ├─ spelunk explore/search
   │     ├─► embed query text via HTTP ─► spelunk-server
   │     │    (chunk + query text leave the machine only if server_url is a remote
-  │     │     team server, or that server proxies to a third-party --embedding-url)
+  │     │     team server; that server always embeds natively, never proxies)
   │     ├─► KNN search ─► index.db  (always local sqlite-vec)
   │     └─► LLM prompt ─► spelunk-server
   │           └─ context: code chunks + spec files + memory notes
@@ -181,7 +183,7 @@ unauthenticated (no bearer required or sent).
 | Threat | Mode | Likelihood | Impact | Mitigation |
 |--------|------|-----------|--------|-----------|
 | Client impersonates a legitimate spelunk user to the server | B | Medium | High | Bearer token auth — but **optional**; server runs unauthenticated by default. Operators must explicitly pass `--key` / `SPELUNK_SERVER_KEY`. |
-| Attacker spoofs the embedding/LLM backend to return adversarial responses | A | Low | Medium | The loopback server is on-machine, so this only applies when a remote team `server_url` (or a server's external `--embedding-url`/`--llm-url`) is used over plaintext HTTP. `validate_transport_url` rejects a non-loopback `http://` `server_url` (loopback-only plaintext; https required otherwise), so a remote backend must be HTTPS. |
+| Attacker spoofs the embedding/LLM backend to return adversarial responses | A | Low | Medium | The loopback server is on-machine, so this only applies when a remote team `server_url` (or a server's external `--llm-url`) is used over plaintext HTTP. `validate_transport_url` rejects a non-loopback `http://` `server_url` (loopback-only plaintext; https required otherwise), so a remote backend must be HTTPS. |
 
 ### T — Tampering
 
@@ -204,12 +206,14 @@ unauthenticated (no bearer required or sent).
 | Threat | Mode | Likelihood | Impact | Mitigation |
 |--------|------|-----------|--------|-----------|
 | Credentials in source code indexed into vector DB | A | Medium | High | `secrets.rs` scanner drops matching chunks before storage; `.env*`/`*.pem`/`*.key` files excluded |
-| **Source code sent off-machine for embedding** | A | Medium | **High** | The default loopback server embeds natively on-machine, so nothing leaves. Egress requires an explicit remote team `server_url` (chunk text crosses to the team server) or a server whose operator set an external `--embedding-url` (server forwards post-secret-scan chunks to a third party). Both are explicit operator choices; users must be informed via docs. |
-| **Memory notes / code context sent off-machine for LLM** | A | Low | **High** | `spelunk explore` and `memory harvest` send memory content + code context to `spelunk-server`. On the default loopback server the LLM runs on-machine; egress requires a remote team `server_url` or a server-side `--llm-url` shim. |
+| **Source code sent off-machine for embedding** | A | Medium | **High** | The default loopback server embeds natively on-machine, so nothing leaves. Egress requires an explicit remote team `server_url` (chunk text crosses to that server, which always embeds natively in-process; there is no operator flag to forward embedding to a third party). This is an explicit operator/user choice; users must be informed via docs. **Enforced** for the local-tier default: `crates/spelunk-cli/tests/egress_containment.rs` traps every outbound connection across `init`/`index`/`search` and fails loudly, naming the destination, on any escape past loopback. |
+| **Memory notes / code context sent off-machine for LLM** | A | Low | **High** | `spelunk explore` and `memory harvest` send memory content + code context to `spelunk-server`. On the default loopback server the LLM runs on-machine; egress requires a remote team `server_url`, or an `llm_url` (config key, `SPELUNK_LLM_URL`, or `--llm-url`) pointing off-machine. Either is an explicit user choice, and an `llm_url` is never inherited from a checked-in project config: it is read from the personal config only, so cloning a repo cannot redirect a developer's LLM traffic. |
 | Server memory accessible without auth | B | Medium | High | No `--key` / `SPELUNK_SERVER_KEY` by default; any process that can reach the port reads all notes |
 | Server bound to 0.0.0.0 exposes data on LAN/internet | B | Medium | High | **Enforced:** a non-loopback bind requires **both** TLS and a key: `spelunk-server` refuses to start on `0.0.0.0`/LAN/public addresses unless `--tls-cert`/`--tls-key` and `--key` / `SPELUNK_SERVER_KEY` are set (ADR-066 §4); plaintext off-host is refused with no override; loopback (`127.0.0.1`) is the default (PR #490) |
 | Indexed content contains credentials missed by scanner | A | Medium | Medium | Pattern gaps tracked in #138 |
 | CLI bearer credential (`server_key`) readable as plaintext at rest (e.g. user syncs `~/.config` into a dotfiles repo or backup) | A | Medium | High | The `server_key` is stored in the OS keychain (macOS Keychain / Linux Secret Service / Windows Credential Manager), not in `config.toml`; a legacy plaintext key is migrated out and stripped on next run. Headless fallback is an owner-only (`0600`) `secrets.toml`; `SPELUNK_SERVER_KEY` is the CI escape hatch. The credential is never logged. |
+| LLM endpoint credential (`llm_url`) exposed in the process table, at rest, or in transit | A | Medium | High | Stored in the OS secret store via `spelunk auth set-key --llm`, never in `config.toml`; read from stdin/prompt and refused as an argument. The CLI resolves it only on the daemon-spawn path and passes it to the child in its environment: no input emits `--llm-key`/`--llm-key-file` into the spawned daemon's argv, and the endpoint URL/model travel as arguments precisely because they are not secret. `SPELUNK_LLM_KEY` is the CI/non-interactive escape hatch. Never logged at any level, and not echoed by the refusal below. When a credential resolves against a plaintext `http://` non-loopback endpoint, `spelunk-server` refuses to start rather than sending it in the clear; the check is scoped to a credential being present, so keyless LAN endpoints are unaffected. |
+| Detached `spelunk-server` daemon reads the OS keychain, raising an authorization prompt no user can answer (or, worse, being granted standing access) | A | Medium | Medium | **Structural:** the server crate reaches for no secret store at all. The CLI resolves the credential in the user's own session and hands it over out of band. Enforced by `the_server_crate_never_reaches_for_a_secret_store`, a source-level scan of `crates/spelunk-server/src/`, so a future reach fails CI rather than shipping. |
 | `spelunk memory add`/edit interactive `$EDITOR` draft written to a predictable temp path, enabling symlink/TOCTOU clobber and a world-readable info-leak window | A | Low | Medium | **Fixed:** the draft is created via `tempfile::Builder` (unpredictable name, `O_EXCL`, mode `0600` on unix) instead of a PID-derived path in `std::env::temp_dir()`. The `NamedTempFile` handle is kept open across the `$EDITOR`/`$VISUAL` spawn and the body is read back by seeking the retained handle (not by re-opening the path), so a symlink swapped in at the draft's path during the edit window is not followed. |
 | **Memory note body contains a credential written to git notes and pushed to a shared/public remote** | A | **Medium** | **High** | **No mitigation on the direct `memory add` path.** The `store_in_git_notes` flag is `true` by default. `contains_secret` is not called in `add.rs` before `append_to_git_notes`. Users must set `store_in_git_notes = false` in config to opt out, or avoid including secrets in note bodies. See [git-notes memory](#git-notes-memory-prref-notespelunk) section. Track: issue to add secret-scan gate on write-through path. |
 | **Sensitive architectural context (decisions, handoffs) in git notes exposed on clone to any repo reader** | A | **Medium** | **Medium** | Notes attached to `refs/notes/spelunk` are fetched by `git fetch` when the refspec is included; anyone with clone access reads the full history of notes. **Documentation control only** — users must understand that `store_in_git_notes = true` (default) means notes are as public as the repo. |
@@ -353,17 +357,21 @@ pushed with notes, the credential is exfiltrated.
 
 The default backend is on-machine (loopback `spelunk-server`, native F2LLM
 embedder), so by default no code or memory content leaves the machine. This
-section covers the two paths that reach a third party.
+section covers the two paths that reach a third party. Embedding has no
+third-party path at all: it is always computed natively, in-process, by
+whichever `spelunk-server` receives the text; the control is the choice of
+`server_url`, not a server-side embedding flag.
 
-**When a remote team `server_url` is set, or a `spelunk-server` operator has set
-an external `--embedding-url` / `--llm-url` shim (e.g. `https://api.openai.com`):**
+**When a remote team `server_url` is set (chunk/query text and memory context
+cross to that server), or a `spelunk-server` operator has set an external
+`--llm-url` shim (e.g. `https://api.openai.com`) for LLM features only:**
 
 | Data sent | Trigger | Risk |
 |-----------|---------|------|
-| Source code chunk content (post-secret-scan) | `spelunk index` | Code exfiltration to vendor |
-| User query text | `spelunk search`, `spelunk explore` | Query logging by vendor |
-| Code context + memory notes | `spelunk explore` | Combined context exfiltration |
-| Memory note bodies | `spelunk memory harvest` | Decision/requirement exfiltration |
+| Source code chunk content (post-secret-scan) | `spelunk index` against a remote team `server_url` | Code exfiltration to that server |
+| User query text | `spelunk search`, `spelunk explore` against a remote team `server_url` | Query logging by that server |
+| Code context + memory notes | `spelunk explore`, via a remote team `server_url` and/or a server-side `--llm-url` LLM shim | Combined context exfiltration |
+| Memory note bodies | `spelunk memory harvest`, via a remote team `server_url` and/or a server-side `--llm-url` LLM shim | Decision/requirement exfiltration |
 
 **Mitigations (documentation, not code):**
 - Document the data-egress implications prominently in `docs/getting-started.md` and the `config.toml` comments
@@ -391,5 +399,5 @@ From this threat model, the following requirements are binding:
 4. **Atomic transactions for memory state transitions** — `supersede()` and `insert_with_supersession()` (issue #136).
 5. **CI must gate on `cargo audit` and `cargo deny`.**
 6. **spelunk-server documentation must warn** that the server is unauthenticated by default and should only be exposed beyond localhost when `--key` / `SPELUNK_SERVER_KEY` is set.
-7. **Config documentation must warn** that setting a remote team `server_url` (or running a `spelunk-server` with an external `--embedding-url` / `--llm-url` shim) transmits source code and memory content off the machine.
+7. **Config documentation must warn** that setting a remote team `server_url` (or running a `spelunk-server` with an external `--llm-url` shim) transmits source code and memory content off the machine.
 8. **Secret scanner must run on the git-notes write-through path.** `add.rs` must call `contains_secret(body)` (and optionally `contains_secret(title)`) before calling `append_to_git_notes()`. If a match is found, the git-notes write must be skipped (with a `tracing::warn!`) and the primary SQLite write must still succeed. This closes the gap identified in the [git-notes memory](#git-notes-memory-prref-notespelunk) section above. **This is a binding requirement for any release with `store_in_git_notes = true` as the default.**

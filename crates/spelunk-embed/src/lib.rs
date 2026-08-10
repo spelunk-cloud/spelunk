@@ -16,10 +16,12 @@
 //!
 //! The result is a [`NativeEmbedder`], which implements the crate's own
 //! [`EmbeddingBackend`] trait (re-exported by spelunk-core at
-//! `spelunk_core::embeddings::EmbeddingBackend`). candle is an unconditional
-//! dependency: depending on this crate means you want its native embedder, so
-//! there is no feature gate to opt out of candle. Add the `metal` feature for
-//! Metal GPU acceleration on macOS.
+//! `spelunk_core::embeddings::EmbeddingBackend`). `NativeEmbedder` itself, and
+//! candle/tokenizers with it, live behind the default-on `native` feature: a
+//! consumer that only needs the trait + [`MODEL_ID`] (spelunk-core, so
+//! spelunk-cli doesn't statically link an embedder it only ever calls over
+//! HTTP) depends on this crate with `default-features = false`. Add the
+//! `metal` feature for Metal GPU acceleration on macOS.
 
 mod backend;
 pub use backend::EmbeddingBackend;
@@ -28,10 +30,21 @@ pub use backend::EmbeddingBackend;
 /// Exact-match token: never parse it. Requantization or a hardware-portability
 /// rebuild of the same model must NOT change this — only a genuine model swap
 /// (different weights / vector space) does, which forces a re-index.
+///
+/// Before changing this value, ship memory.db embedding-provenance stamping
+/// first: unstamped `note_embeddings` vectors are assumed to be this model
+/// (backfill rule "unstamped ⇒ F2LLM-v2-330M@896"), an invariant that only
+/// holds while this is the sole model ever shipped. See the 2026-07-26
+/// `requirement` entry in spelunk memory and task spelunk-oss^286 for the
+/// acceptance criteria that work must meet.
 pub const MODEL_ID: &str = "F2LLM-v2-330M@896";
 
+#[cfg(feature = "native")]
 mod embedder_native;
+#[cfg(feature = "native")]
 pub use embedder_native::{DIM, NativeEmbedder};
 
+#[cfg(feature = "native")]
 mod error;
+#[cfg(feature = "native")]
 pub use error::EmbedError;

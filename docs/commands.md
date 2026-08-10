@@ -20,8 +20,8 @@ always-available commands (`graph`, text/ast-grep `search`, `memory add/list`,
 Initialise spelunk for the current project: register it, start the local server
 if needed, parse and chunk the source tree, hand the embedding pass to a
 detached background worker, and (when inside a git repo with an `origin` remote)
-configure the fetch refspec so project memory notes travel automatically on
-`git fetch`.
+configure the fetch refspec — then fetch the notes ref once — so a single `init`
+after a clone pulls in the team's project memory.
 
 ```
 spelunk init [options]
@@ -33,21 +33,36 @@ spelunk init [options]
 | `--no-index` | false | Skip the initial index run |
 | `--name <slug>` | derived | Explicit project slug. Overrides the git-derived default; use it for projects without a git remote. |
 
-`init` writes the project slug to `.spelunk/config.toml` (committed, so the whole
-team shares one identity). The slug defaults to the git-derived value:
+`init` writes the project slug to `.spelunk/config.toml` but takes **no git
+action on it** — commit it yourself so the slug travels with the repo and the
+whole team shares one identity:
+
+```bash
+git add .spelunk/config.toml && git commit -m "Add spelunk project slug"
+```
+
+`init` prints a one-line reminder to do this; committing the file is a step you
+own, not something `init` performs. The slug defaults to the git-derived value:
 `host/owner/repo` when an `origin` remote exists, else `local/<blake3-hex>` of the
 canonical path. Pass `--name` to set an explicit slug for a repo without a remote
-or to choose your own. An existing `project_id` in config is never rewritten, so
+or to choose your own. Without a committed slug, a fresh clone of a remote-less
+repo derives a different per-clone identity, and a `--name` slug cannot be
+re-derived at all. An existing `project_id` in config is never rewritten, so
 re-running `init` (or running it after a rename) does not change an established
 slug.
 
 **Memory notes travel with the repository:** When run inside a git repo with an
 `origin` remote, `init` configures `remote.origin.fetch` so teammates'
 `refs/notes/spelunk` arrives on `git fetch`, landing on the tracking ref
-`refs/notes/origin/spelunk`. `memory list`, `context`, and `init` merge that
-tracking ref into your own notes, so *reading* teammates' memory needs no extra
-step. *Publishing* yours is opt-in: your memory stays local until you install the
-pre-push hook, and the init output names the command that does it. See
+`refs/notes/origin/spelunk`, and does a one-time best-effort fetch of that ref
+so a **single** `init` after a clone hydrates teammates' memory (the fetch is
+non-fatal, so `init` still succeeds offline). Thereafter every default read path
+— `memory list`, `memory search`, `memory show`, and `context` — folds the
+tracking ref into your own notes and imports it into `memory.db` when the notes
+ref has moved since the last import, so *reading* a teammate's newly-fetched
+memory needs no re-`init` and no extra step. *Publishing* yours is opt-in: your
+memory stays local until you install the pre-push hook, and the init output
+names the command that does it. See
 [Sharing memory across clones via git-notes](memory.md#sharing-memory-across-clones-via-git-notes).
 
 **Memory survives history rewrites:** `init` also points `notes.rewriteRef` at
@@ -58,10 +73,14 @@ rewrites are local. Note that `git merge --squash` and cherry-picking onto a
 divergent base still do not carry notes. See [Surviving history
 rewrites](memory.md#surviving-history-rewrites).
 
-If the repo already carries memory on `refs/notes/spelunk`, `init` also hydrates
-the new `memory.db` from those notes: every entry not already present is imported
+If the repo already carries memory on `refs/notes/spelunk` — whether written
+locally or just fetched by the step above — `init` also hydrates the new
+`memory.db` from those notes: every entry not already present is imported
 (idempotent, no embeddings), and it prints `Memory:  imported N entries from git
-notes` when any were imported. See [Project memory](memory.md) for details.
+notes` when any were imported. Because the refspec is configured and the notes
+ref fetched *before* this import, one `init` after a clone is enough; later
+fetches are picked up automatically by the read paths. See [Project
+memory](memory.md) for details.
 
 **Example:**
 
@@ -88,7 +107,7 @@ spelunk index <path> [options]
 | `--batch-size <n>` | 0 (auto) | Cap on the embedding batch size (chunks per server request); the embed phase calibrates the actual size from measured throughput, up to this cap. 0 leaves the cap at the server's own 256-chunk limit |
 | `--force` | false | Force full re-index (ignore change detection) |
 | `--recount` | false | Backfill `token_count` for existing chunks and exit |
-| `--no-summaries` | false | Skip LLM summary generation even when `server_url` is configured |
+| `--no-summaries` | false | Skip LLM summary generation, and the notice explaining why it was skipped, even when an LLM is available |
 | `--summary-batch-size <n>` | 10 | Chunks per LLM summary request |
 | `--detach` | false | Re-exec in the background and return immediately (used by git hooks) |
 | `--detach-embed` | false | Parse in the foreground, then run the embedding phase in a detached background process and return the prompt (`spelunk init` does this automatically) |
@@ -102,6 +121,26 @@ longer need `--force` just to fill in missing embeddings.
 Summaries are the exception: a chunk whose summary failed (say the LLM was
 unreachable) is recorded as attempted rather than missing, so a plain re-run
 skips it. Use `--force` to retry those.
+
+**Summaries need an LLM, and never fail the index.** If no LLM can be reached,
+`spelunk index` prints a notice naming the reason and what to do, then exits 0
+with everything else (files, chunks, embeddings) indexed as usual. The three
+reasons are: no LLM anywhere, an `llm_url` your running local server was not
+started with, and offline mode. See
+[Third-party models → How spelunk finds an LLM](third-party-models.md#how-spelunk-finds-an-llm)
+for the routing rule and the exact messages. LLM routing is resolved separately
+from embedding: which server embeds your code is unaffected by any of this.
+
+If a previous run was interrupted after recording a file's new content hash
+but before writing its chunks (a process kill mid-parse, for example), that
+file looks up to date by hash alone but has no chunks. A plain `spelunk index`
+detects this and reprocesses the file automatically; you don't need `--force`
+to recover from it.
+
+Only one `spelunk index` run is allowed per project at a time. If a run is
+already in progress, starting a second one fails immediately with `index
+already running (pid N), try again once it finishes` instead of writing to
+the database alongside the first run.
 
 The index also remembers the chunker configuration (currently just the
 `MAX_CHUNK_TOKENS` cap) it was built under. If a plain `spelunk index` detects
@@ -284,6 +323,13 @@ PageRank pipeline that improves multi-hop recall over raw KNN. `text` and
 index, so it needs `spelunk index` first; `ast-grep` and the `auto` default
 work with no index at all.
 
+`text` mode scores the query's words as **independent terms** (BM25): a
+multi-word query ranks chunks that contain the terms in **any order** — a chunk
+containing more of the terms ranks above one containing fewer — rather than
+requiring them to appear as one contiguous phrase. Matching is case-insensitive
+and not stemmed (`bursts` matches `bursts`, not `burst`), following the FTS
+tokenizer.
+
 In `ast-grep` mode (and the `auto` fallback used when there is no index or
 server), a plain-string query matches case-insensitively as a substring of
 identifiers and file text, so `Billing` finds `BillingEntity`. A query
@@ -308,7 +354,11 @@ spelunk search "$X.unwrap()" --mode ast-grep     # structural pattern (metavaria
 
 Agentic search: the server's LLM iteratively calls spelunk's own tools (search,
 graph, read) to answer an open-ended question. Requires a server with an LLM
-backend configured.
+backend configured; without one the command fails with a message naming the
+reason and what to do (see
+[Third-party models → How spelunk finds an LLM](third-party-models.md#how-spelunk-finds-an-llm)).
+Its embedding and its LLM calls resolve independently and can land on different
+servers.
 
 ```
 spelunk explore "<question>" [options]
@@ -598,6 +648,7 @@ Manage the local `spelunk-server` daemon. Runtime state lives under
 
 ```
 spelunk server start [--port <n>] [--bin <path>] [--db <path>]
+                     [--llm-url <url>] [--llm-model <name>]
 spelunk server stop
 spelunk server status
 spelunk server logs [-n <lines>]
@@ -616,6 +667,30 @@ spelunk server status
 spelunk server logs -n 100
 spelunk server stop
 ```
+
+### LLM configuration for the daemon
+
+| Flag | Notes |
+|------|-------|
+| `--llm-url <url>` | Chat-completions endpoint this daemon serves LLM features from. Overrides `SPELUNK_LLM_URL` and `llm_url` in the personal config, for this daemon only. |
+| `--llm-model <name>` | Model name this daemon sends to that endpoint. Overrides `SPELUNK_LLM_MODEL` and `llm_model`. Ignored without an endpoint. |
+
+Set `llm_url` in the personal config instead if you want every daemon to get
+it; these flags are the per-launch override. A blank flag value (`--llm-url ""`)
+is discarded rather than treated as an override, so the configured value still
+applies.
+
+**There is no `--llm-key` flag here, deliberately.** Arguments are readable by
+any user on the machine through the process table, so the endpoint's credential
+is never accepted or emitted as one. Store it with
+[`spelunk auth set-key --llm`](#spelunk-auth) or set `SPELUNK_LLM_KEY`; the CLI
+resolves it at spawn time and passes it to the daemon in its environment. The
+daemon never reads the OS secret store itself.
+
+A running daemon keeps the configuration it was started with. `spelunk server
+stop && spelunk server start` after any change. See
+[Third-party models](third-party-models.md#configuring-an-external-llm-endpoint)
+for the full precedence table.
 
 ---
 
@@ -700,23 +775,35 @@ The credential is never logged.
 
 ## spelunk auth
 
-Manage the per-server bearer credentials a self-hosted `server_url` resolves
-through (ADR-071). Distinct from `spelunk login`, which manages the
+Store credentials in the OS secret store: the per-server bearers a self-hosted
+`server_url` resolves through (ADR-071), and the credential for a configured
+`llm_url` endpoint. Distinct from `spelunk login`, which manages the
 spelunk.cloud `[auth]` token pair.
 
 ```
-spelunk auth set-key --server <url>
+spelunk auth set-key (--server <url> | --llm)
 spelunk auth list-servers
 ```
 
 | Subcommand | Notes |
 |------------|-------|
-| `set-key --server <url>` | Store a bearer key for the given server, keyed by its origin (scheme + host + non-default port). The key is read from stdin if piped, otherwise from an interactive prompt; it is never accepted as a flag value or positional argument. |
-| `list-servers` | Print every server origin with a stored key, one per line. Never prints key material. Notes if a legacy flat key is still present and pending migration. |
+| `set-key --server <url>` | Store a bearer key for the given server, keyed by its origin (scheme + host + non-default port). |
+| `set-key --llm` | Store the credential for the configured `llm_url` chat-completions endpoint. A single entry: there is one LLM endpoint, not a set of them. |
+| `list-servers` | Print every server origin with a stored key, one per line. Never prints key material. Notes if a legacy flat key is still present and pending migration. It lists servers, so a stored LLM credential does not appear. |
+
+`--server` and `--llm` are mutually exclusive, and exactly one is required.
+Either way the credential is read from stdin if piped, otherwise from an
+interactive prompt. **It is never accepted as a flag value or a positional
+argument**, because arguments are readable by any user on the machine through
+the process table. Nothing about either command prints key material, and
+neither writes a credential into `config.toml`.
 
 ```bash
 echo "$SERVER_KEY" | spelunk auth set-key --server https://spelunk.internal.example.com
 spelunk auth list-servers
+
+spelunk auth set-key --llm                 # prompts
+echo "$LLM_KEY" | spelunk auth set-key --llm
 ```
 
 Resolution precedence for a given request's `server_url`: the `SPELUNK_SERVER_KEY`
@@ -725,6 +812,12 @@ over the per-origin store; a spelunk.cloud origin instead resolves through the
 `[auth]` token pair from `spelunk login`. This lets CI pin a single key for the
 one server it talks to without touching the keychain, while a developer's
 machine holds separate keys per self-hosted server.
+
+The LLM credential resolves as `SPELUNK_LLM_KEY` > this stored entry > unset,
+and only on the code path that starts a local daemon: no other command reads
+it, so none of them authorize against your keychain for it. The daemon receives
+it in its environment and never opens the secret store itself. See
+[Third-party models](third-party-models.md#security-properties).
 
 ---
 
@@ -807,6 +900,14 @@ cross-project dep pass (see [Cross-project visibility](memory.md#cross-project-v
 Results from linked projects carry a `[from: <project>]` badge in text output
 and `source_project` / `source_project_path` fields in JSON.
 
+**`memory harvest` needs an LLM.** All three sources (`--source git`,
+`--source claude-code`, `--source failures`) use it for extraction, and the
+command fails with a message naming the reason and what to do when none is
+reachable. See
+[Third-party models → How spelunk finds an LLM](third-party-models.md#how-spelunk-finds-an-llm).
+Extraction and the dedup embedding resolve independently and can land on
+different servers.
+
 **Memory kinds:** `decision` · `context` · `requirement` · `note` · `intent` ·
 `answer` · `handoff` · `question` · `antipattern`
 
@@ -845,8 +946,10 @@ of adding a duplicate, so the printed pull count reflects only genuinely new
 rows. Pre-promotion, a pull can still add a distinct row alongside matching
 local content, same as `memory add`.
 
-**Backfilling missing embeddings:** a note's semantic vector is minted only at
-`memory add` time, so a note added while the embedder was down, or carried
+**Backfilling missing embeddings:** a note's semantic vector is minted at
+`memory add` time, and again by `memory push` / `sync` for any entry in the set
+they are about to push that still lacks one. A note that misses both, added
+while the embedder was down and never pushed, or carried
 through the 768→896 embedding-dimension upgrade (which drops the old vectors),
 stays present-but-unembedded: still found by text search, `list`, `timeline`,
 and `context`, but absent from semantic `memory search`. `spelunk memory
@@ -889,13 +992,35 @@ spelunk sync [--project <slug>] [--source <path>] [--include-archived]
 For a one-directional transfer, use `spelunk memory push` (local → server) or
 `spelunk memory pull` (server → local).
 
+**The push embeds what it pushes.** Before the batch is built, both `spelunk
+sync` and `spelunk memory push` embed every entry in the push set that has no
+usable local vector, through the local loopback embedder and using the same
+document text `spelunk memory reindex` uses, and commit each vector to
+`memory.db`. A pushed entry is then findable by semantic `memory search` locally
+without a separate `reindex`. This changes what is stored locally, not what is
+sent: `kind`, `title`, and `body` are serialised on every push and always were,
+and the vector fields are additive. The step is skipped in `cloud_first` mode
+with a `server_url` set, the same condition `memory reindex` declines under. With
+no local embedder reachable the push still completes, text-only, with the exit
+code it always had, and prints one warning naming how many entries went out
+without a local embedding and that `spelunk memory reindex` is the cure. The
+summary line reports the local embed count separately from `created` /
+`skipped` / `failed`, for example `Sync complete. Pushed 4 entries (created 4,
+skipped 0), applied 1 new remote entries. Embedded 2 locally.` Entries already
+synced, and entries arriving via `memory pull`, are outside the push set and are
+not embedded by this step. See [Backfilling missing
+embeddings](memory.md#backfilling-missing-embeddings).
+
 ---
 
 ## spelunk plumbing
 
 Low-level commands for agents and scripts. All emit JSONL and exit non-zero on
 error (exit 1 for "no results", exit 2 for errors). See
-[plumbing-and-porcelain.md](plumbing-and-porcelain.md).
+[plumbing-and-porcelain.md](plumbing-and-porcelain.md). These field names,
+types, and exit codes are semver-bound and test-enforced; the
+[stability contract](stability.md) says exactly what may change and what may
+not.
 
 ```
 spelunk plumbing cat-chunks <file>     # indexed chunks for a file
@@ -939,6 +1064,9 @@ and publish on your next push.
 | `SPELUNK_CLOUD_URL` | Override the spelunk.cloud API URL used by `login` / `org` (default `https://api.spelunk.cloud`) |
 | `SPELUNK_SERVER_KEY` | Static credential for a team/self-hosted server; takes precedence over the keychain-stored credential and `login` tokens (the non-interactive escape hatch for CI / headless) |
 | `SPELUNK_SERVER_CA` | Path to a PEM CA bundle to trust for a `SPELUNK_SERVER_URL` whose certificate is signed by an internal or self-signed CA. Added as a trust anchor on top of the built-in roots; TLS verification stays on (no insecure mode). Overrides `server_ca` in `config.toml`. |
+| `SPELUNK_LLM_URL` | Chat-completions endpoint a locally started daemon serves LLM features from; overrides `llm_url` in the personal config. Set but empty blanks the configured value rather than falling through to it. |
+| `SPELUNK_LLM_MODEL` | Model name sent to that endpoint; overrides `llm_model`. Same empty-value rule. |
+| `SPELUNK_LLM_KEY` | Credential for that endpoint; takes precedence over the entry stored by `spelunk auth set-key --llm`. Not a `config.toml` field. Blank reads as unset. |
 | `SPELUNK_SECRET_STORE` | Secret-store backend: `auto` (default — keychain, file fallback), `keychain` (require the OS keychain), or `file` (force `~/.config/spelunk/secrets.toml`) |
 | `SPELUNK_CONFIG_DIR` | Override the whole `~/.config/spelunk/` directory (not just the config file), same as `-c, --config` but for the entire directory |
 | `SPELUNK_STATE_DIR` | Override the runtime state directory (default `~/.local/state/spelunk/`) that holds the server's pid/port/log/db files and the embed worker's pid/baseline files. Every reader and writer resolves through this same variable, so it is safe to redirect wholesale (useful for test isolation, containers, or a non-default `HOME`). |

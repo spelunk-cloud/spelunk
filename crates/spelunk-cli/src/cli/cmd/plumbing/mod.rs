@@ -151,7 +151,7 @@ pub async fn plumbing(args: PlumbingArgs, cfg: Config) -> Result<()> {
 
     match args.command {
         PlumbingCommand::ParseFile(a) => return parse_file::parse_file(a),
-        PlumbingCommand::Embed(a) => return embed_cmd::embed_cmd(&cfg, a.query).await,
+        PlumbingCommand::Embed(a) => return embed_cmd::embed_cmd(&cfg, &db_path, a.query).await,
         // Notes are the pre-`init` store (ADR-068), so publishing must not
         // require an index.
         PlumbingCommand::PublishNotes(a) => return publish_notes::publish_notes(a).await,

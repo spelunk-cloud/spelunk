@@ -26,8 +26,9 @@ pub(super) fn open_store() -> MemoryStore {
     let store = MemoryStore {
         conn,
         reembed_needed: None,
+        dropped_768: std::cell::Cell::new(false),
     };
-    store.migrate().expect("schema migration");
+    store.run_migrations().expect("schema migration");
     store
 }
 

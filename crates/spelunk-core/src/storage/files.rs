@@ -70,6 +70,21 @@ impl Database {
         Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
     }
 
+    /// Whether a file has at least one stored chunk. A hash-current file with
+    /// zero chunks means a prior parse committed `upsert_file`'s new hash but
+    /// was interrupted before any chunk of that file landed (no transaction
+    /// spans the two writes - see `process_text_file` in the CLI's parse
+    /// phase); the hash-only skip check alone cannot see that half-indexed
+    /// state.
+    pub fn file_has_chunks(&self, path: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM chunks c JOIN files f ON f.id = c.file_id \
+             WHERE f.path = ?1)",
+        )?;
+        stmt.query_row(rusqlite::params![path], |r| r.get::<_, bool>(0))
+            .map_err(Into::into)
+    }
+
     /// Look up the file id for a given path, or None if not indexed.
     pub fn file_id_for_path(&self, path: &str) -> Result<Option<i64>> {
         let mut stmt = self
@@ -146,15 +161,5 @@ impl Database {
             rusqlite::params![file_id],
         )?;
         Ok(())
-    }
-
-    /// Return all indexed file paths and their stored hashes.
-    /// Used by `spelunk check` to detect stale files without re-embedding.
-    pub fn all_file_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
-        let mut stmt = self.conn.prepare_cached("SELECT path, hash FROM files")?;
-        let map = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
-        Ok(map)
     }
 }

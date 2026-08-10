@@ -24,8 +24,8 @@ only that single backend (local SQLite `memory.db`, git-notes, or a configured
 ### Concrete failure mode (2026-06-11 incident)
 
 - Decision #134 ("SSE memory stream → Cloud-only", tagged `locked`, v1) was
-  recorded in `code/cloud-api`'s `memory.db`.
-- An agent working in `code/spelunk-oss` ran `spelunk context` /
+  recorded in the cloud-api project's `memory.db`.
+- An agent working in the spelunk-oss project ran `spelunk context` /
   `spelunk memory search "SSE"` at session start, per the standard agent
   workflow in `CLAUDE.md`.
 - That agent's local `memory.db` (spelunk-oss) had no record of decision #134.
@@ -94,10 +94,10 @@ at implementation time, but this sibling-file convention is already used by
 
 **Symmetric link requirement for the failure mode in this incident:** the
 2026-06-11 incident is the *root* (or a sibling project) needing visibility
-into cloud-api's locked decisions. For `code/spelunk-oss` to see
-`code/cloud-api`'s decision #134, `code/spelunk-oss` must have a
-`project_deps` edge to `code/cloud-api` (i.e. `spelunk link ../cloud-api` run
-from spelunk-oss, or equivalent from root). This ADR does **not** mandate
+into cloud-api's locked decisions. For the spelunk-oss project to see
+cloud-api's decision #134, spelunk-oss must have a `project_deps` edge to
+cloud-api (i.e. `spelunk link` run against the cloud-api project from
+spelunk-oss, or equivalent from root). This ADR does **not** mandate
 auto-linking all five named projects (root, cloud-api, spelunk-oss,
 spelunk-webapp, marketing-site) to each other — that's an operational/registry
 setup task, not a code change. However, **the implementer should verify (and

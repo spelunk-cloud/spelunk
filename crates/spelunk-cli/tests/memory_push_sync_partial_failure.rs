@@ -13,10 +13,9 @@
 // regression in the command-layer framing or exit code is what fails here.
 
 mod plumbing_helpers;
-use plumbing_helpers::spelunk_bin_in;
+use plumbing_helpers::{register_sqlite_vec, spelunk_bin_in};
 
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path, path_regex};
@@ -31,18 +30,6 @@ const PROJECT_SLUG: &str = "acme-widget";
 // Enough entries to span more than one push chunk (chunk size is 50), so a
 // later chunk can fail after an earlier one has already landed.
 const SEED_COUNT: usize = 60;
-
-fn register_sqlite_vec() {
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        #[allow(clippy::missing_transmute_annotations)]
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
-    });
-}
 
 // The first `POST /memory/batch` (chunk 1) lands `created: 50`; every later
 // request 500s (chunk 2 fails). Keyed on call count so it does not depend on
@@ -107,7 +94,6 @@ fn write_config(dir: &Path, server_url: &str) -> std::path::PathBuf {
         &config_path,
         format!(
             "db_path = {db_path:?}\n\
-             embedding_model = \"test-model\"\n\
              llm_model = \"test-chat\"\n"
         ),
     )

@@ -46,8 +46,8 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
     let config_path = spelunk_dir.join("config.toml");
 
     // Ignore machine-specific SQLite (index.db/memory.db + their -wal/-shm
-    // sidecars); config.toml and cloud-project-id.lock are committed, so must
-    // not be listed here. Idempotent: never clobbers a pre-existing file.
+    // sidecars); config.toml is committed, so must not be listed here.
+    // Idempotent: never clobbers a pre-existing file.
     write_spelunk_gitignore(&spelunk_dir);
 
     // Project slug: explicit --name, else derived (`host/owner/repo` when a git
@@ -119,7 +119,7 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
     let server_line: Option<String> = {
         use std::io::IsTerminal;
         if std::io::stdin().is_terminal() {
-            match super::server::ensure_server_running(7777).await {
+            match super::server::ensure_server_running(7777, &cfg).await {
                 Ok((port, true)) => Some(format!(
                     "http://127.0.0.1:{port}  \x1b[32m✓\x1b[0m  (auto-started)"
                 )),
@@ -193,15 +193,31 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
         }
     };
 
-    // ── 6b. Import git-notes memory into the project memory.db ────────────────
-    // Entries recorded on `refs/notes/spelunk` before init (git-notes fallback
-    // or write-through) are invisible to the SQLite-backed `memory list` until
-    // imported. No enclosing git repo → nothing to import. Non-fatal: a failure
-    // here must not sink init.
+    // ── 6b. Configure the notes fetch refspec, fetch, then import (ADR-077 D3) ─
+    // Order is load-bearing. On a fresh clone the tracking ref has never been
+    // fetched, so the import has to run AFTER the refspec is configured and a
+    // fetch has populated `refs/notes/origin/spelunk` — otherwise a single
+    // `init` imports nothing and the user needs a second one. The read-path
+    // import (ADR-077 D1) is the durable guarantee for anything fetched later;
+    // the one fetch here is what makes ONE `init` after clone self-sufficient.
+
+    // 1. Configure the `origin` notes fetch refspec (only inside a git repo).
+    let notes_lines = if git_root.is_some() {
+        configure_notes_refspec(&project_root).await
+    } else {
+        Vec::new()
+    };
+
+    // 2 + 3. Best-effort fetch of the notes ref, then merge + import into the
+    // project memory.db. Entries on `refs/notes/spelunk` (a teammate's, or a
+    // pre-init write-through) are invisible to the SQLite-backed reads until
+    // imported. Non-fatal throughout: a failure here (offline fetch included)
+    // must not sink init.
     let memory_line: Option<String> = if let Some(git_root) = git_root.as_ref() {
         let mem_path = spelunk_dir.join("memory.db");
-        // Fold in anything a previous `git fetch` left on the tracking ref
-        // before hydrating, so teammates' entries import too (ADR-069 D5).
+        fetch_notes_best_effort(&project_root).await;
+        // Fold anything on the tracking ref into the working ref before
+        // hydrating, so teammates' entries import too (ADR-069 D5 / ADR-077 D3).
         crate::storage::merge_tracking_notes(Some(git_root)).await;
         match super::memory::reconcile::import_git_notes_into_memory(git_root, &mem_path).await {
             Ok(0) => None,
@@ -213,13 +229,6 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
         }
     } else {
         None
-    };
-
-    // ── 7. Configure git-notes refspec on `origin` (only inside a git repo) ───
-    let notes_lines = if git_root.is_some() {
-        configure_notes_refspec(&project_root).await
-    } else {
-        Vec::new()
     };
 
     // ── 8. Print success summary ──────────────────────────────────────────────
@@ -241,6 +250,16 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
             config_path.display()
         );
     }
+    // D5 (ADR-077): `init` writes config.toml but takes no git action on it, so
+    // it must tell the user to commit it — the slug travels with the repo only
+    // once it is committed (a remote-less repo derives a per-clone slug, and a
+    // `--name` slug cannot be re-derived at all).
+    if wrote_slug {
+        println!(
+            "           wrote .spelunk/config.toml — commit it so your project slug \
+             travels with the repo"
+        );
+    }
     println!("  Hook:    {}", hook_status);
     if let Some(line) = memory_line {
         println!("  Memory:  {line}");
@@ -259,19 +278,23 @@ pub async fn init(args: InitArgs, cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// Write `.spelunk/.gitignore` covering the machine-specific SQLite and log
-/// files. The `*` glob covers the `-wal`/`-shm` sidecars. Created only when
-/// absent so re-init never clobbers user edits; failures are non-fatal.
+/// Write `.spelunk/.gitignore` covering the machine-specific SQLite, the
+/// per-run index lock (+ its pid sidecar), and log files. The `*` glob covers
+/// the SQLite `-wal`/`-shm` sidecars and the lock's `.pid` sidecar. Created
+/// only when absent so re-init never clobbers user edits; failures are
+/// non-fatal.
 fn write_spelunk_gitignore(spelunk_dir: &std::path::Path) {
     let gitignore_path = spelunk_dir.join(".gitignore");
     if gitignore_path.exists() {
         return;
     }
-    // Only machine-specific regenerated files are listed. config.toml and
-    // cloud-project-id.lock are committed, so they must stay out of this file.
+    // Only machine-specific regenerated files are listed. config.toml is
+    // committed, so it must stay out of this file.
     const GITIGNORE: &str = "# Machine-specific SQLite, regenerated by `spelunk index`.\n\
                              index.db*\n\
                              memory.db*\n\
+                             # Per-run index lock + its pid sidecar (holds a local process id).\n\
+                             index.lock*\n\
                              # Diagnostics from the detached background index phases.\n\
                              *.log\n";
     if let Err(e) = std::fs::create_dir_all(spelunk_dir) {
@@ -280,6 +303,57 @@ fn write_spelunk_gitignore(spelunk_dir: &std::path::Path) {
     }
     if let Err(e) = std::fs::write(&gitignore_path, GITIGNORE) {
         eprintln!("Warning: could not write {}: {e}", gitignore_path.display());
+    }
+}
+
+/// Best-effort fetch of the notes ref so the first `init` after a clone
+/// hydrates teammates' memory (ADR-077 D3).
+///
+/// Bounded and non-fatal: skipped without an `origin`, fetches only the notes
+/// refspec (never branches), and a failure — offline, or an unreachable
+/// remote — is ignored so `init` still succeeds. A hard time budget with
+/// `kill_on_drop` keeps a black-holed remote from hanging `init`.
+async fn fetch_notes_best_effort(project_root: &std::path::Path) {
+    use std::process::Stdio;
+    const NOTES_FETCH_REFSPEC: &str = "+refs/notes/spelunk*:refs/notes/origin/spelunk*";
+    const FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+    let has_origin = tokio::process::Command::new("git")
+        .current_dir(project_root)
+        .args(["remote", "get-url", "origin"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !has_origin {
+        return;
+    }
+
+    let mut child = match tokio::process::Command::new("git")
+        .current_dir(project_root)
+        .args(["fetch", "origin", NOTES_FETCH_REFSPEC])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("init notes fetch skipped (spawn failed): {e}");
+            return;
+        }
+    };
+    // On timeout the future is dropped and `kill_on_drop` reaps the child, so a
+    // hung fetch cannot leave `init` waiting or orphan a git process.
+    if tokio::time::timeout(FETCH_BUDGET, child.wait())
+        .await
+        .is_err()
+    {
+        tracing::debug!("init notes fetch timed out; continuing (read paths still import later)");
     }
 }
 
@@ -440,9 +514,95 @@ mod tests {
             !body.contains("config.toml"),
             "config.toml is committed, must not be ignored: {body}"
         );
+    }
+
+    #[test]
+    fn gitignore_ignores_index_run_lock_and_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spelunk_dir = tmp.path().join(".spelunk");
+
+        write_spelunk_gitignore(&spelunk_dir);
+
+        let body = std::fs::read_to_string(spelunk_dir.join(".gitignore")).unwrap();
+        // The index run-lock (`index.lock`) and its pid sidecar
+        // (`index.lock.pid`, which holds a machine-local process id) are
+        // regenerated every `spelunk index` run and must never be committed; a
+        // `git add -A` otherwise churns the pid across machines. `index.lock*`
+        // covers both.
         assert!(
-            !body.contains("cloud-project-id.lock"),
-            "cloud-project-id.lock is committed, must not be ignored: {body}"
+            body.contains("index.lock*"),
+            "must ignore the index run-lock + pid sidecar: {body}"
+        );
+    }
+
+    // End-to-end: the generated `.gitignore` must make real git treat the run
+    // lock and its pid sidecar as ignored, so a `git add -A` never stages them.
+    #[test]
+    fn generated_gitignore_makes_git_ignore_lock_and_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        // Hermetic git: the shared fixture drops global/system config (and
+        // author identity) so a developer's core.excludesfile can neither mask
+        // nor manufacture the ignore.
+        crate::cli::cmd::test_support::isolate_git_config();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .expect("spawn git")
+        };
+        assert!(
+            git(&["init", "-q", "-b", "main"]).status.success(),
+            "git init failed"
+        );
+
+        let spelunk_dir = repo.join(".spelunk");
+        write_spelunk_gitignore(&spelunk_dir);
+
+        // Files a `spelunk index` run drops into `.spelunk/`: the machine-local
+        // ones must all be ignored; `.gitignore` itself stays committable.
+        for f in [
+            "index.lock",
+            "index.lock.pid",
+            "index.db",
+            "memory.db",
+            "index.log",
+        ] {
+            std::fs::write(spelunk_dir.join(f), b"x").unwrap();
+        }
+
+        // `check-ignore -q` exits 0 only when the path is ignored.
+        for rel in [".spelunk/index.lock", ".spelunk/index.lock.pid"] {
+            assert!(
+                git(&["check-ignore", "-q", rel]).status.success(),
+                "{rel} must be git-ignored by the generated .gitignore"
+            );
+        }
+
+        // The confirmed churn source: nothing machine-local shows up to stage.
+        // `-uall` lists untracked files individually instead of collapsing the
+        // whole new `.spelunk/` dir into one entry.
+        let out = git(&["status", "--porcelain", "-uall"]).stdout;
+        let porcelain = String::from_utf8_lossy(&out);
+        for f in [
+            "index.lock",
+            "index.lock.pid",
+            "index.db",
+            "memory.db",
+            "index.log",
+        ] {
+            assert!(
+                !porcelain.contains(f),
+                "{f} must not appear in `git status --porcelain`, got:\n{porcelain}"
+            );
+        }
+        // Sanity: the ignore did not swallow everything - the committable
+        // `.gitignore` is still an untracked, addable file.
+        assert!(
+            porcelain.contains(".gitignore"),
+            "the generated .gitignore should stay untracked+committable, got:\n{porcelain}"
         );
     }
 

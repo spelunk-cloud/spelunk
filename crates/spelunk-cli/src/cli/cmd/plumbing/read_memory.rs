@@ -1,7 +1,10 @@
 use anyhow::Result;
 
 use super::PlumbingReadMemoryArgs;
-use crate::{config::Config, storage::open_memory_backend};
+use crate::{
+    config::Config,
+    storage::{NoteId, open_memory_backend},
+};
 
 pub(super) async fn read_memory(
     args: PlumbingReadMemoryArgs,
@@ -11,7 +14,7 @@ pub(super) async fn read_memory(
     let backend = open_memory_backend(cfg, mem_path, None).await?;
 
     if let Some(id) = args.id {
-        match backend.get(id).await? {
+        match backend.get(NoteId::from_i64(id)).await? {
             None => std::process::exit(1),
             Some(note) => println!("{}", serde_json::to_string(&note)?),
         }

@@ -70,7 +70,9 @@ async fn links_list(format: String) -> Result<()> {
             match Database::open(&dep.db_path) {
                 Ok(db) => {
                     let fc = db.stats().ok().map(|s| s.file_count);
-                    let staleness = db.sample_staleness_check(5).ok();
+                    // Resolve indexed (root-relative) paths against the LINKED
+                    // project's own root, not this (linking) project's cwd.
+                    let staleness = db.staleness_report(&dep.root_path, Some(5)).ok();
                     let status_str = match staleness {
                         Some(r) if r.stale > 0 => "stale".to_string(),
                         Some(_) => "fresh".to_string(),
@@ -170,7 +172,9 @@ async fn links_check() -> Result<()> {
         }
 
         match Database::open(&dep.db_path) {
-            Ok(db) => match db.sample_staleness_check(5) {
+            // Resolve indexed (root-relative) paths against the LINKED project's
+            // own root, not this (linking) project's cwd.
+            Ok(db) => match db.staleness_report(&dep.root_path, Some(5)) {
                 Ok(r) if r.stale > 0 => {
                     all_ok = false;
                     problems.push(format!(

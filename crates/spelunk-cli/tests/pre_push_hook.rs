@@ -46,26 +46,29 @@ fn spelunk_exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_spelunk"))
 }
 
-/// A `git` invocation in `dir` with an isolated identity and config.
-///
-/// `git push` runs the pre-push hook, which execs a spelunk child. That child
-/// runs `Config::load`, which reads `<HOME>/.config/spelunk/config.toml` and
-/// resolves a secret store, defaulting to the OS keychain when
-/// `SPELUNK_SECRET_STORE` is unset. git is the only thing standing between a
-/// test and that child, so both have to be pinned here: pinning them on the
-/// spelunk commands a test runs directly leaves the hook's child ambient.
-///
-/// `HOME` redirects that config dir on unix only. `spelunk_config_dir()` goes
-/// through `dirs::home_dir()`, which on Windows is
-/// `SHGetKnownFolderPath(FOLDERID_Profile)` and reads no environment variable,
-/// so there is nothing to pin: a test whose premise needs the *ambient* config
-/// to be the seeded one has to be `#[cfg(unix)]`. `SPELUNK_SECRET_STORE=file`
-/// still keeps the child off the keychain everywhere, which is what the rest of
-/// this suite needs.
+// A `git` invocation in `dir` with an isolated identity and config.
+//
+// `git push` runs the pre-push hook, which execs a spelunk child. That child
+// runs `Config::load`, which reads a config dir and resolves a secret store,
+// defaulting to the OS keychain when `SPELUNK_SECRET_STORE` is unset. git is
+// the only thing standing between a test and that child, so all of it has to be
+// pinned here: pinning it on the spelunk commands a test runs directly leaves
+// the hook's child ambient.
+//
+// `HOME` alone does not pin the config dir, because `spelunk_config_dir()`
+// returns `SPELUNK_CONFIG_DIR` before it consults `dirs::home_dir()`. Anything
+// this helper does not set is inherited from the test process, so a runner that
+// exports `SPELUNK_CONFIG_DIR` (the documented way to isolate the suite from a
+// developer's own config) silently wins over `HOME` and points the hook's child
+// at a directory no test seeded. `SPELUNK_CONFIG_DIR` is therefore derived from
+// `home` and set explicitly, the same way `spelunk_bin_in` does it for the
+// direct-spawn path. That also makes the pin work on Windows, where
+// `dirs::home_dir()` reads no environment variable at all.
 fn git_cmd(home: &Path, dir: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(dir)
         .env("HOME", home)
+        .env("SPELUNK_CONFIG_DIR", home.join(".config").join("spelunk"))
         .env("SPELUNK_SECRET_STORE", "file")
         .env_remove("XDG_CONFIG_HOME")
         .env("SPELUNK_NO_SERVER", "1")
@@ -127,13 +130,19 @@ fn bin(home: &Path, cwd: &Path) -> Command {
     cmd
 }
 
-/// Like [`bin`], but runs an arbitrary copy of the binary rather than the one
-/// cargo built. Used to control the path the shim embeds.
+// Like `bin`, but runs an arbitrary copy of the binary rather than the one
+// cargo built. Used to control the path the shim embeds.
+//
+// This cannot go through `spelunk_bin_in`, which always resolves the
+// cargo-built binary, so it repeats that helper's isolation by hand and has to
+// keep `SPELUNK_CONFIG_DIR` among it: without the pin this spawn inherits the
+// runner's ambient value, which wins over `HOME`.
 fn bin_at(exe: &Path, home: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::new(exe);
     cmd.current_dir(cwd)
         .env("SPELUNK_SECRET_STORE", "file")
         .env("HOME", home)
+        .env("SPELUNK_CONFIG_DIR", home.join(".config").join("spelunk"))
         .env_remove("XDG_CONFIG_HOME")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -433,22 +442,20 @@ fn failed_notes_push_does_not_block_the_branch_push() {
     );
 }
 
-/// A config that will not load must not cost the user their branch push either.
-///
-/// The config loads before the command dispatch, so a broken one aborted the
-/// push with a bare `?` before `--best-effort` was ever consulted. The failure
-/// mode reaches users through the keychain, the default store when
-/// `SPELUNK_SECRET_STORE` is unset, so no malformed file of their own is needed.
-///
-/// Unix-only because the seeded config has to be the *ambient* one, which is the
-/// case the hook's child hits: it takes no `--config`. `spelunk_config_dir()`
-/// resolves that path through `dirs::home_dir()`, which reads `$HOME` on unix but
-/// calls `SHGetKnownFolderPath(FOLDERID_Profile)` on Windows, consulting no
-/// environment at all. There is no var to pin there, and seeding the real profile
-/// would break every other test in this suite.
-/// [`a_broken_config_is_tolerated_for_a_best_effort_publish`] covers the same
-/// arm on every platform through `--config`.
-#[cfg(unix)]
+// A config that will not load must not cost the user their branch push either.
+//
+// The config loads before the command dispatch, so a broken one aborted the
+// push with a bare `?` before `--best-effort` was ever consulted. The failure
+// mode reaches users through the keychain, the default store when
+// `SPELUNK_SECRET_STORE` is unset, so no malformed file of their own is needed.
+//
+// The seeded config has to be the *ambient* one, which is the case the hook's
+// child hits: it takes no `--config`. `git_cmd` pins `SPELUNK_CONFIG_DIR` at the
+// seeded directory and `spelunk_config_dir()` returns that before it consults
+// `dirs::home_dir()`, so the premise holds on every platform. That pin is what
+// makes this reachable on Windows, where `dirs::home_dir()` calls
+// `SHGetKnownFolderPath(FOLDERID_Profile)` and reads no environment variable, so
+// a `HOME` redirect alone would leave the child on the real profile.
 #[test]
 fn an_unloadable_config_does_not_block_the_branch_push() {
     let home = TempDir::new().unwrap();
@@ -497,12 +504,11 @@ fn an_unloadable_config_does_not_block_the_branch_push() {
     );
 }
 
-/// The `--best-effort` config tolerance itself, on every platform.
-///
-/// The end-to-end guard above can only isolate an ambient config on unix, so the
-/// arm that keeps a hook's push alive would otherwise go unexercised on Windows.
-/// `--config` reaches the same branch: the command ignores `cfg`, so the publish
-/// still runs and the exit stays 0.
+// The `--best-effort` config tolerance reached through `--config` rather than an
+// ambient config dir. The guard above drives the ambient path the hook's child
+// actually takes; this pins the same arm to the explicit flag, so a regression in
+// either route is caught on its own. The command ignores `cfg`, so the publish
+// still runs and the exit stays 0.
 #[test]
 fn a_broken_config_is_tolerated_for_a_best_effort_publish() {
     let home = TempDir::new().unwrap();

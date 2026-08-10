@@ -28,7 +28,12 @@ Load order (later overrides earlier):
    directory (project-level, team-wide). Only `server_url`, `project_id`,
    `server_ca`, and `[index]` are read from this file.
 4. Environment variables: `SPELUNK_SERVER_URL`, `SPELUNK_SERVER_KEY`,
-   `SPELUNK_PROJECT_ID`, `SPELUNK_SERVER_CA`, `SPELUNK_MODE`.
+   `SPELUNK_PROJECT_ID`, `SPELUNK_SERVER_CA`, `SPELUNK_LLM_URL`,
+   `SPELUNK_LLM_MODEL`, `SPELUNK_MODE`.
+
+A variable that is **set** overrides the file even when its value is empty:
+`SPELUNK_LLM_URL=""` blanks a configured `llm_url` rather than falling through
+to it. Unset the variable to let the file value apply.
 
 Override the global config file path with `-c, --config <path>` on any command
 (also settable via `SPELUNK_CONFIG_DIR`, which overrides the whole
@@ -51,30 +56,82 @@ file only accepts the fields listed under
 Path to the SQLite index database file. The project index and memory databases
 live alongside it (`index.db`, `memory.db`).
 
-### `embedding_model`
-
-- **Type:** string
-- **Default:** `f2llm-v2-330m`
-
-This is **not** a model selector. The effective embedding model is fixed
-product-wide (`codefuse-ai/F2LLM-v2-330M`, 896-dimension) and served by
-`spelunk-server`; nothing in `config.toml` changes it. This field is purely a
-cosmetic display label used in the `model:` field of `spelunk plumbing embed`
-JSONL output, so scripts consuming that output have a name to print. There is
-normally no reason to change it.
-
 ### `llm_model`
 
 - **Type:** string, optional
 - **Default:** unset
+- **Env override:** `SPELUNK_LLM_MODEL`
 
-A local presence flag, not a model selector: when unset, `spelunk explore` is
-hidden from `--help` (it still runs if invoked directly). The value itself is
-never sent to `spelunk-server` and does not choose which chat model actually
-runs; that is resolved by whichever server the CLI reaches. `spelunk memory
-harvest` does not consult this field at all: for both commands, whether a chat
-model is actually available depends on the capability tier (a reachable
-inference server with a model loaded), independent of this setting.
+Two unrelated jobs, which is worth untangling before you set it.
+
+**Configuration.** Together with `llm_url` below, it is the model name a daemon
+the CLI starts sends to that endpoint, passed as the daemon's `--llm-model`. It
+is ignored without an `llm_url`: a model with no endpoint is not a
+configuration.
+
+**A local presence flag.** When unset, `spelunk explore` is hidden from
+`--help` (it still runs if invoked directly). This is cosmetic. The value is
+not attached to any inference request the CLI makes, so it does not choose the
+model on a server the CLI merely reaches, such as a team `server_url`; that
+server's own configuration decides. `spelunk memory harvest` does not consult
+this field at all. For both commands, whether a chat model is actually
+available depends on the capability tier (a reachable inference server with a
+model loaded), independent of this setting.
+
+### `llm_url`
+
+- **Type:** string, optional
+- **Default:** unset
+- **Env override:** `SPELUNK_LLM_URL`
+
+Base URL of an OpenAI-compatible chat-completions endpoint (a local LM Studio
+or Ollama, a self-hosted gateway). When set, the auto-spawned local
+`spelunk-server` is started against it and gains LLM capability, which is what
+`spelunk explore`, `spelunk memory harvest`, and index-time summaries need.
+When unset, the daemon runs without an LLM.
+
+Personal config only. A value in a checked-in `.spelunk/config.toml` is
+ignored, like any key outside the project-level allowlist: an endpoint URL is a
+per-developer choice, and committing one points the whole team at one machine.
+
+Setting this field is also a statement about where your code may go. Under the
+default `local_first` mode (and under `offline`), if `llm_url` is set but the
+running local server was not started with it, spelunk stops and asks you to
+restart the server rather than falling back to an LLM on `server_url`. Under
+`mode = "cloud_first"` that does not apply, because `server_url` is the
+inference target there already. See
+[Third-party models → The local-LLM guarantee](third-party-models.md#the-local-llm-guarantee-and-where-it-stops).
+
+**Precedence**, highest first: `spelunk server start --llm-url` (for that
+daemon only) > `SPELUNK_LLM_URL` > `llm_url` here > unset. An empty value is
+handled differently in the two override positions: `SPELUNK_LLM_URL=""`
+overrides and blanks this field, leaving no endpoint at all, while
+`--llm-url ""` is discarded and leaves the environment or config value in
+place. A variable that is set wins even when empty; a flag has to carry a value
+to win.
+
+**The credential for this endpoint is never a config field**, here or anywhere
+else. Store it with `spelunk auth set-key --llm`, which reads it from stdin or
+a prompt and keeps it in the OS secret store, or set `SPELUNK_LLM_KEY` (which
+wins over the stored value). Two properties of that are deliberate:
+
+- The CLI reads the credential **only** on the code path that spawns a daemon.
+  It is not loaded with the rest of your configuration, so no ordinary command
+  authorizes against your keychain for it.
+- The spawned daemon **never opens the OS secret store itself.** It is detached,
+  and a keychain read from a background process with no user session raises a
+  prompt nobody can answer. The CLI resolves the credential in your session and
+  passes it to the child out of band, in its environment, never in an argument.
+
+`spelunk-server` refuses to start when a credential resolves and `llm_url` is a
+plaintext `http://` URL to a non-loopback host, naming the URL in the error.
+The check is scoped to a credential being present, so a keyless LAN endpoint on
+`http://192.168.x.x:1234` is unaffected. See
+[Third-party models](third-party-models.md#security-properties).
+
+A daemon already running keeps the configuration it was started with. Restart
+it with `spelunk server stop && spelunk server start` after changing `llm_url`,
+`llm_model`, or the stored credential.
 
 ### `llm_context_length`
 
@@ -142,6 +199,12 @@ read from the personal config, not from `.spelunk/config.toml`. See
 [Team server and sync modes](memory.md#team-server-and-sync-modes) for the
 full picture.
 
+`mode` also decides which server answers LLM calls for `spelunk explore`,
+`spelunk memory harvest` and index-time summaries, and it is the one setting
+that changes whether a configured [`llm_url`](#llm_url) keeps your code off a
+remote LLM. See
+[Third-party models → How spelunk finds an LLM](third-party-models.md#how-spelunk-finds-an-llm).
+
 ### `server_key`
 
 - **Type:** string, optional
@@ -184,9 +247,9 @@ there anyway is silently dropped and never resolves to a credential. See
 - **Default:** unset (derived at runtime if absent)
 - **Env override:** `SPELUNK_PROJECT_ID`
 
-Human-readable project slug used to route memory on a team `spelunk-server`. If
-the server routes projects by an internal UUID, the CLI resolves the slug for you
-on first use and caches the result locally. Required when `server_url` points at
+Human-readable project slug used to route memory on a team `spelunk-server`. It
+is sent to the server exactly as configured, whether it is a slug or a UUID:
+there is no lookup and nothing is cached. Required when `server_url` points at
 a non-loopback address (or provide it once via `spelunk sync --project <slug>`).
 If `server_url` is a loopback address, `project_id` may be omitted: spelunk
 derives a stable id from the project's git remote, or from a hash of the local
@@ -229,6 +292,13 @@ self-hosted `server_url`, which resolves its own credential separately (see
 `server_key` above). `refresh_token` rotates an expired access token and backs
 organization switching. The file is written with `0600` permissions. This
 table is not read from `.spelunk/config.toml`.
+
+Every field is optional: a partial table (for example a login without an org,
+which omits `org_id`, or a hand-trimmed file) is tolerated and never blocks
+commands that need no credentials. A missing or empty `access_token` is read as
+"not logged in" (no bearer is sent); a missing `expires_at` is treated as
+expired (forcing a refresh); a missing `org_id` applies no organization
+scoping.
 
 ### `[index]`
 
@@ -283,13 +353,21 @@ with repo access, so the project config has no field for it at all: a stray
 normally. Use `spelunk auth set-key --server <url>` (or `SPELUNK_SERVER_KEY`
 in CI) to set a shared team credential per developer instead.
 
+**`llm_url` is not accepted here either**, for a related reason: it is the
+endpoint a credential is presented to, and it is a per-developer choice. A
+committed value would point every teammate's local daemon at whichever machine
+the author happened to be running an LLM on. Set it in the personal config or
+via `SPELUNK_LLM_URL`.
+
 ## `~/.config/spelunk/config.toml` (personal)
 
 ```toml
 # ~/.config/spelunk/config.toml
 
-# Un-hides `spelunk explore` from --help (cosmetic only; see the field
-# descriptions above for what actually gates explore/harvest availability)
+# Chat-completions endpoint the local spelunk-server is started against, and
+# the model it is asked for. Store the endpoint's credential with
+# `spelunk auth set-key --llm`, never here.
+llm_url = "http://127.0.0.1:1234"
 llm_model = "google/gemma-3n-e4b"
 llm_context_length = 8192
 
@@ -311,6 +389,7 @@ without error but do nothing:
 |-----|--------|
 | `memory_server_url` | Removed. Use `server_url`. |
 | `memory_server_key` | Removed. Use `server_key`, `spelunk auth set-key`, or `spelunk login`. |
+| `embedding_model` | Removed. The embedding model is pinned product-wide (`codefuse-ai/F2LLM-v2-330M`, 896-dimension), computed only by the bundled native embedder in `spelunk-server`; there is no config key or relocation option for it. |
 
 `inference_url` is not a config key at all: it is populated at runtime only,
 when spelunk auto-discovers a loopback server, and is never read from either
@@ -326,6 +405,9 @@ TOML file.
 | `SPELUNK_SERVER_KEY` | `server_key` (takes precedence over the per-origin secret store and `spelunk login` tokens) |
 | `SPELUNK_PROJECT_ID` | `project_id` |
 | `SPELUNK_SERVER_CA` | `server_ca` |
+| `SPELUNK_LLM_URL` | `llm_url` |
+| `SPELUNK_LLM_MODEL` | `llm_model` |
+| `SPELUNK_LLM_KEY` | Credential for the `llm_url` endpoint (takes precedence over the secret-store entry written by `spelunk auth set-key --llm`). Not a `config.toml` field. |
 | `SPELUNK_MODE` | `mode` (`offline` / `local_first` / `cloud_first`; an unrecognized value is a hard error) |
 | `SPELUNK_NO_SERVER=1` | Kill-switch: forces `offline` mode and disables server autostart, regardless of `mode` or `server_url` |
 | `SPELUNK_CLOUD_URL` | spelunk.cloud API URL used by `login` / `org` (default `https://api.spelunk.cloud`) |
@@ -342,6 +424,7 @@ field here.
 
 ## What's next
 
+- [Stability contract](stability.md) - which of these keys semver freezes, which file each may be set in, and the deprecation policy for removing one
 - [Server setup](server-setup.md) - `server_url` / `server_key` in a team deployment
 - [Project memory](memory.md) - `store_in_git_notes` and memory backends
 - [Commands reference](commands.md) - `-c, --config` and per-command overrides

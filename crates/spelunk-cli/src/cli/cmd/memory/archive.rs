@@ -13,7 +13,7 @@ pub(super) async fn memory_archive(
     backend_override: Option<&str>,
 ) -> Result<()> {
     let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
-    if backend.archive(args.id).await? {
+    if backend.archive(args.id.clone()).await? {
         println!("Archived memory entry #{}.", args.id);
 
         // ── Git-notes write-through carrier ──────────────────────────────────
@@ -26,7 +26,7 @@ pub(super) async fn memory_archive(
         // already returned `Ok` above).
         let write_through = cfg.store_in_git_notes && backend_override != Some("git-notes");
         if write_through {
-            match backend.get(args.id).await {
+            match backend.get(args.id.clone()).await {
                 // `append_state_update` derives the entity_id from `note`
                 // itself (ADR-068 A6) rather than from the rowid `args.id`.
                 Ok(Some(note)) => {

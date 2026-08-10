@@ -1,12 +1,12 @@
 {
-  "version": "0.9.5",
+  "version": "0.9.7",
   "description": "Code intelligence for AI agents - persistent memory, code graph, search",
   "homepage": "https://github.com/spelunk-cloud/spelunk",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/spelunk-cloud/spelunk/releases/download/v0.9.5/spelunk-v0.9.5-x86_64-pc-windows-msvc.zip",
-      "hash": "3be1ab89a44d712321bcd9a51f51f3c2fd42d245a471552efee1ea7efb8a809c"
+      "url": "https://github.com/spelunk-cloud/spelunk/releases/download/v0.9.7/spelunk-v0.9.7-x86_64-pc-windows-msvc.zip",
+      "hash": "c523bac39bb5481b576000657b963ca2c1a87b5fea7f9a1942dcb2c14c0cd695"
     }
   },
   "bin": [

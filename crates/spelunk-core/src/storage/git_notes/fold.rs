@@ -90,6 +90,38 @@ fn resolve_superseded_by_entity_id(group: &[NoteRecord]) -> Option<String> {
         .and_then(|r| r.superseded_by_entity_id.clone())
 }
 
+/// Map each entity to the commit its note is anchored to: the commit carrying
+/// the entity's base (fold-winning) copy.
+///
+/// The base is the same earliest-recorded copy [`fold_group`] folds onto, so an
+/// entity's anchor is the commit it was first written on; later state-updates
+/// (appended to whatever `HEAD` was current when written) never move it. Keyed
+/// on `resolve_entity_id`, exactly like [`fold_records`], so a legacy line and a
+/// fresh line for the same entry share one anchor.
+///
+/// Input is `(commit, record)` pairs, one per raw line across every noted
+/// commit; the winning copy is chosen with the same [`base_key`] ordering
+/// [`base_index`] uses, so the anchor of an entity always names the commit of
+/// the copy `fold_group` keeps as base.
+pub(super) fn anchor_commits(records: &[(String, NoteRecord)]) -> HashMap<String, String> {
+    let mut best: HashMap<String, usize> = HashMap::new();
+    for (i, (_commit, record)) in records.iter().enumerate() {
+        match best.entry(record.resolve_entity_id()) {
+            Entry::Vacant(slot) => {
+                slot.insert(i);
+            }
+            Entry::Occupied(mut slot) => {
+                if base_key(record) < base_key(&records[*slot.get()].1) {
+                    slot.insert(i);
+                }
+            }
+        }
+    }
+    best.into_iter()
+        .map(|(entity, i)| (entity, records[i].0.clone()))
+        .collect()
+}
+
 /// Index of the copy every base-sourced field is taken from.
 ///
 /// Total by construction: two copies this cannot separate agree on every field

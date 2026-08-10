@@ -1,9 +1,12 @@
-//! Thin HTTP clients for spelunk-server inference endpoints.
+//! Thin HTTP client for spelunk-server inference endpoints.
 //!
-//! `ServerLlmClient`  — calls `POST /v1/projects/{id}/llm/complete` (SSE).
-//! `ServerEmbedClient`— calls `POST /v1/projects/{id}/index/embed`  (JSON).
+//! `ServerInferenceClient` calls both `POST /v1/projects/{id}/llm/complete`
+//! (SSE) and `POST /v1/projects/{id}/index/embed` (JSON); `ServerLlmAdapter`
+//! and `ServerEmbedAdapter` expose those two over spelunk-core's backend
+//! traits. LLM and embed routing resolve independently, so a command that needs
+//! both builds two clients rather than sharing one.
 //!
-//! These are the ONLY places in spelunk-cli that call AI inference routes.
+//! This is the ONLY place in spelunk-cli that calls AI inference routes.
 //! All prompt orchestration remains CLI-side; the server is a raw-inference peer.
 
 use std::sync::Arc;
@@ -169,6 +172,20 @@ impl ServerInferenceClient {
         Some(Self::build(cfg, base_url, bearer))
     }
 
+    /// Build a client for an explicitly configured remote `server_url` that is
+    /// serving LLM inference.
+    ///
+    /// [`from_config`](Self::from_config) infers "explicit remote" from the
+    /// inference target being unset, which cannot hold once LLM routing has
+    /// pointed that target at `server_url`. Without this, an error on the
+    /// remote would tell the user to read `spelunk server logs`, which only
+    /// ever reads the local daemon's log.
+    pub fn from_config_explicit_remote(cfg: &Config) -> Option<Self> {
+        let mut client = Self::from_config(cfg)?;
+        client.is_explicit_remote = true;
+        Some(client)
+    }
+
     /// Same as [`from_config`](Self::from_config) but with an injected
     /// [`SecretStore`](spelunk_core::config::secret_store::SecretStore), so
     /// in-process tests can exercise bearer resolution without touching the
@@ -268,6 +285,18 @@ impl ServerInferenceClient {
                 }),
             }),
         }
+    }
+
+    /// [`from_config_explicit_remote`](Self::from_config_explicit_remote) with
+    /// an injected secret store, so tests never touch the real one.
+    #[cfg(test)]
+    fn from_config_explicit_remote_with_store(
+        cfg: &Config,
+        store: &dyn spelunk_core::config::secret_store::SecretStore,
+    ) -> Option<Self> {
+        let mut client = Self::from_config_with_store(cfg, store)?;
+        client.is_explicit_remote = true;
+        Some(client)
     }
 
     /// Mark this test client as reached via an explicit remote `server_url`
@@ -446,9 +475,19 @@ impl ServerInferenceClient {
         let resp = self
             .send_authed(|| self.client.post(&url).json(&body))
             .await
-            .context("POST /llm/complete")?
-            .error_for_status()
-            .context("spelunk-server returned an error for /llm/complete")?;
+            .context("POST /llm/complete")?;
+        // Same treatment as `embed_text`: surface the server's structured
+        // reason instead of a bare status, and scope the "check the logs" hint
+        // to the server that actually failed.
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let remote_url = self.is_explicit_remote.then_some(self.base_url.as_str());
+            anyhow::bail!(
+                "{}",
+                server_inference_error("/llm/complete", status, &text, remote_url)
+            );
+        }
 
         let mut stream = resp.bytes_stream();
         let mut sse_buf = String::new();
@@ -668,17 +707,24 @@ fn server_inference_error(
             .filter(|s| !s.is_empty())
     };
     let reason = field("detail").or_else(|| field("error"));
+    // Naming the server is not only for the `unavailable` hint: on an explicit
+    // remote, every failure needs to say which server produced it, or the
+    // reader assumes their local daemon.
+    let server = match remote_url {
+        Some(url) => format!("spelunk-server at {url}"),
+        None => "spelunk-server".to_string(),
+    };
     let hint = match field("state") {
-        Some("loading") => " Retry shortly (`spelunk server status`).".to_string(),
+        Some("loading") => " Retry shortly (`spelunk server status`).",
         Some("unavailable") => match remote_url {
-            Some(url) => format!(" Check the logs for team server {url}."),
-            None => " See `spelunk server logs`.".to_string(),
+            Some(_) => " Check that server's logs.",
+            None => " See `spelunk server logs`.",
         },
-        _ => String::new(),
+        _ => "",
     };
     match reason {
-        Some(reason) => format!("spelunk-server {endpoint} returned {status}: {reason}.{hint}"),
-        None => format!("spelunk-server {endpoint} returned {status}.{hint}"),
+        Some(reason) => format!("{server} {endpoint} returned {status}: {reason}.{hint}"),
+        None => format!("{server} {endpoint} returned {status}.{hint}"),
     }
 }
 
@@ -1175,6 +1221,53 @@ mod tests {
         assert_eq!(encode_project_id("my-project"), "my-project");
     }
 
+    // The two peers this CLI talks to publish *incompatible* id types for the
+    // same conceptual Project resource, and both do so as documented
+    // contracts: the cloud API declares a `string`/`uuid`, this repo's
+    // `docs/openapi.json` declares an `integer`/`int64`. Neither is going to
+    // yield to the other soon.
+    //
+    // The only reason that divergence does not already break the CLI is that
+    // the CLI never holds a *typed* project id. It carries the identifier as an
+    // opaque string and spends it as one path segment, so both peers' shapes
+    // pass through untouched. That immunity is load-bearing and completely
+    // invisible in the type signature, which is exactly the kind of property
+    // that gets "tidied up" into an i64 or a Uuid by someone who only ever
+    // looked at one peer.
+    //
+    // This test is the tripwire for that tidy-up. It is deliberately not a
+    // schema-comparison test: this repo cannot see the other peer's schema, so
+    // it pins the CLI-side property that makes the divergence survivable
+    // instead. See docs/version-skew.md.
+    #[test]
+    fn project_id_stays_opaque_across_both_peers_id_types() {
+        let cloud_api_shaped = "550e8400-e29b-41d4-a716-446655440000";
+        let oss_server_shaped = "4815162342";
+
+        for id in [cloud_api_shaped, oss_server_shaped] {
+            let encoded = encode_project_id(id);
+            assert_eq!(
+                encoded, id,
+                "neither peer's id shape may be mangled on the way into the path"
+            );
+            let decoded = percent_encoding::percent_decode_str(&encoded)
+                .decode_utf8()
+                .expect("valid UTF-8 after percent-decoding");
+            assert_eq!(decoded, id, "round-trip mismatch for project id {id:?}");
+        }
+
+        // Both must also survive as the same Rust type, with no parsing step
+        // that could reject one peer's shape. If this stops compiling because
+        // `project_id` gained a stricter type, that is the breakage this test
+        // exists to announce, and the fix is a conversation with both peers,
+        // not a cast here.
+        let ids: Vec<String> = [cloud_api_shaped, oss_server_shaped]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(ids.len(), 2, "both peer id shapes must be representable");
+    }
+
     /// The synthetic query `chunk_id` is built from a fresh `uuid` crate v7
     /// UUID. Two calls must differ (so concurrent queries never collide), and
     /// the value must be a real version-7 UUID — the `query:` prefix is what
@@ -1204,6 +1297,21 @@ mod tests {
             .expect_err("non-loopback http:// must be rejected");
         assert!(err.contains("loopback"));
         assert!(err.contains("https"));
+    }
+
+    // The inference client gates on the same validator, so an authority that
+    // only looks like loopback must not reach the point of carrying a bearer.
+    #[test]
+    fn transport_validator_rejects_spoofed_loopback_authorities() {
+        for url in [
+            "http://127.0.0.1.evil.example",
+            "http://127.0.0.1@evil.example",
+            "http://127.0.0.1:1234@evil.example",
+        ] {
+            let err = spelunk_core::config::validate_transport_url(url)
+                .expect_err("a host that only looks like loopback must be rejected");
+            assert!(err.contains("loopback"), "{url}: {err}");
+        }
     }
 
     #[test]
@@ -1238,6 +1346,102 @@ mod tests {
             ServerInferenceClient::from_config_with_store(&cfg, &store).is_some(),
             "https:// inference URL (any host) must be accepted"
         );
+    }
+
+    // ── the remote LLM branch keeps its explicit-remote identity ────────────
+
+    // LLM routing points the inference target at `server_url`, which is
+    // exactly the shape `from_config` reads as "not an explicit remote". If
+    // the flag were re-derived rather than carried, a failure on the team
+    // server would tell the reader to run `spelunk server logs`, which only
+    // ever reads their own local daemon's log.
+    #[test]
+    #[serial_test::serial]
+    fn explicit_remote_constructor_keeps_the_flag_when_the_inference_target_is_set() {
+        unsafe {
+            std::env::remove_var("SPELUNK_SERVER_KEY");
+        }
+        let cfg = crate::config::Config {
+            inference_url: Some("https://team.example:7777".to_string()),
+            server_url: Some("https://team.example:7777".to_string()),
+            project_id: Some("proj".to_string()),
+            ..Default::default()
+        };
+        let store = spelunk_core::config::secret_store::MemoryStore::default();
+        assert!(
+            !ServerInferenceClient::from_config_with_store(&cfg, &store)
+                .expect("client builds")
+                .is_explicit_remote,
+            "the plain constructor derives the flag and cannot see through this shape"
+        );
+        assert!(
+            ServerInferenceClient::from_config_explicit_remote_with_store(&cfg, &store)
+                .expect("client builds")
+                .is_explicit_remote,
+            "the remote LLM branch must carry the flag rather than re-derive it"
+        );
+    }
+
+    // `/llm/complete` used to throw the server's response body away and report
+    // a bare status. A failure on a remote LLM must name that server, and must
+    // never send the reader to their own local daemon's log.
+    #[tokio::test]
+    async fn llm_complete_error_on_an_explicit_remote_names_that_server_not_local_logs() {
+        let remote = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/llm/complete"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": "llm unavailable",
+                "state": "unavailable",
+                "detail": "upstream endpoint refused the connection",
+            })))
+            .mount(&remote)
+            .await;
+
+        let client = ServerInferenceClient::for_test(&remote.uri(), "proj", None, None)
+            .with_explicit_remote();
+        let err = client
+            .llm_complete(&[LlmMessage::user("hi")], 16, None)
+            .await
+            .expect_err("a 503 must be an error");
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains(&remote.uri()),
+            "the failing server must be named: {msg}"
+        );
+        assert!(
+            msg.contains("upstream endpoint refused the connection"),
+            "the server's own reason must survive: {msg}"
+        );
+        assert!(
+            !msg.contains("spelunk server logs"),
+            "a remote failure must not point at the local daemon's log: {msg}"
+        );
+    }
+
+    // The loopback counterpart: there, the local log genuinely is the place to
+    // look, so that hint must stay.
+    #[tokio::test]
+    async fn llm_complete_error_on_the_loopback_still_points_at_the_local_log() {
+        let loopback = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/proj/llm/complete"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": "llm unavailable",
+                "state": "unavailable",
+                "detail": "no LLM configured",
+            })))
+            .mount(&loopback)
+            .await;
+
+        let client = ServerInferenceClient::for_test(&loopback.uri(), "proj", None, None);
+        let err = client
+            .llm_complete(&[LlmMessage::user("hi")], 16, None)
+            .await
+            .expect_err("a 503 must be an error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("spelunk server logs"), "got: {msg}");
     }
 
     // ── server_inference_error ───────────────────────────────────────────────

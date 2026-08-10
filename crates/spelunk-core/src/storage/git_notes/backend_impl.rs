@@ -2,14 +2,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
 
-use super::super::backend::{MemoryBackend, NoteInput};
-use super::super::memory::{MemoryEdge, Note};
+use super::super::backend::{MemoryBackend, NoteInput, numeric_note_id};
+use super::super::memory::{MemoryEdge, Note, NoteId};
 use super::super::note_record::{NoteRecord, now_millis, now_secs, record_to_note};
 use super::GitNotesBackend;
 
 #[async_trait]
 impl MemoryBackend for GitNotesBackend {
-    async fn add(&self, input: NoteInput) -> Result<(i64, bool)> {
+    async fn add(&self, input: NoteInput) -> Result<(NoteId, bool)> {
         let id = now_millis();
         let entity_id =
             crate::storage::entity_id::entity_id(&input.kind, &input.title, &input.body);
@@ -37,7 +37,7 @@ impl MemoryBackend for GitNotesBackend {
 
         // Git notes are append-only: this backend never detects or collapses
         // a collision, so every add is reported as a fresh insert.
-        Ok((id, true))
+        Ok((NoteId::from_i64(id), true))
     }
 
     async fn list(
@@ -60,14 +60,23 @@ impl MemoryBackend for GitNotesBackend {
             .await
     }
 
+    /// Filters by the git-notes **anchor** (the commit each entry's note is
+    /// attached to), not a stored `source_ref` field — the notes carrier never
+    /// records the anchor commit inside the record, only as the attachment. This
+    /// is what makes a note-anchored `memory add` entry findable by its commit
+    /// on the git-notes-primary path; the SQLite-primary path resolves the same
+    /// anchors via [`GitNotesBackend::entity_ids_anchored_to`] and reads the
+    /// authoritative local rows back.
     async fn list_by_source_ref(
         &self,
-        _source_ref_prefix: &str,
-        _limit: usize,
-        _include_archived: bool,
-        _as_of: Option<i64>,
+        source_ref_prefix: &str,
+        limit: usize,
+        include_archived: bool,
+        as_of: Option<i64>,
     ) -> Result<Vec<Note>> {
-        Err(crate::error::SpelunkError::BackendUnsupported("list_by_source_ref".into()).into())
+        let effective_limit = limit.min(super::GIT_NOTES_MAX_LIST);
+        self.list_anchored_to(source_ref_prefix, include_archived, as_of, effective_limit)
+            .await
     }
 
     /// Folds every commit's records first (`folded_records`), then looks up
@@ -78,7 +87,8 @@ impl MemoryBackend for GitNotesBackend {
     /// `fold_group`'s base) but reflects the entity's current `status` and
     /// `superseded_by_entity_id`, which callers checking "is OLD still
     /// active" (ADR-068 E4) depend on.
-    async fn get(&self, id: i64) -> Result<Option<Note>> {
+    async fn get(&self, id: NoteId) -> Result<Option<Note>> {
+        let id = numeric_note_id(&id)?;
         Ok(self
             .folded_records()
             .await?
@@ -103,7 +113,8 @@ impl MemoryBackend for GitNotesBackend {
     /// entity-keyed event log (see [`append_state_update`]'s doc), and a
     /// rewrite mutates an already-written line's bytes, breaking that
     /// invariant even on a single machine with no other clone involved.
-    async fn archive(&self, id: i64) -> Result<bool> {
+    async fn archive(&self, id: NoteId) -> Result<bool> {
+        let id = numeric_note_id(&id)?;
         let mut found = None;
         for (commit, _) in self.noted_commits().await? {
             let blob = self.read_note_blob(&commit).await?;
@@ -165,7 +176,7 @@ impl MemoryBackend for GitNotesBackend {
         Err(crate::error::SpelunkError::BackendUnsupported("search_hybrid".into()).into())
     }
 
-    async fn supersede(&self, _old_id: i64, _new_id: i64) -> Result<bool> {
+    async fn supersede(&self, _old_id: NoteId, _new_id: NoteId) -> Result<bool> {
         Err(crate::error::SpelunkError::BackendUnsupported("supersede".into()).into())
     }
 

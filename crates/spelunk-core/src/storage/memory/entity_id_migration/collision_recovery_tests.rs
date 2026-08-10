@@ -162,7 +162,7 @@ fn add_note_after_promotion_does_not_touch_status_or_superseded_by() {
     );
     assert_eq!(
         note.superseded_by,
-        Some(other_id),
+        sup(other_id),
         "criterion 27: superseded_by must be left untouched by the collision path"
     );
 }
@@ -280,7 +280,7 @@ fn add_note_superseding_sets_entity_id_and_archives_old_on_fresh_insert() {
     assert_eq!(old.status, "archived");
     assert_eq!(
         old.superseded_by,
-        Some(new_id),
+        sup(new_id),
         "archive-OLD must target the freshly-inserted row"
     );
 }
@@ -349,7 +349,7 @@ fn add_note_superseding_recovers_from_collision_and_archives_old_on_existing_row
     assert_eq!(old.status, "archived");
     assert_eq!(
         old.superseded_by,
-        Some(existing_id),
+        sup(existing_id),
         "criterion 3: archive-OLD must target the EXISTING row, not a new one"
     );
 }
@@ -587,7 +587,7 @@ fn add_note_superseding_self_collision_does_not_create_self_referential_archived
     let row = store.get(old_id).unwrap().expect("row still exists");
     assert_ne!(
         row.superseded_by,
-        Some(old_id),
+        sup(old_id),
         "BUG: a self-supersede collision must not leave a row pointing \
          superseded_by at its own id, this is a self-loop of the exact \
          shape dedupe.rs's own self-edge guard exists to prevent, just \
@@ -648,4 +648,9 @@ fn backfill_other_error_from_update_propagates_unchanged() {
         "expected the synthetic trigger error to propagate somewhere in \
          the error chain, got: {full_chain}"
     );
+}
+
+// Expected `Note::superseded_by` for a store-minted rowid.
+fn sup(id: i64) -> Option<crate::storage::memory::NoteId> {
+    Some(crate::storage::memory::NoteId::from_i64(id))
 }

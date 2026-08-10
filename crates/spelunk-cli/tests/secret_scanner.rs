@@ -159,7 +159,11 @@ fn summary_secret_is_not_persisted() {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "ok",
                 "version": "test",
-                "capabilities": ["memory", "index.embed", "search.semantic", "explore", "plan"],
+                // `llm.complete` is what LLM routing keys on; without it this
+                // server has no LLM and the summary pass under test is skipped.
+                "capabilities": [
+                    "memory", "index.embed", "search.semantic", "explore", "plan", "llm.complete"
+                ],
             })))
             .mount(&server)
             .await;

@@ -47,7 +47,7 @@ async fn mount_health_and_since(server: &MockServer) {
 // point is bearer-per-origin resolution, not config-file precedence.
 fn write_server_config(dir: &Path, name: &str) -> std::path::PathBuf {
     let config_path = dir.join(format!("{name}.toml"));
-    std::fs::write(&config_path, "embedding_model = \"test-model\"\n").unwrap();
+    std::fs::write(&config_path, "").unwrap();
     config_path
 }
 

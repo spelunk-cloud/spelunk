@@ -15,23 +15,23 @@ use spelunk_core::config::{self, server_keys};
 
 #[derive(Args, Debug)]
 pub struct LogoutArgs {
-    /// Also clear every stored self-hosted server key (the per-origin map
-    /// and any legacy entry).
+    /// Clear every stored self-hosted server key (the per-origin map and any
+    /// legacy entry) and nothing else; the cloud token pair is left intact.
     #[arg(long, conflicts_with = "server")]
     pub servers: bool,
 
-    /// Also clear the stored server key for this one server origin.
+    /// Clear the stored server key for this one server origin and nothing
+    /// else; the cloud token pair is left intact.
     #[arg(long)]
     pub server: Option<String>,
 }
 
 pub async fn logout(args: LogoutArgs) -> Result<()> {
-    config::remove_auth_tokens()
-        .context("removing [auth] tokens from ~/.config/spelunk/config.toml")?;
-    println!("Logged out. Stored spelunk.cloud credentials have been removed.");
-
     let store = config::default_secret_store()?;
 
+    // Each form clears exactly one credential store and leaves the other
+    // intact (see the module doc). Only the bare, no-flag form touches the
+    // cloud `[auth]` pair; `--server`/`--servers` are server-key-only.
     if args.servers {
         server_keys::clear_all(store.as_ref()).context("clearing the server_keys map")?;
         // Belt-and-braces: also clear the legacy flat entry and any plaintext
@@ -43,6 +43,10 @@ pub async fn logout(args: LogoutArgs) -> Result<()> {
             .context("clearing the stored server key")?;
         println!("Cleared the stored server key for {origin}.");
     } else {
+        config::remove_auth_tokens()
+            .context("removing [auth] tokens from ~/.config/spelunk/config.toml")?;
+        println!("Logged out. Stored spelunk.cloud credentials have been removed.");
+
         let n = server_keys::count(store.as_ref())?;
         if n > 0 {
             println!(

@@ -56,6 +56,13 @@ pub const KEYRING_SERVICE: &str = "spelunk";
 /// future WorkOS token, it is the single `Authorization: Bearer` credential.
 pub const KEY_SERVER_KEY: &str = "server_key";
 
+/// Key name for the credential sent to the configured LLM endpoint.
+///
+/// A single flat entry rather than a per-origin map: there is one LLM
+/// endpoint, not a set of them. Read only on the daemon-spawn path, never by
+/// [`crate::config::Config::load`].
+pub const KEY_LLM_KEY: &str = "llm_key";
+
 /// Environment variable that pins which backend the secret store uses.
 ///
 /// * unset / `auto` — prefer the keychain, fall back to the file store when no

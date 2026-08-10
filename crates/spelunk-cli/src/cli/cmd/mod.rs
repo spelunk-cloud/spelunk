@@ -3,6 +3,7 @@ pub mod auth_api;
 pub mod check;
 pub(crate) mod color;
 pub mod context;
+mod daemon_llm;
 mod embed_worker;
 pub mod explore;
 pub mod graph;

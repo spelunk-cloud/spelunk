@@ -136,313 +136,205 @@ async fn search_sends_query_text_not_precomputed_embedding() {
     );
 }
 
-// ── Cloud-api slug → UUID resolution (ADR-005) ────────────────────────────────
-
-use tempfile::TempDir;
-
-const UUID_A: &str = "018f4e2a-1234-7abc-8def-000000000001";
-const UUID_B: &str = "018f4e2a-1234-7abc-8def-000000000002";
-
-fn write_cache(dir: &std::path::Path, slug: &str, uuid: &str) {
-    std::fs::write(
-        dir.join(CLOUD_PROJECT_CACHE_FILE),
-        format!("slug = \"{slug}\"\nuuid = \"{uuid}\"\n"),
-    )
-    .unwrap();
-}
-
-/// D5: a raw UUID in config is used directly — no lookup, no cache write.
+// ── CLI to peer: query parameters this server does not accept ────────────────
+//
+// Pins live drift rather than desired behaviour. `spelunk_server::handlers::
+// ListQuery` deserialises exactly three names from `GET /memory`: `kind`,
+// `limit`, `archived`. Axum's `Query` extractor ignores anything else, so the
+// two parameters below are accepted by the transport, dropped by the handler,
+// and never reported to the caller.
+//
+// The `source_ref` case is the one with teeth: `has_source_ref` decides whether
+// a commit has already been harvested purely from whether the filtered list
+// came back non-empty. With the filter dropped, the server answers with the
+// project's newest entries regardless of the sha asked about, so the answer is
+// "yes" for every commit as soon as the project holds any memory at all.
+//
+// When the server grows these parameters (or the client stops sending them),
+// this test is the thing that has to change, and its failure is the reminder
+// that `has_source_ref` was reading a filtered list that was never filtered.
 #[tokio::test]
-async fn resolve_raw_uuid_passes_through_without_lookup() {
-    let tmp = TempDir::new().unwrap();
-    // server_url points nowhere reachable; if a lookup were attempted this
-    // would fail. A raw UUID must short-circuit before any network call.
-    let got = resolve_cloud_project_uuid(
-        UUID_A,
-        "https://api.example.com",
-        Some("key"),
-        None,
-        tmp.path(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(got.to_string(), UUID_A);
-    // No cache should have been written for the raw-UUID path.
-    assert!(!tmp.path().join(CLOUD_PROJECT_CACHE_FILE).exists());
-}
-
-/// D6: loopback / unset server_url with a slug is a misuse — clear error, no
-/// network call.
-#[tokio::test]
-async fn resolve_loopback_with_slug_errors() {
-    let tmp = TempDir::new().unwrap();
-    let err =
-        resolve_cloud_project_uuid("spelunk", "http://127.0.0.1:7777", None, None, tmp.path())
-            .await
-            .unwrap_err();
-    assert!(err.to_string().contains("loopback"), "got: {err}");
-
-    let err2 = resolve_cloud_project_uuid("spelunk", "", None, None, tmp.path())
-        .await
-        .unwrap_err();
-    assert!(err2.to_string().contains("loopback"), "got: {err2}");
-}
-
-/// D4: a cached entry whose stored slug matches the current project_id is used
-/// without any network call.
-#[tokio::test]
-#[serial_test::serial]
-async fn resolve_uses_cache_when_slug_matches() {
-    unsafe { std::env::remove_var("SPELUNK_NO_SLUG_CACHE") };
-    let tmp = TempDir::new().unwrap();
-    write_cache(tmp.path(), "spelunk", UUID_A);
-
-    // Unreachable server_url: a cache hit must avoid the network entirely.
-    let got = resolve_cloud_project_uuid(
-        "spelunk",
-        "https://unreachable.invalid",
-        Some("key"),
-        None,
-        tmp.path(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(got.to_string(), UUID_A);
-}
-
-/// D4 invalidation: a cache whose stored slug differs from the current
-/// project_id is discarded and re-resolved via GET /v1/projects.
-#[tokio::test]
-#[serial_test::serial]
-async fn resolve_discards_cache_on_slug_mismatch() {
+async fn list_sends_query_parameters_the_oss_server_silently_drops() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    unsafe { std::env::remove_var("SPELUNK_NO_SLUG_CACHE") };
-    let tmp = TempDir::new().unwrap();
-    // Cache holds an entry for a *different* slug than we resolve.
-    write_cache(tmp.path(), "old-slug", UUID_A);
-
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/v1/projects"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "projects": [
-                { "id": UUID_B, "slug": "new-slug" }
-            ]
-        })))
+        .and(path("/v1/projects/local%2Fabc123/memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
         .mount(&server)
         .await;
 
-    let got =
-        resolve_cloud_project_uuid_inner("new-slug", &server.uri(), Some("key"), None, tmp.path())
-            .await
-            .unwrap();
-    assert_eq!(
-        got.to_string(),
-        UUID_B,
-        "stale-slug cache must be discarded and re-resolved"
-    );
-
-    // The cache should now be rewritten to the new slug → uuid mapping.
-    let rewritten = std::fs::read_to_string(tmp.path().join(CLOUD_PROJECT_CACHE_FILE)).unwrap();
-    assert!(rewritten.contains("new-slug"), "cache: {rewritten}");
-    assert!(rewritten.contains(UUID_B), "cache: {rewritten}");
-}
-
-/// Happy path: slug resolves via GET /v1/projects and the result is cached.
-#[tokio::test]
-#[serial_test::serial]
-async fn resolve_via_list_endpoint_and_caches() {
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    unsafe { std::env::remove_var("SPELUNK_NO_SLUG_CACHE") };
-    let tmp = TempDir::new().unwrap();
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/projects"))
-        .and(header("Authorization", "Bearer sekret"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "projects": [
-                { "id": UUID_A, "slug": "other" },
-                { "id": UUID_B, "slug": "spelunk" }
-            ]
-        })))
-        .mount(&server)
-        .await;
-
-    let got = resolve_cloud_project_uuid_inner(
-        "spelunk",
-        &server.uri(),
-        Some("sekret"),
-        None,
-        tmp.path(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(got.to_string(), UUID_B);
-
-    // Cached for next time.
-    let cached = read_cloud_project_cache(tmp.path(), "spelunk").unwrap();
-    assert_eq!(cached.to_string(), UUID_B);
-}
-
-/// D6: a slug not present in the list yields a fatal, actionable error.
-#[tokio::test]
-#[serial_test::serial]
-async fn resolve_slug_not_found_errors() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    unsafe { std::env::remove_var("SPELUNK_NO_SLUG_CACHE") };
-    let tmp = TempDir::new().unwrap();
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/projects"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "projects": [ { "id": UUID_A, "slug": "other" } ]
-        })))
-        .mount(&server)
-        .await;
-
-    let err =
-        resolve_cloud_project_uuid_inner("missing", &server.uri(), Some("k"), None, tmp.path())
-            .await
-            .unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("missing"), "got: {msg}");
-    assert!(msg.contains("not found"), "got: {msg}");
-    // D2/D6: the error must be *actionable* — point the user at the recovery
-    // steps (list projects / inspect config), not just say "not found".
-    assert!(
-        msg.contains("spelunk projects list") && msg.contains("config.toml"),
-        "slug-not-found error must include the actionable recovery hint; got: {msg}"
-    );
-    // A "not found" must NOT have poisoned the cache with a bogus entry.
-    assert!(
-        !tmp.path().join(CLOUD_PROJECT_CACHE_FILE).exists(),
-        "no cache file should be written when the slug is not found"
-    );
-}
-
-/// D6: GET /v1/projects returning a 401 (auth) surfaces a fatal error mentioning
-/// the URL/status, and does not write a cache entry.
-#[tokio::test]
-#[serial_test::serial]
-async fn resolve_surfaces_401_error() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    unsafe { std::env::remove_var("SPELUNK_NO_SLUG_CACHE") };
-    let tmp = TempDir::new().unwrap();
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/projects"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(&server)
-        .await;
-
-    let err =
-        resolve_cloud_project_uuid_inner("spelunk", &server.uri(), Some("bad"), None, tmp.path())
-            .await
-            .unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("/v1/projects"),
-        "error should name the endpoint; got: {msg}"
-    );
-    assert!(
-        msg.contains("401") || msg.to_lowercase().contains("unauthorized"),
-        "error should surface the 401 status; got: {msg}"
-    );
-    assert!(
-        !tmp.path().join(CLOUD_PROJECT_CACHE_FILE).exists(),
-        "no cache should be written on an error response"
-    );
-}
-
-/// D6: GET /v1/projects returning a 5xx surfaces a fatal error with the status.
-#[tokio::test]
-#[serial_test::serial]
-async fn resolve_surfaces_5xx_error() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    unsafe { std::env::remove_var("SPELUNK_NO_SLUG_CACHE") };
-    let tmp = TempDir::new().unwrap();
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/projects"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
-
-    let err =
-        resolve_cloud_project_uuid_inner("spelunk", &server.uri(), Some("k"), None, tmp.path())
-            .await
-            .unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("503") || msg.to_lowercase().contains("server error"),
-        "error should surface the 5xx status; got: {msg}"
-    );
-}
-
-/// D6: a connection failure (server unreachable) surfaces a fatal error that
-/// names the endpoint being resolved, rather than panicking or hanging.
-#[tokio::test]
-#[serial_test::serial]
-async fn resolve_surfaces_connection_error() {
-    unsafe { std::env::remove_var("SPELUNK_NO_SLUG_CACHE") };
-    let tmp = TempDir::new().unwrap();
-
-    // Bind then immediately drop a listener to obtain a port nothing listens on.
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
+    let backend = RemoteMemoryBackend {
+        client: reqwest::Client::new(),
+        base_url: server.uri(),
+        project_id: "local/abc123".to_string(),
+        api_key: None,
     };
-    let dead_url = format!("http://127.0.0.1:{port}");
 
-    let err = resolve_cloud_project_uuid_inner("spelunk", &dead_url, Some("k"), None, tmp.path())
+    backend
+        .list(None, 5, false, Some(1_700_000_000))
         .await
-        .unwrap_err();
-    let msg = format!("{err:#}");
+        .expect("list must reach the mock");
+    backend
+        .list_by_source_ref("deadbeefcafe", 1, true, None)
+        .await
+        .expect("list_by_source_ref must reach the mock");
+
+    let queries: Vec<String> = server
+        .received_requests()
+        .await
+        .expect("mock server records requests")
+        .iter()
+        .map(|r| r.url.query().unwrap_or_default().to_string())
+        .collect();
+
+    let accepted_by_the_server = ["kind", "limit", "archived"];
+    let sent: Vec<&str> = queries
+        .iter()
+        .flat_map(|q| q.split('&'))
+        .filter_map(|pair| pair.split('=').next())
+        .filter(|name| !accepted_by_the_server.contains(name))
+        .collect();
+
     assert!(
-        msg.contains("/v1/projects") && msg.contains("spelunk"),
-        "connection error should name the endpoint and slug being resolved; got: {msg}"
+        sent.contains(&"as_of"),
+        "expected `list` to still be sending the unsupported `as_of` parameter; \
+         if it stopped, delete this test. Sent: {sent:?}"
+    );
+    assert!(
+        sent.contains(&"source_ref"),
+        "expected `list_by_source_ref` to still be sending the unsupported \
+         `source_ref` parameter; if it stopped, delete this test. Sent: {sent:?}"
     );
 }
 
-/// SPELUNK_NO_SLUG_CACHE=1 forces a fresh lookup, ignoring an existing cache.
+// ── Wire-shape tolerance ─────────────────────────────────────────────────────
+//
+// The read endpoints must accept both shapes a team server can send: the
+// object envelope a server at or after the ADR-076 wire-contract fix returns
+// (`{entries, total}` / `{shas}`), and the bare array an older server still in
+// the version-skew support window returns. Accepting both is what keeps a
+// newer CLI working against an older team server. See docs/version-skew.md.
+
+fn note_json(title: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": 1,
+        "kind": "decision",
+        "title": title,
+        "body": "b",
+        "tags": [],
+        "linked_files": [],
+        "created_at": 0,
+        "status": "active",
+        "superseded_by": null,
+    })
+}
+
+fn backend_at(uri: String) -> RemoteMemoryBackend {
+    RemoteMemoryBackend {
+        client: reqwest::Client::new(),
+        base_url: uri,
+        project_id: "proj".to_string(),
+        api_key: None,
+    }
+}
+
 #[tokio::test]
-#[serial_test::serial]
-async fn resolve_no_cache_env_forces_fresh_lookup() {
+async fn list_accepts_object_envelope_from_newer_server() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let tmp = TempDir::new().unwrap();
-    // Cache says UUID_A, but a forced fresh lookup must return the server value.
-    write_cache(tmp.path(), "spelunk", UUID_A);
-
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/v1/projects"))
+        .and(path("/v1/projects/proj/memory"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "projects": [ { "id": UUID_B, "slug": "spelunk" } ]
+            "entries": [note_json("A")],
+            "total": 1,
         })))
         .mount(&server)
         .await;
 
-    unsafe { std::env::set_var("SPELUNK_NO_SLUG_CACHE", "1") };
-    let got =
-        resolve_cloud_project_uuid_inner("spelunk", &server.uri(), Some("k"), None, tmp.path())
-            .await;
-    unsafe { std::env::remove_var("SPELUNK_NO_SLUG_CACHE") };
+    let notes = backend_at(server.uri())
+        .list(None, 10, false, None)
+        .await
+        .expect("list must parse the object envelope");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].title, "A");
+}
 
-    assert_eq!(got.unwrap().to_string(), UUID_B);
+#[tokio::test]
+async fn list_accepts_bare_array_from_older_server() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/projects/proj/memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([note_json("A")])))
+        .mount(&server)
+        .await;
+
+    let notes = backend_at(server.uri())
+        .list(None, 10, false, None)
+        .await
+        .expect("list must still parse a legacy bare array");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].title, "A");
+}
+
+#[tokio::test]
+async fn search_accepts_object_envelope_from_newer_server() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/projects/proj/memory/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entries": [note_json("hit")],
+            "total": 1,
+        })))
+        .mount(&server)
+        .await;
+
+    let query_blob = crate::embeddings::vec_to_blob(&[0.1_f32, 0.2, 0.3]);
+    let notes = backend_at(server.uri())
+        .search(&query_blob, "q", 5, None)
+        .await
+        .expect("search must parse the object envelope");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].title, "hit");
+}
+
+#[tokio::test]
+async fn harvested_shas_accepts_both_shapes() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let enveloped = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/projects/proj/memory/harvested-shas"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "shas": ["abc"] })),
+        )
+        .mount(&enveloped)
+        .await;
+    let shas = backend_at(enveloped.uri())
+        .harvested_shas()
+        .await
+        .expect("harvested_shas must parse the object envelope");
+    assert!(shas.contains("abc"), "got: {shas:?}");
+
+    let bare = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/projects/proj/memory/harvested-shas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(["def"])))
+        .mount(&bare)
+        .await;
+    let shas = backend_at(bare.uri())
+        .harvested_shas()
+        .await
+        .expect("harvested_shas must still parse a legacy bare array");
+    assert!(shas.contains("def"), "got: {shas:?}");
 }

@@ -36,6 +36,60 @@ fn reject_option_like_ref(git_ref: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse the built-in default range shape `HEAD~<N>..HEAD`, returning `N`.
+///
+/// Only this exact shape is clamped (see [`resolve_range_revs`]); any other
+/// range the user passes — a tag range like `v1.0..HEAD`, a raw SHA range, or a
+/// single ref — is their explicit choice and reaches `git log` untouched.
+fn parse_head_count_range(range: &str) -> Option<usize> {
+    range
+        .strip_prefix("HEAD~")?
+        .strip_suffix("..HEAD")?
+        .parse::<usize>()
+        .ok()
+}
+
+/// Number of commits reachable from `HEAD`, or `None` when it cannot be
+/// determined (an empty repo with no commits yet, or `git` failing/absent).
+fn head_commit_count() -> Option<usize> {
+    let out = std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()?
+        .trim()
+        .parse::<usize>()
+        .ok()
+}
+
+/// Resolve the `git log` revision argument(s) and the quoted display label for
+/// a range harvest (i.e. when no `--branch` override is in play).
+///
+/// The default range `HEAD~N..HEAD` names `HEAD~N`, a commit that does not
+/// exist in a repo with fewer than `N + 1` commits, so `git log` aborts with a
+/// raw `fatal: bad revision`. When the range has that shape we clamp `N` to the
+/// commits that actually exist and select them with `--max-count` against
+/// `HEAD`: that lists the most recent `min(N, commit_count)` commits (the whole
+/// history, root included, on a shallow repo) and never errors. A `commit_count`
+/// of `None` (git could not count) or any non-default range is left untouched,
+/// so a genuinely malformed range still surfaces git's own error.
+fn resolve_range_revs(git_range: &str, commit_count: Option<usize>) -> (Vec<String>, String) {
+    match (parse_head_count_range(git_range), commit_count) {
+        (Some(requested), Some(count)) if count > 0 => {
+            let effective = requested.min(count);
+            (
+                vec![format!("--max-count={effective}"), "HEAD".to_string()],
+                format!("'HEAD~{effective}..HEAD'"),
+            )
+        }
+        _ => (vec![git_range.to_string()], format!("'{git_range}'")),
+    }
+}
+
 pub(super) async fn memory_harvest(
     args: MemoryHarvestArgs,
     mem_path: &std::path::Path,
@@ -85,21 +139,69 @@ pub(super) async fn memory_harvest(
     }
 }
 
+/// Build harvest's two inference clients: one for embedding (dedup vectors),
+/// one for LLM extraction.
+///
+/// They resolve independently and can land on different servers, so a single
+/// shared client would silently send one of the two to the wrong place.
+pub(super) async fn harvest_clients(
+    cfg: &Config,
+    mem_path: &std::path::Path,
+) -> Result<(ServerInferenceClient, ServerInferenceClient)> {
+    let embed_server =
+        ServerInferenceClient::from_config(cfg).ok_or_else(harvest_requires_server)?;
+    let project_root = mem_path.parent().unwrap_or(mem_path);
+    let route = capability::resolve_llm_route(cfg, project_root).await;
+    let Some(llm_server) = route.client() else {
+        anyhow::bail!(
+            "{}",
+            capability::no_llm_message(
+                route
+                    .reason()
+                    .unwrap_or(capability::NoLlmReason::NoLlmAnywhere),
+                capability::LlmFeature::MemoryHarvest,
+            )
+        );
+    };
+    Ok((embed_server, llm_server))
+}
+
 async fn memory_harvest_git(
     args: MemoryHarvestArgs,
     mem_path: &std::path::Path,
     cfg: &Config,
     backend_override: Option<&str>,
 ) -> Result<()> {
-    let (git_ref, range_label) = match &args.branch {
-        Some(branch) => (branch.clone(), format!("full history of '{branch}'")),
-        None => (args.git_range.clone(), format!("'{}'", args.git_range)),
+    // Validate the user-supplied ref first, so a malicious option-shaped
+    // `--branch`/`--git-range` value is rejected even before the LLM precheck.
+    let user_ref = args
+        .branch
+        .clone()
+        .unwrap_or_else(|| args.git_range.clone());
+    reject_option_like_ref(&user_ref)?;
+
+    // LLM capability precheck, BEFORE the git range is resolved (mirrors
+    // `explore`). With no LLM available the user must see the actionable
+    // locked-feature message, not a raw `git log` error from an unresolvable
+    // range on a shallow repo — the message must not depend on repo size.
+    let (embed_server, llm_server) = harvest_clients(cfg, mem_path).await?;
+
+    // Resolve the revisions to walk: `--branch` means the full history of that
+    // ref; otherwise clamp the default `HEAD~N..HEAD` range to the commits that
+    // actually exist so a repo with fewer than N+1 commits never trips
+    // `bad revision`.
+    let (git_revs, range_label): (Vec<String>, String) = match &args.branch {
+        Some(branch) => (vec![branch.clone()], format!("full history of '{branch}'")),
+        None => resolve_range_revs(&args.git_range, head_commit_count()),
     };
 
-    reject_option_like_ref(&git_ref)?;
+    let mut log_args: Vec<String> = vec!["log".to_string()];
+    log_args.extend(git_revs);
+    log_args.push("--format=%H%x00%s%x00%b%x00---".to_string());
+    log_args.push("--".to_string());
 
     let git_out = std::process::Command::new("git")
-        .args(["log", &git_ref, "--format=%H%x00%s%x00%b%x00---", "--"])
+        .args(&log_args)
         .output()
         .context("running git log (is git installed and are we in a git repo?)")?;
 
@@ -162,7 +264,7 @@ async fn memory_harvest_git(
     let total = new_commits.len();
     let num_batches = total.div_ceil(batch_size);
     println!(
-        "Analysing {} new commit(s) in '{}' ({} batch(es) of up to {})…",
+        "Analysing {} new commit(s) in {} ({} batch(es) of up to {})…",
         total, range_label, num_batches, batch_size
     );
 
@@ -196,7 +298,7 @@ async fn memory_harvest_git(
         }
     });
 
-    let server = ServerInferenceClient::from_config(cfg).ok_or_else(harvest_requires_server)?;
+    // `embed_server` / `llm_server` were resolved up front as the LLM precheck.
 
     let mut stored = 0usize;
     let mut dedup_skipped = 0usize;
@@ -289,7 +391,7 @@ async fn memory_harvest_git(
 
         let messages = vec![LlmMessage::system(system), LlmMessage::user(user)];
 
-        let raw_json = match server
+        let raw_json = match llm_server
             .llm_complete(&messages, max_tokens, Some(schema.clone()))
             .await
         {
@@ -356,7 +458,7 @@ async fn memory_harvest_git(
             }
 
             let embed_text = format!("title: {title} | text: {body}");
-            let vec = match server.embed_text(&embed_text).await {
+            let vec = match embed_server.embed_text(&embed_text).await {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
@@ -481,19 +583,26 @@ async fn memory_harvest_failures(
     cfg: &Config,
     backend_override: Option<&str>,
 ) -> Result<()> {
-    let git_ref = match &args.branch {
-        Some(branch) => branch.clone(),
-        None => args.git_range.clone(),
-    };
-    let range_label = match &args.branch {
-        Some(branch) => format!("full history of '{branch}'"),
-        None => format!("'{git_ref}'"),
+    let user_ref = args
+        .branch
+        .clone()
+        .unwrap_or_else(|| args.git_range.clone());
+    reject_option_like_ref(&user_ref)?;
+
+    // Clamp the default `HEAD~N..HEAD` range to the commits that exist so a
+    // shallow repo never trips `bad revision` (mirrors the git source).
+    let (git_revs, range_label): (Vec<String>, String) = match &args.branch {
+        Some(branch) => (vec![branch.clone()], format!("full history of '{branch}'")),
+        None => resolve_range_revs(&args.git_range, head_commit_count()),
     };
 
-    reject_option_like_ref(&git_ref)?;
+    let mut log_args: Vec<String> = vec!["log".to_string()];
+    log_args.extend(git_revs);
+    log_args.push("--format=%H%x00%s%x00%b%x00---".to_string());
+    log_args.push("--".to_string());
 
     let git_out = std::process::Command::new("git")
-        .args(["log", &git_ref, "--format=%H%x00%s%x00%b%x00---", "--"])
+        .args(&log_args)
         .output()
         .context("running git log")?;
     if !git_out.status.success() {
@@ -581,7 +690,7 @@ async fn memory_harvest_failures(
         }
     });
 
-    let server = ServerInferenceClient::from_config(cfg).ok_or_else(harvest_requires_server)?;
+    let (embed_server, llm_server) = harvest_clients(cfg, mem_path).await?;
 
     let mut stored = 0usize;
     let mut dedup_skipped = 0usize;
@@ -654,7 +763,7 @@ async fn memory_harvest_failures(
 
         let messages = vec![LlmMessage::system(system), LlmMessage::user(user)];
 
-        let raw_json = match server
+        let raw_json = match llm_server
             .llm_complete(&messages, max_tokens, Some(schema.clone()))
             .await
         {
@@ -719,7 +828,7 @@ async fn memory_harvest_failures(
             }
 
             let embed_text = format!("title: {title} | text: {body}");
-            let vec = match server.embed_text(&embed_text).await {
+            let vec = match embed_server.embed_text(&embed_text).await {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
@@ -894,5 +1003,63 @@ mod option_injection_guard_tests {
     fn rejects_option_like_ref_with_shell_metacharacters() {
         assert!(reject_option_like_ref("--output=/tmp/x;rm -rf /").is_err());
         assert!(reject_option_like_ref("-$(whoami)").is_err());
+    }
+}
+
+#[cfg(test)]
+mod range_clamp_tests {
+    use super::{parse_head_count_range, resolve_range_revs};
+
+    #[test]
+    fn parses_only_the_default_head_count_shape() {
+        assert_eq!(parse_head_count_range("HEAD~10..HEAD"), Some(10));
+        assert_eq!(parse_head_count_range("HEAD~1..HEAD"), Some(1));
+        assert_eq!(parse_head_count_range("HEAD~30..HEAD"), Some(30));
+        // Anything else is a user-chosen range and must not be clamped.
+        assert_eq!(parse_head_count_range("v1.0..HEAD"), None);
+        assert_eq!(parse_head_count_range("HEAD~10..main"), None);
+        assert_eq!(parse_head_count_range("main"), None);
+        assert_eq!(parse_head_count_range("HEAD~..HEAD"), None);
+        assert_eq!(parse_head_count_range("HEAD~abc..HEAD"), None);
+    }
+
+    #[test]
+    fn clamps_the_default_range_to_a_one_commit_repo() {
+        // The last-10 default must collapse to the single commit that exists,
+        // selected via --max-count so `HEAD~10` (which does not exist here) is
+        // never named to git.
+        let (revs, label) = resolve_range_revs("HEAD~10..HEAD", Some(1));
+        assert_eq!(revs, vec!["--max-count=1".to_string(), "HEAD".to_string()]);
+        assert_eq!(label, "'HEAD~1..HEAD'");
+    }
+
+    #[test]
+    fn clamps_to_the_exact_commit_count_below_the_default() {
+        let (revs, label) = resolve_range_revs("HEAD~10..HEAD", Some(7));
+        assert_eq!(revs, vec!["--max-count=7".to_string(), "HEAD".to_string()]);
+        assert_eq!(label, "'HEAD~7..HEAD'");
+    }
+
+    #[test]
+    fn keeps_the_full_count_when_the_repo_is_deep_enough() {
+        let (revs, label) = resolve_range_revs("HEAD~10..HEAD", Some(50));
+        assert_eq!(revs, vec!["--max-count=10".to_string(), "HEAD".to_string()]);
+        assert_eq!(label, "'HEAD~10..HEAD'");
+    }
+
+    #[test]
+    fn passes_a_custom_range_through_untouched() {
+        let (revs, label) = resolve_range_revs("v1.0..HEAD", Some(3));
+        assert_eq!(revs, vec!["v1.0..HEAD".to_string()]);
+        assert_eq!(label, "'v1.0..HEAD'");
+    }
+
+    #[test]
+    fn leaves_the_range_alone_when_the_commit_count_is_unknown() {
+        // git rev-list failed (empty repo, or git absent): don't fabricate a
+        // range, let the existing `git log` error path speak.
+        let (revs, label) = resolve_range_revs("HEAD~10..HEAD", None);
+        assert_eq!(revs, vec!["HEAD~10..HEAD".to_string()]);
+        assert_eq!(label, "'HEAD~10..HEAD'");
     }
 }

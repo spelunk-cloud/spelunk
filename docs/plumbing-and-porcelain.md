@@ -32,6 +32,11 @@ Use porcelain commands for:
 
 Scripts should distinguish `1` (empty) from `2` (broken) rather than treating any non-zero exit as fatal.
 
+These codes, and the JSONL field names and types below, are covered by the
+[stability contract](stability.md): they are semver-bound, evolve additively
+only, and are enforced by tests rather than by convention. `hash-file`, `embed`,
+and `publish-notes` cannot return `1`; the contract explains why.
+
 ## Output format
 
 All plumbing commands write **one JSON object per line** (JSONL) to **stdout**. Errors and warnings go to **stderr** only — stdout is always machine-parseable. There are no progress bars, no ANSI escape codes, and no trailing commas or array wrappers.

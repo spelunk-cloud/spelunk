@@ -51,6 +51,15 @@ impl SyncMode {
         }
     }
 
+    /// The accepted values, formatted for an error message
+    /// (`offline, local_first, cloud_first`).
+    ///
+    /// Single source of truth shared by the `SPELUNK_MODE` env-var error and
+    /// the `config.toml` parse error, so the two can never drift.
+    pub fn valid_values() -> &'static str {
+        "offline, local_first, cloud_first"
+    }
+
     /// String form used in config files and `SPELUNK_MODE`.
     pub fn as_str(&self) -> &'static str {
         match self {

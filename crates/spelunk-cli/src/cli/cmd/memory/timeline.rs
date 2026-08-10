@@ -1,7 +1,6 @@
 use anyhow::Result;
 
 use super::super::color::cprintln;
-use super::super::helpers::{embed_query, require_server_client};
 use super::super::status::format_age;
 use super::{MemoryTimelineArgs, backend_err};
 use crate::{capability, config::Config, storage::open_memory_backend};
@@ -25,19 +24,15 @@ pub(super) async fn memory_timeline(
 
     super::outbox::poll_and_apply(cfg, mem_path).await;
 
-    let sp = super::super::ui::spinner("Embedding query…");
-    let client = require_server_client(cfg, "memory timeline")?;
-    let blob = embed_query(
-        &client,
-        "Given a question, retrieve passages that answer the question",
-        &args.query,
-    )
-    .await?;
-    sp.finish_and_clear();
-
+    // Timeline is a local, always-available capability: it filters the topic
+    // through the same no-server full-text path as `memory search --mode text`
+    // (the local backend matches on `query` and ignores `query_blob`), so no
+    // query embedding — and thus no running inference server — is required.
+    // The empty blob is only consulted by the remote backend, which embeds the
+    // `query` text server-side anyway.
     let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     let notes = backend
-        .search_timeline(&blob, &args.query, args.limit)
+        .search_timeline(&[], &args.query, args.limit)
         .await
         .map_err(backend_err)?;
 
@@ -76,7 +71,7 @@ pub(super) async fn memory_timeline(
 fn print_timeline_entry(n: &crate::storage::memory::Note) {
     let ts = n.valid_at.unwrap_or(n.created_at);
     let marker = if n.status == "active" { "●" } else { "○" };
-    let sup = if let Some(id) = n.superseded_by {
+    let sup = if let Some(id) = &n.superseded_by {
         format!(" → #{id}")
     } else {
         String::new()

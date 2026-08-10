@@ -9,6 +9,7 @@ mod project_id;
 mod sync_mode;
 mod tls;
 
+pub mod llm_key;
 pub mod secret_store;
 pub mod server_keys;
 
@@ -24,8 +25,7 @@ pub use persist::{
     save_server_key_with, write_project_slug,
 };
 pub use predicates::{
-    is_loopback_url, is_loopback_url_missing_port, looks_like_uuid, no_server_env_set,
-    validate_transport_url,
+    is_loopback_url, is_loopback_url_missing_port, no_server_env_set, validate_transport_url,
 };
 pub use project_id::derive_project_id;
 pub use sync_mode::SyncMode;
@@ -105,15 +105,22 @@ pub struct Config {
     #[serde(default = "Config::default_db_path")]
     pub db_path: PathBuf,
 
-    /// Display label for the `model:` field of `plumbing embed` JSONL output only.
-    /// The effective embedding model is owned by spelunk-server, not this key.
-    #[serde(default = "Config::default_embedding_model")]
-    pub embedding_model: String,
-
     /// Chat model id, resolved by spelunk-server, for `ask` and `memory harvest`.
     /// When unset, commands that require a chat model are unavailable.
+    /// `SPELUNK_LLM_MODEL` overrides this.
     #[serde(default)]
     pub llm_model: Option<String>,
+
+    /// Base URL of an OpenAI-compatible chat completions endpoint (a local
+    /// LM Studio / Ollama, or a self-hosted gateway), passed on to the
+    /// auto-spawned `spelunk-server` so it gains LLM capability.
+    ///
+    /// Personal config (`~/.config/spelunk/config.toml`) or `SPELUNK_LLM_URL`
+    /// only, never `.spelunk/config.toml`: a checked-in endpoint points the
+    /// whole team at one developer's machine, and it is the natural sibling of
+    /// the LLM credential that `ProjectConfig` already excludes (ADR-071 D4).
+    #[serde(default)]
+    pub llm_url: Option<String>,
 
     // ── spelunk-server (optional) ─────────────────────────────────────────────
     /// URL of the spelunk-server instance, e.g. `https://spelunk.internal.example.com`
@@ -217,17 +224,38 @@ pub struct Config {
 ///
 /// Written by `spelunk login` / `spelunk org switch`; rotated by the token
 /// refresh path. The file is written `0600` (see [`save_auth_tokens_to`]).
+///
+/// Every field is `#[serde(default)]`, so a partial `[auth]` table never fails
+/// the whole config load. `--org` is a documented optional scoping flag and
+/// hand-editing the config is a documented workflow, so a login without an org
+/// (no `org_id`) or a trimmed table must not brick commands that need no
+/// credentials. An absent field is read as its "unset" form, which the
+/// consumers already treat sensibly:
+/// * missing `access_token` ⇒ empty ⇒ not logged in (no bearer resolved, see
+///   [`Config::load_with_store_from`] and [`server_keys::bearer_for`]);
+/// * missing `expires_at` ⇒ `0` ⇒ [`AuthTokens::is_expired_at`] reports
+///   expired, so an unknown expiry can never read as "still valid";
+/// * missing `org_id` ⇒ empty ⇒ no organisation scoping (the same empty-string
+///   sentinel the login/refresh paths already use).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthTokens {
     /// Short-lived WorkOS access token, sent as `Authorization: Bearer`.
+    /// Empty (or absent) means "not logged in": no bearer is resolved.
+    #[serde(default)]
     pub access_token: String,
     /// Long-lived rotating refresh token. Exchanged directly at WorkOS
     /// `/user_management/authenticate` (refresh grant) to rotate the
-    /// access token or switch organisation.
+    /// access token or switch organisation. Empty when the table predates a
+    /// login or was hand-trimmed; the refresh path then simply cannot rotate.
+    #[serde(default)]
     pub refresh_token: String,
     /// Absolute expiry of `access_token`, as a Unix timestamp (seconds).
+    /// Absent ⇒ `0`, which [`AuthTokens::is_expired_at`] treats as expired.
+    #[serde(default)]
     pub expires_at: i64,
-    /// WorkOS organisation the tokens are scoped to.
+    /// WorkOS organisation the tokens are scoped to. Empty when logged in
+    /// without an org (`--org` omitted); no scoping is applied.
+    #[serde(default)]
     pub org_id: String,
 }
 
@@ -241,6 +269,9 @@ impl AuthTokens {
 
     /// Expiry check against an explicit `now` (Unix seconds) — testable form of
     /// [`AuthTokens::is_expired`]. Treats the token as expired 30 s early.
+    ///
+    /// A missing `expires_at` deserialises to `0`, so this reports expired for
+    /// any realistic `now`: an unknown expiry is never read as "still valid".
     pub fn is_expired_at(&self, now: i64) -> bool {
         const SKEW_SECS: i64 = 30;
         now >= self.expires_at - SKEW_SECS
@@ -250,9 +281,6 @@ impl AuthTokens {
 impl Config {
     fn default_db_path() -> PathBuf {
         spelunk_config_dir().join("index.db")
-    }
-    fn default_embedding_model() -> String {
-        "f2llm-v2-330m".to_string()
     }
     fn default_llm_context_length() -> usize {
         8192
@@ -266,8 +294,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             db_path: Self::default_db_path(),
-            embedding_model: Self::default_embedding_model(),
             llm_model: None,
+            llm_url: None,
             server_url: None,
             server_key: None,
             project_id: None,
@@ -326,6 +354,20 @@ impl Config {
     /// paths can be exercised without a real keychain or daemon. Production code
     /// calls [`Config::load`], which resolves the host's default store.
     pub fn load_with_store(path: Option<&Path>, store: &dyn SecretStore) -> Result<Self> {
+        let project_root = std::env::current_dir().ok();
+        Self::load_with_store_from(path, store, project_root.as_deref())
+    }
+
+    /// Like [`load_with_store`], but the project-level `.spelunk/config.toml` is
+    /// discovered by walking up from `project_root` rather than the process CWD.
+    /// `None` skips project discovery entirely: a `.spelunk/config.toml` checked
+    /// in to this repo must not leak into a hermetic unit-test load. Production
+    /// always passes the CWD via [`load_with_store`].
+    pub(crate) fn load_with_store_from(
+        path: Option<&Path>,
+        store: &dyn SecretStore,
+        project_root: Option<&Path>,
+    ) -> Result<Self> {
         // ── 1. Load global personal config ───────────────────────────────────
         let global_path = match path {
             Some(p) => p.to_path_buf(),
@@ -334,7 +376,7 @@ impl Config {
         let mut cfg: Config = if global_path.exists() {
             let raw = std::fs::read_to_string(&global_path)
                 .with_context(|| format!("reading config at {}", global_path.display()))?;
-            toml::from_str(&raw).context("parsing config.toml")?
+            parse_global_config(&raw, &global_path)?
         } else {
             Config::default()
         };
@@ -356,13 +398,13 @@ impl Config {
         // file never carries a credential. A file that still has a
         // `server_key` line keeps working for its other fields: the parse
         // above silently drops the unrecognized key.
-        if let Ok(cwd) = std::env::current_dir()
-            && let Some(proj_path) = find_project_config(&cwd)
+        if let Some(root) = project_root
+            && let Some(proj_path) = find_project_config(root)
         {
             let raw = std::fs::read_to_string(&proj_path)
                 .with_context(|| format!("reading project config at {}", proj_path.display()))?;
             let proj: ProjectConfig =
-                toml::from_str(&raw).context("parsing .spelunk/config.toml")?;
+                toml::from_str(&raw).map_err(|e| config_parse_error(&proj_path, e))?;
 
             if let Some(v) = proj.server_url {
                 cfg.server_url = Some(v);
@@ -423,6 +465,12 @@ impl Config {
         if let Ok(v) = std::env::var("SPELUNK_SERVER_CA") {
             cfg.server_ca = Some(v);
         }
+        if let Ok(v) = std::env::var(llm_key::ENV_LLM_URL) {
+            cfg.llm_url = Some(v);
+        }
+        if let Ok(v) = std::env::var(llm_key::ENV_LLM_MODEL) {
+            cfg.llm_model = Some(v);
+        }
         // SPELUNK_MODE overrides the configured sync mode. An
         // unrecognised value is a hard error — silently falling back to a
         // default would defeat the deterministic-mode guarantee the Founder
@@ -430,8 +478,8 @@ impl Config {
         if let Ok(v) = std::env::var("SPELUNK_MODE") {
             let parsed = SyncMode::parse(&v).with_context(|| {
                 format!(
-                    "SPELUNK_MODE={v:?} is not a valid sync mode \
-                     (expected one of: offline, local_first, cloud_first)"
+                    "SPELUNK_MODE={v:?} is not a valid sync mode (expected one of: {})",
+                    SyncMode::valid_values()
                 )
             })?;
             cfg.mode = Some(parsed);
@@ -450,7 +498,12 @@ impl Config {
         cfg.server_key = if let Some(v) = env_server_key {
             Some(v)
         } else {
-            cfg.auth.as_ref().map(|auth| auth.access_token.clone())
+            // An empty (or absent) `[auth].access_token` means "not logged in":
+            // it must resolve to no bearer, never an empty-string `Some("")`.
+            cfg.auth
+                .as_ref()
+                .map(|auth| auth.access_token.clone())
+                .filter(|token| !token.is_empty())
         };
 
         Ok(cfg)
@@ -511,6 +564,52 @@ fn portless_loopback_server_url_warning(url: &str) -> Option<String> {
          value, remove server_url from config; otherwise add the port your server \
          actually listens on."
     ))
+}
+
+/// Build an actionable error for a `config.toml` that failed to parse.
+///
+/// The bare `.context("parsing config.toml")` this replaces was unusable: an
+/// [`anyhow::Error`]'s `Display` shows only its top context, so the file path
+/// and the toml crate's own diagnostic (the offending key/line) never reached
+/// the user. This produces a single self-contained message that names the
+/// **file**, embeds the toml diagnostic that pinpoints the **offending key**,
+/// and states the **remedy**.
+fn config_parse_error(path: &Path, source: toml::de::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "could not parse the spelunk config file {path}:\n{source}\n\
+         Fix the offending key shown above, or remove it to fall back to the default.",
+        path = path.display(),
+    )
+}
+
+/// Parse the global personal `config.toml`, turning any failure into an
+/// actionable error (see [`config_parse_error`]).
+///
+/// An unrecognised `mode` is singled out so the message names the bad value
+/// and lists the accepted set explicitly — the same guidance as the
+/// `SPELUNK_MODE` env-var error — rather than relying on however serde/toml
+/// happens to render the underlying enum error.
+fn parse_global_config(raw: &str, path: &Path) -> Result<Config> {
+    toml::from_str::<Config>(raw).map_err(|source| {
+        if let Some(bad) = bad_mode_value(raw) {
+            return anyhow::anyhow!(
+                "invalid `mode` value {bad:?} in the spelunk config file {path} \
+                 (expected one of: {valid})",
+                path = path.display(),
+                valid = SyncMode::valid_values(),
+            );
+        }
+        config_parse_error(path, source)
+    })
+}
+
+/// If `raw` sets `mode` to a string that is not a valid [`SyncMode`], return
+/// that offending value. Runs only on the error path, so the extra parse is
+/// off the happy path.
+fn bad_mode_value(raw: &str) -> Option<String> {
+    let table = raw.parse::<toml::Table>().ok()?;
+    let value = table.get("mode")?.as_str()?;
+    SyncMode::parse(value).is_none().then(|| value.to_string())
 }
 
 impl Config {
@@ -626,7 +725,13 @@ mod tests {
     /// `Config::load` with a fresh in-memory secret store, so credential tests
     /// never touch the host keychain or `~/.config/spelunk/secrets.toml`.
     fn load_hermetic(path: &Path) -> Result<Config> {
-        Config::load_with_store(Some(path), &MemoryStore::default())
+        load_hermetic_with(path, &MemoryStore::default())
+    }
+
+    // No project-config discovery, so a .spelunk/config.toml checked in to this
+    // repo cannot leak into the loaded Config (that is what makes it hermetic).
+    fn load_hermetic_with(path: &Path, store: &dyn SecretStore) -> Result<Config> {
+        Config::load_with_store_from(Some(path), store, None)
     }
 
     /// Unset all spelunk-related env vars to prevent cross-test contamination.
@@ -637,6 +742,8 @@ mod tests {
             std::env::remove_var("SPELUNK_PROJECT_ID");
             std::env::remove_var("SPELUNK_MODE");
             std::env::remove_var("SPELUNK_NO_SERVER");
+            std::env::remove_var("SPELUNK_LLM_URL");
+            std::env::remove_var("SPELUNK_LLM_MODEL");
         }
     }
 
@@ -735,9 +842,10 @@ mod tests {
     fn config_with_pruned_keys_still_parses() {
         // Guards the forward-compat contract for pre-0.9 config.toml files:
         // `Config` carries no `deny_unknown_fields`, so keys pruned as dead
-        // (batch_size, models_dir, api_base_url, plans_dir, specs_dir) are
-        // ignored rather than rejected. Adding `deny_unknown_fields` would
-        // break every existing user config, so this must stay green.
+        // (batch_size, models_dir, api_base_url, lmstudio_base_url, plans_dir,
+        // specs_dir, embedding_model) are ignored rather than rejected. Adding
+        // `deny_unknown_fields` would break every existing user config, so
+        // this must stay green.
         clear_spelunk_env();
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
@@ -748,8 +856,10 @@ mode = "local_first"
 batch_size = 32
 models_dir = "/opt/models"
 api_base_url = "http://inference.internal:1234"
+lmstudio_base_url = "http://127.0.0.1:1234"
 plans_dir = "docs/plans"
 specs_dir = "docs/specs"
+embedding_model = "some-other-model"
 "#,
         )
         .unwrap();
@@ -813,7 +923,7 @@ memory_server_key = "old-token"
         .unwrap();
 
         let store = MemoryStore::default();
-        let cfg = Config::load_with_store(Some(&config_path), &store).unwrap();
+        let cfg = load_hermetic_with(&config_path, &store).unwrap();
         assert_eq!(cfg.server_url, None);
         assert_eq!(cfg.server_key, None);
         assert_eq!(
@@ -1238,19 +1348,17 @@ project_id = "team/proj"
         let global_config = tmp.path().join("global.toml");
         std::fs::write(&global_config, "").unwrap();
 
-        let original_cwd = std::env::current_dir().ok();
-        std::env::set_current_dir(&proj_dir).unwrap();
-
-        let cfg = load_hermetic(&global_config).unwrap();
+        let cfg = Config::load_with_store_from(
+            Some(&global_config),
+            &MemoryStore::default(),
+            Some(&proj_dir),
+        )
+        .unwrap();
         assert_eq!(
             cfg.server_url,
             Some("http://proj.example.com:7777".to_string())
         );
         assert_eq!(cfg.project_id, Some("team/proj".to_string()));
-
-        if let Some(d) = original_cwd {
-            std::env::set_current_dir(d).unwrap();
-        }
     }
 
     // ── [auth] WorkOS tokens ───────────────────────────────────────────────────
@@ -1279,6 +1387,144 @@ project_id = "team/proj"
         let auth = cfg.auth.expect("auth table should load");
         assert_eq!(auth.refresh_token, "rt-sample");
         assert_eq!(auth.org_id, "org_sample");
+    }
+
+    // ── [auth] partial-table tolerance ─────────────────────────────────────────
+    //
+    // `--org` is an optional scoping flag and hand-editing the config is a
+    // documented workflow, so a login-without-org or a trimmed `[auth]` table
+    // must not brick every command with a parse error. Each field is tolerated
+    // when absent (missing token ⇒ not logged in, missing expiry ⇒ expired).
+
+    // A `[auth]` table missing `org_id` still loads: the access token resolves
+    // as the bearer and the org is simply empty (no scoping).
+    #[test]
+    #[serial_test::serial]
+    fn auth_block_missing_org_id_still_loads() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[auth]\n\
+             access_token = \"at\"\n\
+             refresh_token = \"rt\"\n\
+             expires_at = 4000000000\n",
+        )
+        .unwrap();
+
+        let cfg = load_hermetic(&path).expect("a [auth] table without org_id must still parse");
+        assert_eq!(cfg.server_key.as_deref(), Some("at"));
+        let auth = cfg.auth.expect("auth table should load");
+        assert_eq!(auth.org_id, "", "missing org_id is treated as no scoping");
+    }
+
+    // A `[auth]` table missing `expires_at` loads and the token is treated as
+    // expired (an unknown expiry must never read as "still valid").
+    #[test]
+    #[serial_test::serial]
+    fn auth_block_missing_expires_at_is_treated_as_expired() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[auth]\n\
+             access_token = \"at\"\n\
+             refresh_token = \"rt\"\n\
+             org_id = \"org_x\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_hermetic(&path).expect("a [auth] table without expires_at must still parse");
+        let auth = cfg.auth.expect("auth table should load");
+        assert!(
+            auth.is_expired_at(1),
+            "a token with no expiry must be treated as expired"
+        );
+    }
+
+    // A `[auth]` table with no access token means "not logged in": no bearer is
+    // resolved (an empty token must never become a `Some("")` bearer).
+    #[test]
+    #[serial_test::serial]
+    fn auth_block_missing_access_token_means_not_logged_in() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[auth]\n\
+             refresh_token = \"rt\"\n\
+             org_id = \"org_x\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_hermetic(&path).expect("a [auth] table without access_token must parse");
+        assert_eq!(
+            cfg.server_key, None,
+            "a missing/empty access token must resolve to no bearer"
+        );
+    }
+
+    // The reported failure mode: an otherwise-fine config with a bare `[auth]`
+    // header (every field trimmed away) must still load rather than error.
+    #[test]
+    #[serial_test::serial]
+    fn bare_auth_header_does_not_brick_load() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "llm_model = \"gpt-oss\"\n[auth]\n").unwrap();
+
+        let cfg = load_hermetic(&path).expect("a bare [auth] header must not brick the load");
+        assert_eq!(cfg.llm_model.as_deref(), Some("gpt-oss"));
+        assert_eq!(cfg.server_key, None);
+    }
+
+    // ── actionable parse-error messages ────────────────────────────────────────
+
+    // An unrecognised `mode` names the bad value AND lists the valid modes AND
+    // the file, mirroring the `SPELUNK_MODE` env-var message.
+    #[test]
+    #[serial_test::serial]
+    fn invalid_mode_value_error_names_value_modes_and_file() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "mode = \"bogus_mode\"\n").unwrap();
+
+        let err = load_hermetic(&path).unwrap_err().to_string();
+        assert!(err.contains("bogus_mode"), "must name the bad value: {err}");
+        assert!(err.contains("offline"), "must list valid modes: {err}");
+        assert!(err.contains("local_first"), "must list valid modes: {err}");
+        assert!(err.contains("cloud_first"), "must list valid modes: {err}");
+        assert!(
+            err.contains(&path.display().to_string()),
+            "must name the config file: {err}"
+        );
+    }
+
+    // A genuinely malformed config (a type error here) produces a message that
+    // names the file and points at a remedy, not a bare "parsing config.toml".
+    #[test]
+    #[serial_test::serial]
+    fn malformed_config_error_names_file_and_remedy() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        // `llm_context_length` is a usize; a string is a hard type error.
+        std::fs::write(&path, "llm_context_length = \"lots\"\n").unwrap();
+
+        let err = load_hermetic(&path).unwrap_err().to_string();
+        assert!(
+            err.contains(&path.display().to_string()),
+            "must name the config file: {err}"
+        );
+        assert!(
+            err.contains("remove") || err.contains("Fix"),
+            "must point at a remedy: {err}"
+        );
     }
 
     /// `SPELUNK_SERVER_KEY` (CI) overrides the `[auth]` access token.
@@ -1433,16 +1679,14 @@ project_id = "team/old"
         let global_config = tmp.path().join("global.toml");
         std::fs::write(&global_config, "").unwrap();
 
-        let original_cwd = std::env::current_dir().ok();
-        std::env::set_current_dir(&proj_dir).unwrap();
-
-        let cfg = load_hermetic(&global_config).unwrap();
+        let cfg = Config::load_with_store_from(
+            Some(&global_config),
+            &MemoryStore::default(),
+            Some(&proj_dir),
+        )
+        .unwrap();
         assert_eq!(cfg.server_url, None);
         assert_eq!(cfg.project_id, Some("team/old".to_string()));
-
-        if let Some(d) = original_cwd {
-            std::env::set_current_dir(d).unwrap();
-        }
     }
 
     #[test]
@@ -1467,19 +1711,17 @@ project_id = "team/new"
         let global_config = tmp.path().join("global.toml");
         std::fs::write(&global_config, "").unwrap();
 
-        let original_cwd = std::env::current_dir().ok();
-        std::env::set_current_dir(&proj_dir).unwrap();
-
-        let cfg = load_hermetic(&global_config).unwrap();
+        let cfg = Config::load_with_store_from(
+            Some(&global_config),
+            &MemoryStore::default(),
+            Some(&proj_dir),
+        )
+        .unwrap();
         assert_eq!(
             cfg.server_url,
             Some("http://new.example.com:7777".to_string())
         );
         assert_eq!(cfg.project_id, Some("team/new".to_string()));
-
-        if let Some(d) = original_cwd {
-            std::env::set_current_dir(d).unwrap();
-        }
     }
 
     // ── keychain secret store migration / precedence ─────────────────────────
@@ -1908,5 +2150,293 @@ project_id = "team/new"
         let cfg = load_hermetic(&global).unwrap();
 
         assert_eq!(cfg.server_ca.as_deref(), Some("/from/config.pem"));
+    }
+
+    // ── llm_url / llm_model ──────────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn llm_url_loads_from_personal_config() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "llm_url = \"http://127.0.0.1:1234\"\n").unwrap();
+
+        let cfg = load_hermetic(&global).unwrap();
+
+        assert_eq!(cfg.llm_url.as_deref(), Some("http://127.0.0.1:1234"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn llm_url_absent_from_personal_config_stays_none() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "llm_model = \"gpt-oss\"\n").unwrap();
+
+        let cfg = load_hermetic(&global).unwrap();
+
+        assert_eq!(cfg.llm_url, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn llm_url_in_project_config_is_ignored() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "").unwrap();
+
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".spelunk")).unwrap();
+        std::fs::write(
+            project.join(".spelunk").join("config.toml"),
+            "llm_url = \"http://team-box.example:1234\"\n",
+        )
+        .unwrap();
+
+        let store = MemoryStore::default();
+        let cfg = Config::load_with_store_from(Some(&global), &store, Some(&project)).unwrap();
+
+        assert_eq!(
+            cfg.llm_url, None,
+            "an endpoint URL in a checked-in project config must not configure the CLI"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn llm_url_env_overrides_personal_config() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "llm_url = \"http://127.0.0.1:1234\"\n").unwrap();
+
+        unsafe { std::env::set_var("SPELUNK_LLM_URL", "https://gateway.example") };
+        let cfg = load_hermetic(&global);
+        unsafe { std::env::remove_var("SPELUNK_LLM_URL") };
+
+        assert_eq!(
+            cfg.unwrap().llm_url.as_deref(),
+            Some("https://gateway.example")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn llm_url_env_applies_when_personal_config_sets_nothing() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "").unwrap();
+
+        unsafe { std::env::set_var("SPELUNK_LLM_URL", "https://gateway.example") };
+        let cfg = load_hermetic(&global);
+        unsafe { std::env::remove_var("SPELUNK_LLM_URL") };
+
+        assert_eq!(
+            cfg.unwrap().llm_url.as_deref(),
+            Some("https://gateway.example")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn llm_model_env_overrides_personal_config() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "llm_model = \"from-config\"\n").unwrap();
+
+        unsafe { std::env::set_var("SPELUNK_LLM_MODEL", "from-env") };
+        let cfg = load_hermetic(&global);
+        unsafe { std::env::remove_var("SPELUNK_LLM_MODEL") };
+
+        assert_eq!(cfg.unwrap().llm_model.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn llm_model_env_applies_when_personal_config_sets_nothing() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "").unwrap();
+
+        unsafe { std::env::set_var("SPELUNK_LLM_MODEL", "from-env") };
+        let cfg = load_hermetic(&global);
+        unsafe { std::env::remove_var("SPELUNK_LLM_MODEL") };
+
+        assert_eq!(cfg.unwrap().llm_model.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_auth_tokens_preserves_llm_url() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "llm_model = \"gpt-oss\"\nllm_url = \"http://127.0.0.1:1234\"\n",
+        )
+        .unwrap();
+        save_auth_tokens_to(&sample_tokens(), &path).unwrap();
+
+        let cfg = load_hermetic(&path).unwrap();
+        assert_eq!(cfg.llm_url.as_deref(), Some("http://127.0.0.1:1234"));
+        assert_eq!(cfg.llm_model.as_deref(), Some("gpt-oss"));
+        assert_eq!(cfg.auth.unwrap().access_token, "at-sample");
+    }
+
+    // The daemon-spawn path is the only reader of the LLM credential, so a
+    // plain `Config::load` must not pay for a secret-store read of it.
+    #[test]
+    #[serial_test::serial]
+    fn config_load_never_reads_the_llm_key_from_the_store() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "llm_url = \"http://127.0.0.1:1234\"\n").unwrap();
+
+        let store = RecordingStore::default();
+        store
+            .set(secret_store::KEY_LLM_KEY, "sk-llm-secret")
+            .unwrap();
+        store.reads.lock().unwrap().clear();
+
+        let cfg = Config::load_with_store_from(Some(&global), &store, None).unwrap();
+
+        assert_eq!(cfg.llm_url.as_deref(), Some("http://127.0.0.1:1234"));
+        assert!(
+            !store
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|k| k == secret_store::KEY_LLM_KEY),
+            "Config::load must not read the LLM key: reads were {:?}",
+            store.reads.lock().unwrap()
+        );
+    }
+
+    // Broader than the guard above, which only names the LLM key: the ordinary
+    // load path reads no secret at all, so any store read added later goes red
+    // here rather than only a credential-shaped one.
+    #[test]
+    #[serial_test::serial]
+    fn config_load_reads_nothing_at_all_from_an_injected_store() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(
+            &global,
+            "llm_url = \"http://127.0.0.1:1234\"\nllm_model = \"gpt-oss\"\n",
+        )
+        .unwrap();
+
+        let store = RecordingStore::default();
+        store
+            .set(secret_store::KEY_LLM_KEY, "sk-llm-secret")
+            .unwrap();
+        store.set(KEY_SERVER_KEY, "sk-sp-server").unwrap();
+        store.reads.lock().unwrap().clear();
+
+        Config::load_with_store_from(Some(&global), &store, None).unwrap();
+
+        let reads = store.reads.lock().unwrap().clone();
+        assert!(
+            reads.is_empty(),
+            "a config load with no legacy plaintext key to migrate must read no secret: {reads:?}"
+        );
+    }
+
+    // `Config::load` resolves its own store, so the RecordingStore guards above
+    // cannot observe that path at all: a store read added there would go
+    // unnoticed, and on macOS would be a keychain authorization on every
+    // command. An unparseable secrets.toml makes any read fail whatever the
+    // backend, so loading successfully is the proof.
+    #[test]
+    #[serial_test::serial]
+    fn the_public_load_entry_point_reads_no_secret_either() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "llm_url = \"http://127.0.0.1:1234\"\n").unwrap();
+        std::fs::write(tmp.path().join("secrets.toml"), "not = valid = toml\n").unwrap();
+
+        let prev_store = std::env::var(secret_store::ENV_SECRET_STORE).ok();
+        unsafe {
+            std::env::set_var("SPELUNK_CONFIG_DIR", tmp.path());
+            std::env::set_var(secret_store::ENV_SECRET_STORE, "file");
+        }
+        let loaded = Config::load(Some(&global));
+        unsafe {
+            std::env::remove_var("SPELUNK_CONFIG_DIR");
+            match &prev_store {
+                Some(v) => std::env::set_var(secret_store::ENV_SECRET_STORE, v),
+                None => std::env::remove_var(secret_store::ENV_SECRET_STORE),
+            }
+        }
+
+        let cfg = loaded.expect("Config::load must not read the secret store");
+        assert_eq!(cfg.llm_url.as_deref(), Some("http://127.0.0.1:1234"));
+    }
+
+    // An explicitly empty SPELUNK_LLM_URL is an override like any other value,
+    // so it blanks the personal config rather than falling through to it. The
+    // spawn path then normalizes the blank away and configures no endpoint.
+    #[test]
+    #[serial_test::serial]
+    fn llm_url_env_set_to_empty_still_overrides_the_personal_config() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "llm_url = \"http://127.0.0.1:1234\"\n").unwrap();
+
+        unsafe { std::env::set_var("SPELUNK_LLM_URL", "") };
+        let cfg = load_hermetic(&global);
+        unsafe { std::env::remove_var("SPELUNK_LLM_URL") };
+
+        assert_eq!(cfg.unwrap().llm_url.as_deref(), Some(""));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn llm_model_env_set_to_empty_still_overrides_the_personal_config() {
+        clear_spelunk_env();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("config.toml");
+        std::fs::write(&global, "llm_model = \"gpt-oss\"\n").unwrap();
+
+        unsafe { std::env::set_var("SPELUNK_LLM_MODEL", "") };
+        let cfg = load_hermetic(&global);
+        unsafe { std::env::remove_var("SPELUNK_LLM_MODEL") };
+
+        assert_eq!(cfg.unwrap().llm_model.as_deref(), Some(""));
+    }
+
+    // A MemoryStore that records every key passed to `get`.
+    #[derive(Default)]
+    struct RecordingStore {
+        inner: MemoryStore,
+        reads: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SecretStore for RecordingStore {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.reads.lock().unwrap().push(key.to_string());
+            self.inner.get(key)
+        }
+        fn set(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn kind(&self) -> &'static str {
+            "recording"
+        }
     }
 }

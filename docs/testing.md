@@ -5,8 +5,9 @@
 Tests live under `crates/*/tests/` (integration-style, one binary per file)
 plus `#[cfg(test)]` blocks colocated with the code they cover across all four
 crates. The suite spans unit logic, real-SQLite integration, in-process
-server-handler tests, CLI end-to-end tests, property-based tests, and a
-scheduled fuzzing job.
+server-handler tests, CLI end-to-end tests, property-based tests, an upgrade
+corpus of artifacts written by real released binaries, and a scheduled fuzzing
+job.
 
 The embedder stack is the native candle F2LLM path (`spelunk-embed`, gated by
 the `embed-native` feature), not an external OpenAI-compatible endpoint. See
@@ -17,16 +18,20 @@ the `embed-native` feature), not an external OpenAI-compatible endpoint. See
 ## Running the tests
 
 ```bash
-cargo nextest run
+cargo nextest run --lib --bins --tests --benches
 cargo test --doc
 ```
 
 This is what to run before pushing, and matches CI's own invocation
-(`.github/workflows/ci.yml`) on each platform leg: `cargo nextest run`
-for the workspace, plus `cargo test --doc` as a separate pass since
-nextest does not run doctests. Some CI legs add `--no-default-features`
-(see the workflow file for exactly which); reach for that flag locally if
-you need to reproduce a platform-specific failure.
+(`.github/workflows/ci.yml`) on each platform leg: `cargo nextest run` for
+the workspace, plus `cargo test --doc` as a separate pass since nextest
+does not run doctests. `--lib --bins --tests --benches` (not nextest's
+default) keeps examples out of the regular test gate: several depend on
+the native embedder and are meant to be run explicitly with the right
+features, not swept in by a workspace-wide command that doesn't grant
+them. Some CI legs add `--no-default-features` (see the workflow file for
+exactly which); reach for that flag locally if you need to reproduce a
+platform-specific failure.
 
 For a tighter loop while iterating on one file:
 
@@ -86,6 +91,58 @@ network dependency.
 
 ---
 
+## Upgrade corpus (the "DB museum")
+
+Every other migration test in this repo builds an old database shape by hand.
+That tests what we *believe* the old format was. The upgrade corpus tests what
+it **is**: artifacts written by real, downloaded, released spelunk binaries,
+checked in and opened with the current build on every relevant change.
+
+```
+crates/spelunk-cli/tests/upgrade_corpus.rs                the suite
+crates/spelunk-cli/tests/fixtures/upgrade-corpus/         MANIFEST.json + gzipped wings
+scripts/upgrade-corpus/                                   the generator
+.github/workflows/upgrade-corpus.yml                      CI job
+```
+
+Six wings, all produced by actual releases, covering the pre-`user_version`
+`index.db` whose version has to be inferred from its table shapes, a real
+`FLOAT[768]` vector table, memory stores either side of the entity-id backfill,
+a registry with a dependency link, and all three git-notes eras on one ref.
+
+```sh
+SPELUNK_SECRET_STORE=file cargo test -p spelunk-cli --test upgrade_corpus
+```
+
+It needs no network and no server: the fixtures are checked in, and the suite
+expands each gzipped wing into a temp dir, since opening a database migrates it
+and would otherwise destroy the fixture on first run. One test is `#[ignore]`d
+because it needs a downloaded release binary in `SPELUNK_OLD_BINARY`; CI runs
+that leg separately.
+
+This suite is what enforces the on-disk half of the
+[stability contract](stability.md#on-disk-formats). If you change a migration,
+this is the test that tells you whether real field data survives it, and its
+assertions are deliberately specific: they were built by injecting each
+data-destroying regression into the real migration paths and confirming the
+suite went red, so weakening one to make it pass is almost always the wrong
+move.
+
+Two things it documents that are easy to hit and hard to guess:
+
+- an older binary opening a newer `index.db` re-stamps `PRAGMA user_version`
+  **downwards**, which is not corruption. See
+  [Downgrading, and why `user_version` can go backwards](stability.md#downgrading-and-why-user_version-can-go-backwards).
+- adding a wing at each release, and the one assertion that is expected to flip
+  when a release carrying the `memory.db` version guard is captured, are covered
+  in [the corpus README](../scripts/upgrade-corpus/README.md).
+
+Regenerating a wing is scripted but not reproducible byte for byte (wall-clock
+timestamps, epoch-milli ids, absolute capture paths), so regenerate only the
+wing you mean to change, with `generate.sh --only <wing-id>`.
+
+---
+
 ## sqlite-vec in tests
 
 `sqlite3_auto_extension` is process-global and must only be registered once
@@ -114,6 +171,12 @@ pub fn open_test_db() -> spelunk_core::storage::Database {
 Tests that open a `Database` call `common::open_test_db()`. They are still
 annotated `#[serial_test::serial]`, but see the next section for what that
 annotation actually buys under the test runner CI uses.
+
+`spelunk-cli` integration tests reach the same guard through
+`tests/plumbing_helpers.rs::register_sqlite_vec`, alongside the other shared
+fixtures in that module. They need it whenever they open a `rusqlite`
+connection of their own against a DB a spawned `spelunk` binary wrote:
+registration is per-process, so the child's does not carry over.
 
 ### `#[serial]` does not mean what it used to under nextest
 
@@ -159,26 +222,57 @@ ambient config exists.
 
 Every test that spawns git must call an `isolate_git_config()` helper
 first. It sets `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` to `/dev/null`
-for the whole process, guarded by `std::sync::Once` so it is safe to call
-from every test. The isolation must be process-wide, not scoped to one
-`Command`: a helper that only sets env on the `Command` it builds itself
-never reaches git that the code under test spawns for itself.
+for the whole process, and clears `GIT_AUTHOR_*`/`GIT_COMMITTER_*`/`EMAIL`:
+git resolves commit identity from those env vars before it consults config
+at all, so they can override a test's own explicit `git config
+user.name`/`user.email` unless cleared too. Guarded by `std::sync::Once` so
+it is safe to call from every test. The isolation must be process-wide, not
+scoped to one `Command`: a helper that only sets env on the `Command` it
+builds itself never reaches git that the code under test spawns for itself.
 
-Four call sites carry a copy of the same helper, because a unit test
-compiled into `src/` cannot reach a file under `tests/`, and each `tests/`
-integration binary is its own compilation unit:
+For `spelunk-core` integration tests, prefer `common::git_command(cwd)` over
+calling `isolate_git_config()` and `std::process::Command::new("git")`
+separately: it bakes the isolation call into the `Command` it returns, so a
+new test file cannot construct an un-isolated one by forgetting the setup
+step.
+
+`isolate_git_config`/`git_command` have exactly two definitions, both in
+`spelunk-core`, one per side of the `src`/`tests` compilation boundary:
 
 | Location | Covers |
 |------|---------------|
-| `crates/spelunk-cli/tests/plumbing_helpers.rs` | `tests/` integration binaries for `spelunk-cli` |
-| `crates/spelunk-cli/src/cli/cmd/test_support.rs` | `src/` unit tests for `spelunk-cli` |
-| `crates/spelunk-core/src/storage/git_notes/mod.rs` (local to the `cat_file_batch` test module) | `spelunk-core` unit tests |
-| `crates/spelunk-core/tests/integration_git_notes.rs` | `spelunk-core`'s git-notes integration tests |
+| `crates/spelunk-core/src/test_support.rs` (module gated `#[cfg(any(test, feature = "test-support"))]`) | `spelunk-core`'s own `#[cfg(test)]` unit tests, and any downstream crate that enables the `test-support` feature |
+| `crates/spelunk-core/tests/common/mod.rs` (also exports `git_command`) | `spelunk-core`'s `tests/` integration binaries |
 
-CI runners carry no ambient global config, so a missing call here never
-fails CI. It only surfaces as a local test failure for a contributor who
-has one of these settings configured globally, with no indication of the
-cause.
+`spelunk-cli` has no independent copy: `src/cli/cmd/test_support.rs` and
+`tests/plumbing_helpers.rs` both `pub use spelunk_core::test_support::isolate_git_config`,
+reaching it via a `spelunk-core = { path = "../spelunk-core", features =
+["test-support"] }` dev-dependency (the same pattern
+`config::secret_store::MemoryStore` already used for a src/tests-shared test
+double before this).
+
+Two, not one, because `spelunk-core`'s own `tests/` integration binaries link
+the crate externally and can't reach a `#[cfg(test)]`-gated `src/` item
+without a *self-referencing* dev-dependency
+(`spelunk-core = { path = ".", features = ["test-support"] }` inside
+`spelunk-core`'s own `Cargo.toml`). That was tried: it compiles and passes
+against an isolated target dir, but this repo's pre-commit hook points
+`CARGO_TARGET_DIR` at the shared `target/` used by every worktree, and
+building against that shared dir (last built from a different `Cargo.lock`)
+fails with `unresolved import spelunk_core::test_support`. The
+`tests/common/mod.rs` duplicate is the real floor given that constraint, not
+an oversight.
+
+`scripts/check-git-isolation.sh` runs as the first step of CI's Check & Lint
+job and fails the build if a test file spawns `git` (`Command::new("git")`,
+however wrapped, whitespaced, or aliased) without wiring in one of the
+above: a definition or call of `isolate_git_config`, a call to
+`git_command`, or a `mod common;`/`mod plumbing_helpers;` import of the
+fixture module. It's a grep-based heuristic, not a parser (see the script's
+own header comment for exact scope and known blind spots, e.g. it can't
+trace a spawn reached through a variable), but it catches the case that
+used to slip through silently: a new test file that spawns git and forgets
+isolation entirely.
 
 ---
 
@@ -243,9 +337,9 @@ file itself stays accurate.
 ### Ubuntu (`ubuntu-latest`) caveats
 
 - **`check` job disk pressure.** The `check`/lint job builds the full
-  workspace (`--all-targets --features rich-formats`, which pulls in the
-  embedder dependency tree) and has intermittently exhausted the runner's
-  free disk space. The job sets `CARGO_PROFILE_DEV_DEBUG: 0` to drop
+  workspace (`--lib --bins --tests --benches --features rich-formats`, which
+  pulls in the embedder dependency tree) and has intermittently exhausted the
+  runner's free disk space. The job sets `CARGO_PROFILE_DEV_DEBUG: 0` to drop
   dev-profile debug info to reduce that pressure.
 
 ---

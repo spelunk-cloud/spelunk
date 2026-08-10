@@ -5,8 +5,8 @@
 .env
 .DS_Store
 /models
-.spelunk
-.spelunk/
+# .spelunk/config.toml is committed so a bare clone resolves its cloud project;
+# dbs are covered by *.db above, logs by .spelunk/.gitignore.
 .spelunk/*.lock
 .claude/settings.local.json
 .claude/worktrees/
@@ -15,3 +15,6 @@
 # Python (bench/ tooling)
 __pycache__/
 *.pyc
+
+logs/
+*.log

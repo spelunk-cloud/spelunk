@@ -32,6 +32,7 @@ impl Database {
             .with_context(|| format!("opening database at {}", path.display()))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        super::apply_test_page_cap(&conn)?;
 
         let db = Self { conn };
         db.run_migrations()?;
@@ -47,12 +48,29 @@ impl Database {
     /// blindly re-running all steps would drive the guarded 008–010 ALTERs
     /// through their `duplicate column name` branch needlessly. Each step is
     /// idempotent, so a conservative (one-low) inference stays safe.
+    ///
+    /// Returns immediately, before any write, when the on-disk header
+    /// already reads `CURRENT_SCHEMA_VERSION`: `PRAGMA user_version = N`
+    /// opens a write transaction even to re-set an unchanged value, so an
+    /// unconditional stamp on every open would make every `Database::open`,
+    /// including a read-only command, contend for the write lock against a
+    /// concurrent writer instead of only doing so for a genuine migration.
     fn run_migrations(&self) -> Result<()> {
-        let mut version: i32 = self
+        // Read the RAW on-disk value before any inference below adjusts the
+        // working `version`: the skip-write gate further down must key on
+        // what is actually stamped in the file header, not on an in-memory
+        // value that was only just inferred and has not been persisted yet
+        // (a legacy pre-user_version DB reads 0 here but may infer straight
+        // to `CURRENT_SCHEMA_VERSION` - that inference still needs writing).
+        let raw_version: i32 = self
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .context("reading user_version")?;
+        if raw_version == CURRENT_SCHEMA_VERSION {
+            return Ok(());
+        }
 
+        let mut version = raw_version;
         if version == 0 && !self.is_fresh_db()? {
             version = self.infer_legacy_version()?;
         }
@@ -548,6 +566,12 @@ impl Database {
                 rusqlite::params![chunk_id, blob],
             )?;
         }
+        // Held before commit (not after): the crash-safety suite needs the
+        // write lock genuinely open here to test a concurrent reader/writer
+        // against it, and a real SIGKILL landed here exercises the same
+        // uncommitted-batch window `insert_embeddings_shaped_batch_leaves_
+        // nothing_after_a_hard_process_exit` proves with a simulated exit.
+        super::pause_for_crash_test("embed_tx_open");
         tx.commit()?;
         Ok(())
     }
@@ -627,6 +651,40 @@ mod tests {
             user_version(&db.conn),
             CURRENT_SCHEMA_VERSION,
             "a fully-migrated legacy DB must be inferred at the latest version"
+        );
+    }
+
+    // `run_migrations` used to stamp `PRAGMA user_version` unconditionally on
+    // every open, even when nothing needed migrating - and setting that
+    // pragma always opens a write transaction, so a concurrent reader
+    // (`spelunk search` while `spelunk index` runs) could fail with
+    // "database is locked" on this alone, never touching a genuine
+    // migration. Reopening an already-current DB while another connection
+    // holds an open writer transaction must now succeed.
+    #[test]
+    fn opening_an_already_current_db_never_writes_so_a_concurrent_writer_cannot_lock_it_out() {
+        register_sqlite_vec();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        Database::open(tmp.path()).expect("build and fully migrate");
+        assert_eq!(
+            user_version(&Database::open(tmp.path()).unwrap().conn),
+            CURRENT_SCHEMA_VERSION
+        );
+
+        let locker = Connection::open(tmp.path()).expect("open locker connection");
+        locker
+            .execute_batch(
+                "BEGIN IMMEDIATE; \
+                 INSERT INTO files (path, hash, indexed_at) VALUES ('x', 'y', 0);",
+            )
+            .expect("take the write lock");
+
+        let reopened = Database::open(tmp.path());
+        locker.execute_batch("ROLLBACK;").expect("release the lock");
+
+        reopened.expect(
+            "opening an already-migrated DB must never attempt a write, so it must succeed even \
+             while another connection holds the write lock",
         );
     }
 

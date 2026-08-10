@@ -139,41 +139,22 @@ pub async fn search(args: SearchArgs, cfg: Config) -> Result<()> {
         maybe_warn_stale(&db_path);
     }
 
-    // ── Tier-0 fall-through for explicit semantic/hybrid modes (#303-F2 / #323) ──
+    // ── Fail-closed gate for explicit semantic/hybrid with no server ──────────
     //
-    // When the user explicitly requests `--mode semantic` or `--mode hybrid`
-    // but no server is reachable (Tier 0), automatically switch to FTS text
-    // search. Under ADR-004 inference-only routing (no explicit `server_url`),
-    // the fallback is silent — the user never configured a server, so there is
-    // nothing to warn about. The notice is only printed when `server_url` was
-    // explicitly set (the user expected a server and it is unreachable).
+    // An explicit `--mode semantic` / `--mode hybrid` needs a reachable
+    // inference server to embed the query. With no server — the
+    // `SPELUNK_NO_SERVER` kill-switch, or simply nothing reachable — surface the
+    // same actionable locked-feature error the other inference-gated commands
+    // emit (`memory search`, `memory timeline`, `plumbing embed`) via the shared
+    // `require_server_client` helper, rather than silently falling back to text
+    // search and returning "No results found." — an absence claim an agent or
+    // script reads as "no such code exists" instead of "feature unavailable".
     //
-    // The `auto` mode already degrades gracefully via the embed_query_vec error
-    // path below — this guard handles the explicit-mode case only.
-    if (mode == "semantic" || mode == "hybrid") && !tier.is_server() {
-        if cfg.server_url.is_some() {
-            eprintln!("[server unreachable — using text search]");
-        }
-        let sp = spinner("Searching (text)…");
-        let db = Database::open(&db_path)?;
-        let results = db
-            .search_text(&args.query, args.limit.min(100))
-            .unwrap_or_default();
-        sp.finish_and_clear();
-        if results.is_empty() {
-            println!("No results found.");
-            return Ok(());
-        }
-        match crate::utils::effective_format(&args.format) {
-            "json" => println!("{}", serde_json::to_string_pretty(&results)?),
-            "jsonl" => {
-                for item in &results {
-                    println!("{}", serde_json::to_string(item)?);
-                }
-            }
-            _ => print_results_text(&results),
-        }
-        return Ok(());
+    // Only the explicit modes are gated here: `auto` deliberately degrades to
+    // ast-grep with a visible notice (the embed_query_vec error path below),
+    // which is its contract and stays untouched.
+    if mode == "semantic" || mode == "hybrid" {
+        require_server_client(&cfg, "search")?;
     }
 
     // ── Embedding coverage is a first-class search input (chunk-shaped) ──────
@@ -433,8 +414,11 @@ pub(crate) fn maybe_warn_stale(db_path: &std::path::Path) {
     if !db_path.exists() {
         return;
     }
+    // In-project probe: indexed paths are relative to the project root, which is
+    // the cwd for these commands.
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     if let Ok(db) = Database::open(db_path)
-        && let Ok(report) = db.sample_staleness_check(20)
+        && let Ok(report) = db.staleness_report(&root, Some(20))
         && report.stale > 0
     {
         eprintln!(
@@ -450,9 +434,11 @@ pub(crate) fn index_is_stale(db_path: &std::path::Path) -> bool {
     if !db_path.exists() {
         return false;
     }
+    // In-project probe: indexed paths are relative to the project root (cwd).
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     Database::open(db_path)
         .ok()
-        .and_then(|db| db.sample_staleness_check(20).ok())
+        .and_then(|db| db.staleness_report(&root, Some(20)).ok())
         .is_some_and(|report| report.stale > 0)
 }
 

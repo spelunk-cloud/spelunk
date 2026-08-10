@@ -1,0 +1,21 @@
+{
+  "capabilities": [
+    "memory",
+    "index.embed",
+    "search.semantic"
+  ],
+  "embedder": {
+    "detail": null,
+    "state": "ready"
+  },
+  "embedding_dim": 896,
+  "instance_id": "019fa79e-2236-7273-afd3-abea97c43e8f",
+  "limits": {
+    "embed_request_timeout_secs": 1800,
+    "embedder_token_cap": 8192,
+    "max_batch_chunks": 256
+  },
+  "started_by": 501,
+  "status": "ok",
+  "version": "0.9.5"
+}

@@ -1,8 +1,9 @@
 use super::MemoryStore;
+use rusqlite::OptionalExtension;
 use std::sync::OnceLock;
 
 /// Register the sqlite-vec extension exactly once per test process.
-/// `MemoryStore::migrate()` creates a `vec0` virtual table, which
+/// `MemoryStore::run_migrations()` creates a `vec0` virtual table, which
 /// requires the extension to be loaded before any connection is opened.
 fn register_sqlite_vec() {
     static INIT: OnceLock<()> = OnceLock::new();
@@ -52,7 +53,7 @@ fn supersede_happy_path() {
     // (a) old note must be archived with superseded_by set
     let old_note = store.get(old_id).unwrap().expect("old note must exist");
     assert_eq!(old_note.status, "archived");
-    assert_eq!(old_note.superseded_by, Some(new_id));
+    assert_eq!(old_note.superseded_by, sup(new_id));
 
     // (b) a memory_edges row must exist linking new → old
     assert_eq!(
@@ -119,7 +120,7 @@ fn add_note_superseding_happy_path_archives_old_and_links_new() {
 
     let old_note = store.get(old_id).unwrap().expect("old note must exist");
     assert_eq!(old_note.status, "archived");
-    assert_eq!(old_note.superseded_by, Some(new_id));
+    assert_eq!(old_note.superseded_by, sup(new_id));
 
     assert_eq!(
         count_edges(&store, new_id, old_id, "supersedes"),
@@ -161,7 +162,7 @@ fn add_note_superseding_rejects_already_archived_old_and_writes_nothing() {
     let old_note = store.get(old_id).unwrap().expect("old note must exist");
     assert_eq!(
         old_note.superseded_by,
-        Some(successor_a),
+        sup(successor_a),
         "OLD's successor link must still point at the first, not the rejected second, successor"
     );
 
@@ -246,6 +247,80 @@ fn add_edge_duplicate_silently_ignored() {
         count_edges(&store, a, b, "relates_to"),
         1,
         "duplicate edge must not produce a second row"
+    );
+}
+
+// ── relates_to_edges_for_sync(): only fully-synced relates_to edges ───────────
+
+// The edge push enumerates only `relates_to` edges whose BOTH endpoints carry
+// a `remote_id` (so the cloud knows them by external_id) and a `uuid`. An edge
+// with an unsynced endpoint is withheld until a later sync lands it; the two
+// other edge kinds are never enumerated (supersedes rides its entry, and
+// contradicts is server-derived).
+#[test]
+fn relates_to_edges_for_sync_requires_both_endpoints_synced() {
+    let store = open_store();
+    let (a, _) = store
+        .add_note("note", "A", "", &[], &[], None, None)
+        .unwrap();
+    let (b, _) = store
+        .add_note("note", "B", "", &[], &[], None, None)
+        .unwrap();
+    // Mint uuids the way a push would, then wire a linker -> target edge.
+    store.ensure_uuid(a).unwrap();
+    store.ensure_uuid(b).unwrap();
+    store.add_edge(b, a, "relates_to").unwrap();
+
+    // Neither endpoint synced yet: nothing to push.
+    assert!(store.relates_to_edges_for_sync().unwrap().is_empty());
+
+    // Only one endpoint synced: still withheld.
+    store
+        .set_remote_id(a, "01890000-0000-7000-8000-0000000000a1")
+        .unwrap();
+    assert!(
+        store.relates_to_edges_for_sync().unwrap().is_empty(),
+        "an edge with one unsynced endpoint must not be pushable"
+    );
+
+    // Both synced: the edge is now pushable, keyed by each endpoint's uuid.
+    store
+        .set_remote_id(b, "01890000-0000-7000-8000-0000000000b2")
+        .unwrap();
+    let edges = store.relates_to_edges_for_sync().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].from_local_id, b);
+    assert_eq!(edges[0].to_local_id, a);
+    assert_eq!(
+        edges[0].from_external_id,
+        store.uuid_for(b).unwrap().unwrap()
+    );
+    assert_eq!(edges[0].to_external_id, store.uuid_for(a).unwrap().unwrap());
+}
+
+#[test]
+fn relates_to_edges_for_sync_ignores_supersedes_and_contradicts() {
+    let store = open_store();
+    let (a, _) = store
+        .add_note("note", "A", "", &[], &[], None, None)
+        .unwrap();
+    let (b, _) = store
+        .add_note("note", "B", "", &[], &[], None, None)
+        .unwrap();
+    store.ensure_uuid(a).unwrap();
+    store.ensure_uuid(b).unwrap();
+    store
+        .set_remote_id(a, "01890000-0000-7000-8000-0000000000a1")
+        .unwrap();
+    store
+        .set_remote_id(b, "01890000-0000-7000-8000-0000000000b2")
+        .unwrap();
+    store.add_edge(b, a, "supersedes").unwrap();
+    store.add_edge(b, a, "contradicts").unwrap();
+
+    assert!(
+        store.relates_to_edges_for_sync().unwrap().is_empty(),
+        "only relates_to edges are enumerated for push"
     );
 }
 
@@ -1003,8 +1078,9 @@ fn entity_id_migration_backfills_but_does_not_collapse_duplicates() {
         let store = MemoryStore {
             conn,
             reembed_needed: None,
+            dropped_768: std::cell::Cell::new(false),
         };
-        store.migrate().expect("schema migration only");
+        store.run_migrations().expect("schema migration only");
         for created_at in [1_700_000_001_i64, 1_700_000_002] {
             store
                 .add_note_with_created_at(
@@ -1022,7 +1098,8 @@ fn entity_id_migration_backfills_but_does_not_collapse_duplicates() {
         store
             .execute_batch(
                 "DROP INDEX idx_notes_entity_id; \
-                 ALTER TABLE notes DROP COLUMN entity_id;",
+                 ALTER TABLE notes DROP COLUMN entity_id; \
+                 PRAGMA user_version = 0;",
             )
             .expect("drop column to simulate the older schema");
         let has_col: i64 = store
@@ -1541,4 +1618,695 @@ fn superseded_note_excluded_by_default_included_with_archived() {
         got, want,
         "include_archived surfaces the superseded note for backfill"
     );
+}
+
+// ── migration runner (schema version) ───────────────────────────────────────
+// `MemoryStore::run_migrations` is a forward-only runner gated on `PRAGMA
+// user_version`, mirroring `Database::run_migrations` in `storage/db.rs`.
+// These exercise the runner itself; the FTS/lifecycle/dim-upgrade tests
+// elsewhere in this file exercise what each individual step does.
+
+fn user_version(store: &MemoryStore) -> i32 {
+    store
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn notes_has_column(store: &MemoryStore, col: &str) -> bool {
+    let mut stmt = store.conn.prepare("PRAGMA table_info(notes)").unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        if row.get::<_, String>(1).unwrap() == col {
+            return true;
+        }
+    }
+    false
+}
+
+// Acceptance criterion 1: a brand-new store runs every step and ends stamped
+// at the latest version.
+#[test]
+fn fresh_memory_db_stamps_current_version() {
+    let store = open_store();
+    assert_eq!(user_version(&store), super::MEMORY_SCHEMA_VERSION);
+}
+
+// Acceptance criterion 2: re-opening an already-migrated store is a clean
+// no-op that keeps the version and touches no existing row.
+#[test]
+fn reopen_memory_db_is_idempotent() {
+    register_sqlite_vec();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().join("memory.db");
+
+    let store = MemoryStore::open(&path).expect("first open");
+    let (id, _) = store
+        .add_note("decision", "Keep", "body", &[], &[], None, None)
+        .unwrap();
+    drop(store);
+
+    let reopened = MemoryStore::open(&path).expect("second open");
+    assert_eq!(user_version(&reopened), super::MEMORY_SCHEMA_VERSION);
+    assert_eq!(
+        reopened.get(id).unwrap().map(|n| n.title),
+        Some("Keep".to_string()),
+        "re-opening an already-migrated store must not touch existing rows"
+    );
+}
+
+// Acceptance criterion 3: a field DB built by today's binary but stamped
+// `user_version = 0` (every store on disk before this runner shipped, since
+// nothing ever wrote the header before now) is inferred at the latest
+// version on next open, without destructively re-running any step: an
+// existing row, its embedding, and its FTS entry all survive.
+#[test]
+fn legacy_fully_migrated_memory_db_is_inferred_and_stamped_rows_survive() {
+    register_sqlite_vec();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().join("memory.db");
+
+    let id = {
+        let store = MemoryStore::open(&path).expect("build via runner");
+        let (id, _) = store
+            .add_note("decision", "Survives", "body text", &[], &[], None, None)
+            .unwrap();
+        let vector = vec![0.1f32; crate::embeddings::EMBEDDING_DIM];
+        store
+            .insert_embedding(id, &crate::embeddings::vec_to_blob(&vector))
+            .unwrap();
+        // Simulate a pre-runner binary: reset the header stamp.
+        store.execute_batch("PRAGMA user_version = 0").unwrap();
+        id
+    };
+
+    let store = MemoryStore::open(&path).expect("reopen legacy");
+    assert_eq!(
+        user_version(&store),
+        super::MEMORY_SCHEMA_VERSION,
+        "a fully-migrated legacy store must be inferred at the latest version"
+    );
+
+    let note = store
+        .get(id)
+        .unwrap()
+        .expect("note must survive re-inference");
+    assert_eq!(note.title, "Survives");
+    assert!(
+        store.get_embedding(id).unwrap().is_some(),
+        "an existing embedding must not be dropped by a spurious re-run of the \
+         768→896 upgrade step"
+    );
+
+    let hits: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH 'Survives'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hits, 1, "the FTS index must survive re-inference intact");
+}
+
+// Acceptance criterion 4: a partially-old field DB (missing only the last two
+// steps' columns) is inferred at the version just below them, and only those
+// missing steps run.
+#[test]
+fn partially_migrated_legacy_memory_db_is_inferred_then_completed() {
+    register_sqlite_vec();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().join("memory.db");
+
+    {
+        let store = MemoryStore::open(&path).expect("build");
+        // Strip back to a pre-uuid (v6) shape: drop the columns/indexes added
+        // by steps 7 (uuid) and 8 (entity_id), then reset the stamp so `open`
+        // must re-infer rather than trust it.
+        store
+            .execute_batch(
+                "DROP INDEX idx_notes_uuid; \
+                 DROP INDEX idx_notes_remote_id; \
+                 ALTER TABLE notes DROP COLUMN uuid; \
+                 ALTER TABLE notes DROP COLUMN remote_id; \
+                 DROP INDEX idx_notes_entity_id; \
+                 ALTER TABLE notes DROP COLUMN entity_id; \
+                 PRAGMA user_version = 0;",
+            )
+            .expect("strip to v6 shape");
+        assert_eq!(
+            MemoryStore::infer_legacy_version(&store).unwrap(),
+            6,
+            "precondition: stripping uuid/remote_id/entity_id must land inference at 6"
+        );
+    }
+
+    let store = MemoryStore::open(&path).expect("reopen partial");
+    assert_eq!(user_version(&store), super::MEMORY_SCHEMA_VERSION);
+    assert!(notes_has_column(&store, "uuid"), "step 7 must have re-run");
+    assert!(
+        notes_has_column(&store, "entity_id"),
+        "step 8 must have re-run"
+    );
+}
+
+// ── point-in-time (`--as-of`) reconstruction ────────────────────────────────
+// The as-of filter must return exactly the entries live at instant T:
+//     COALESCE(valid_at, created_at) <= T AND (invalid_at IS NULL OR invalid_at > T)
+// independent of archived status. Two boundaries are pinned here:
+//   * an entry invalidated AFTER T (a since-superseded decision) is present at
+//     T without needing include_archived (the then-current decision);
+//   * an entry whose valid_at is AFTER T is absent — including the case where
+//     valid_at is inherited from created_at (stored NULL), which must be read
+//     as created_at, not as "always valid".
+// The `--archived` dimension must not change which historically-live entries
+// appear, so the list case is asserted with include_archived both false and
+// true.
+
+const DAY: i64 = 86_400;
+// 2026-01-01T00:00:00Z, the base every date below is offset from.
+const Y2026: i64 = 1_767_225_600;
+const JAN_15: i64 = Y2026 + 14 * DAY; // superseded decision becomes valid
+const MAR_01_NOON: i64 = Y2026 + 59 * DAY + 12 * 3_600; // probe, before the supersede
+const MAY_01: i64 = Y2026 + 120 * DAY; // probe, still before the supersede
+const JUN_20: i64 = Y2026 + 170 * DAY; // supersede instant: old.invalid_at, new.valid_at
+const JUL_01: i64 = Y2026 + 181 * DAY; // probe, after the supersede
+const AUG_04: i64 = Y2026 + 215 * DAY; // "today": the created-today entry's created_at
+
+fn id_set(notes: &[super::Note]) -> std::collections::BTreeSet<i64> {
+    notes.iter().filter_map(|n| n.id.as_i64()).collect()
+}
+
+// Seed a real supersede chain plus one entry created "today" with no explicit
+// valid_at. Returns (old_decision, new_decision, created_today). All three
+// share the FTS term "quorum" so search_text can retrieve every one.
+//
+//   old_decision   valid JAN_15, superseded → status archived, invalid_at JUN_20
+//   new_decision   valid JUN_20, active successor
+//   created_today  created AUG_04, valid_at stored NULL (inherits created_at)
+fn seed_as_of_chain(store: &MemoryStore) -> (i64, i64, i64) {
+    let (old_id, _) = store
+        .add_note(
+            "decision",
+            "Cache writes synchronously",
+            "quorum write-through",
+            &[],
+            &[],
+            None,
+            Some(JAN_15),
+        )
+        .unwrap();
+    let (new_id, _) = store
+        .add_note_superseding(
+            "decision",
+            "Cache writes asynchronously",
+            "quorum write-behind",
+            &[],
+            &[],
+            Some(JUN_20),
+            old_id,
+        )
+        .unwrap();
+    // add_note_superseding stamps the old entry's invalid_at with wall-clock
+    // now(); pin it to the historical supersede instant so the point-in-time
+    // boundary is deterministic. This is exactly the archived + invalid_at
+    // state a reconciled/harvested supersede leaves behind.
+    store
+        .conn
+        .execute(
+            "UPDATE notes SET invalid_at = ?1 WHERE id = ?2",
+            rusqlite::params![JUN_20, old_id],
+        )
+        .unwrap();
+    // Created "today" with no --valid-at: valid_at is stored NULL and the
+    // as-of filter must treat it as created_at, not as "always valid".
+    let (today_id, _) = store
+        .add_note_with_created_at(
+            "decision",
+            "Cache eviction policy",
+            "quorum lru",
+            &[],
+            &[],
+            None,
+            "active",
+            AUG_04,
+        )
+        .unwrap();
+    (old_id, new_id, today_id)
+}
+
+// list --as-of must reconstruct the exact set live at T, and that set must not
+// depend on include_archived (the archived flag controls the *current* view,
+// never which historically-live entries a point-in-time query returns).
+#[test]
+fn list_as_of_reconstructs_point_in_time_ignoring_archived() {
+    let store = open_store();
+    let (old_id, new_id, today_id) = seed_as_of_chain(&store);
+
+    // (as_of, expected live ids) for a `--kind decision` listing.
+    let cases: &[(i64, &[i64])] = &[
+        // Before the supersede: the old decision is the then-current one; the
+        // successor is not yet valid and the created-today entry is future.
+        (MAR_01_NOON, &[old_id]),
+        (MAY_01, &[old_id]),
+        // After the supersede: the old decision is gone (invalid_at <= T), the
+        // successor is live, the created-today entry is still future.
+        (JUL_01, &[new_id]),
+        // "Today": the created-today entry finally becomes valid; the old
+        // decision stays gone.
+        (AUG_04, &[new_id, today_id]),
+    ];
+
+    for (as_of, expected) in cases {
+        let want: std::collections::BTreeSet<i64> = expected.iter().copied().collect();
+        for include_archived in [false, true] {
+            let got = id_set(
+                &store
+                    .list_filtered(Some("decision"), None, 100, include_archived, Some(*as_of))
+                    .unwrap(),
+            );
+            assert_eq!(
+                got, want,
+                "as_of={as_of} include_archived={include_archived}: point-in-time \
+                 set must match and must not depend on archived status"
+            );
+        }
+    }
+}
+
+// search --as-of (text mode) must apply the same corrected filter: a
+// since-superseded (archived) entry live at T is returned, and an entry whose
+// inherited valid_at is after T is not. search_text has no include_archived
+// flag, so as_of alone must surface the archived-but-then-live entry.
+#[test]
+fn search_text_as_of_reconstructs_point_in_time_ignoring_archived() {
+    let store = open_store();
+    let (old_id, new_id, today_id) = seed_as_of_chain(&store);
+
+    let cases: &[(i64, &[i64])] = &[
+        (MAR_01_NOON, &[old_id]),
+        (JUL_01, &[new_id]),
+        (AUG_04, &[new_id, today_id]),
+    ];
+    for (as_of, expected) in cases {
+        let want: std::collections::BTreeSet<i64> = expected.iter().copied().collect();
+        let got = id_set(&store.search_text("quorum", 50, Some(*as_of)).unwrap());
+        assert_eq!(
+            got, want,
+            "search_text as_of={as_of}: point-in-time set must match regardless \
+             of archived status"
+        );
+    }
+}
+
+// Acceptance criterion 5: a genuine step failure (not a tolerated
+// duplicate-column error) propagates out of `open` rather than being
+// swallowed by the "already applied" guard.
+#[test]
+fn genuine_memory_migration_failure_propagates_not_swallowed() {
+    register_sqlite_vec();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let store = MemoryStore {
+        conn,
+        reembed_needed: None,
+        dropped_768: std::cell::Cell::new(false),
+    };
+    // No `notes` table exists, so the ALTER fails with "no such table" rather
+    // than "duplicate column name": the one error the guard tolerates.
+    let err = store
+        .apply_lifecycle_migration()
+        .expect_err("a missing table must surface as an error, not a swallowed no-op");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no such table") || msg.contains("lifecycle migration"),
+        "a real migration failure must propagate, got: {msg}"
+    );
+}
+
+// Acceptance criterion 6: a store stamped with a schema version newer than
+// this binary supports (e.g. opened by an older binary after a newer one
+// wrote it) refuses with a clear message instead of mis-running steps.
+#[test]
+fn future_memory_schema_version_refuses_to_open() {
+    register_sqlite_vec();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().join("memory.db");
+
+    {
+        let store = MemoryStore::open(&path).expect("build current store");
+        store
+            .execute_batch(&format!(
+                "PRAGMA user_version = {}",
+                super::MEMORY_SCHEMA_VERSION + 1
+            ))
+            .expect("stamp a future version");
+    }
+
+    let err = match MemoryStore::open(&path) {
+        Ok(_) => panic!("an older binary must refuse a DB stamped with a newer schema version"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("newer") || msg.contains("upgrade spelunk"),
+        "the error must explain the version mismatch clearly, got: {msg}"
+    );
+}
+
+// `infer_legacy_version`'s ladder predicates for steps 2, 5 and 7 each only
+// probed the FIRST of two columns a real migration adds in one `ALTER TABLE`
+// loop (e.g. step 2 checked `status` but not `superseded_by`). Each `ALTER
+// TABLE ADD COLUMN` auto-commits independently in SQLite, so a process
+// killed between the two statements is a real partial-application window,
+// not a hypothetical one: exactly the crash-safety scenario this runner
+// exists to survive. A single-column predicate would infer the step as
+// "done" from the first column alone and skip it forever, leaving the
+// second column permanently missing. Cover all three two-column steps in
+// one table-driven test.
+#[test]
+fn legacy_db_missing_the_second_of_a_two_column_step_still_completes_it() {
+    register_sqlite_vec();
+
+    for (drop_col, other_col_in_same_step, dependent_index) in [
+        ("superseded_by", "status", None),
+        ("invalid_at", "valid_at", Some("idx_memory_invalid_at")),
+        ("remote_id", "uuid", Some("idx_notes_remote_id")),
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("memory.db");
+
+        {
+            let store = MemoryStore::open(&path).expect("build current store");
+            if let Some(index) = dependent_index {
+                store
+                    .execute_batch(&format!("DROP INDEX {index}"))
+                    .unwrap_or_else(|e| panic!("drop index {index} depending on {drop_col}: {e}"));
+            }
+            store
+                .execute_batch(&format!(
+                    "ALTER TABLE notes DROP COLUMN {drop_col}; PRAGMA user_version = 0;"
+                ))
+                .unwrap_or_else(|e| {
+                    panic!("simulate a crash-interrupted step dropping {drop_col}: {e}")
+                });
+            assert!(
+                notes_has_column(&store, other_col_in_same_step),
+                "precondition: {other_col_in_same_step} must survive the drop"
+            );
+        }
+
+        let store = MemoryStore::open(&path)
+            .unwrap_or_else(|e| panic!("reopen a legacy db missing only {drop_col}: {e}"));
+        assert!(
+            notes_has_column(&store, drop_col),
+            "inferring the step's version from {other_col_in_same_step} alone must not \
+             permanently skip adding {drop_col}, the other column that step is responsible for"
+        );
+    }
+}
+
+// Criterion 3: a genuine (non-"duplicate column") failure partway through a
+// multi-statement step must not silently mark that step done, and the DDL
+// that already committed before the failure must not be re-applied
+// destructively on the next attempt once the fault is cleared. Force
+// `apply_edges_migration`'s single `execute_batch` (CREATE TABLE, then two
+// CREATE INDEX statements) to fail on its *second* statement by pre-creating
+// a colliding table where the first index should go: the CREATE TABLE
+// before it has already committed by the time the batch errors.
+#[test]
+fn genuine_mid_step_failure_leaves_recoverable_state_not_silent_progress() {
+    register_sqlite_vec();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().join("memory.db");
+
+    {
+        let store = MemoryStore::open(&path).expect("build current store");
+        store
+            .execute_batch(
+                "DROP INDEX idx_memory_edges_from; \
+                 DROP INDEX idx_memory_edges_to; \
+                 DROP TABLE memory_edges; \
+                 PRAGMA user_version = 5;",
+            )
+            .expect("strip back to a pre-edges (v5) shape");
+        // Collide with the name of the first index apply_edges_migration
+        // creates, so its execute_batch fails partway through, after the
+        // CREATE TABLE statement ahead of it has already committed.
+        store
+            .execute_batch("CREATE TABLE idx_memory_edges_from (blocker INTEGER)")
+            .expect("plant a colliding table name");
+    }
+
+    let err = MemoryStore::open(&path)
+        .err()
+        .expect("a real naming collision must surface as an error, not succeed");
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+        msg.contains("index") || msg.contains("table") || msg.contains("already"),
+        "expected a naming-collision error, got: {msg}"
+    );
+
+    // Verify the failure did NOT silently stamp the version, and that the
+    // statement before the failing one (CREATE TABLE memory_edges) really
+    // did commit despite the overall step returning Err.
+    let conn = rusqlite::Connection::open(&path).expect("raw reopen to inspect state");
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 5,
+        "a failed migration attempt must not advance user_version past the point of failure"
+    );
+    let edges_table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_edges'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap()
+        .is_some();
+    assert!(
+        edges_table_exists,
+        "the CREATE TABLE statement that ran before the failing CREATE INDEX must stay \
+         committed: SQLite DDL auto-commits per statement, it isn't rolled back by the later error"
+    );
+    drop(conn);
+
+    // Clear the induced fault and confirm the next open recovers cleanly:
+    // the already-applied CREATE TABLE is tolerated (IF NOT EXISTS), and the
+    // remaining steps complete normally.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw reopen to fix the fault");
+        conn.execute_batch("DROP TABLE idx_memory_edges_from")
+            .expect("remove the blocker");
+    }
+    let recovered = MemoryStore::open(&path).expect("recovered open must succeed");
+    assert_eq!(user_version(&recovered), super::MEMORY_SCHEMA_VERSION);
+}
+
+// Criterion 4: `MemoryStore::open` sets no `busy_timeout` on its connection
+// (same as `Database::open` for index.db, see the analogous
+// `insert_embeddings_rolls_back_on_a_real_sqlite_error_not_just_bad_dimension`
+// test in `storage/db.rs`), so a second writer holding the file's write lock
+// during migration must surface as a loud `SQLITE_BUSY` error, not hang or
+// silently race on the `PRAGMA user_version` write.
+#[test]
+fn concurrent_open_during_migration_fails_loudly_not_silently() {
+    register_sqlite_vec();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().join("memory.db");
+
+    {
+        let store = MemoryStore::open(&path).expect("build current store");
+        store
+            .execute_batch(
+                "DROP INDEX idx_memory_edges_from; \
+                 DROP INDEX idx_memory_edges_to; \
+                 DROP TABLE memory_edges; \
+                 PRAGMA user_version = 5;",
+            )
+            .expect("strip back to a pre-edges (v5) shape needing a real migration write");
+    }
+
+    let locker = rusqlite::Connection::open(&path).expect("second connection");
+    locker
+        .execute_batch("BEGIN IMMEDIATE; CREATE TABLE lock_probe (id INTEGER);")
+        .expect("acquire the write lock");
+
+    let err = MemoryStore::open(&path)
+        .err()
+        .expect("opening under a held write lock must fail, not hang or corrupt state");
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+        msg.contains("lock") || msg.contains("busy"),
+        "expected a locking error, got: {msg}"
+    );
+
+    locker.execute_batch("COMMIT;").expect("release the lock");
+    let recovered =
+        MemoryStore::open(&path).expect("once the lock is released, migration completes");
+    assert_eq!(user_version(&recovered), super::MEMORY_SCHEMA_VERSION);
+}
+
+// Criterion 6: the engineer's legacy-inference tests used a single note, so
+// they couldn't distinguish "row content survives" from "row COUNT survives
+// but rows got cross-attributed" (e.g. an embedding landing on the wrong
+// `note_id`, or FTS text from one note leaking onto another). Use several
+// notes with distinct kind/title/body/tags and distinct embeddings, and
+// assert each note's own content, its own embedding, and its own FTS
+// match survive legacy re-inference attached to the correct row.
+#[test]
+fn legacy_inference_preserves_distinct_multi_row_content_not_just_row_count() {
+    register_sqlite_vec();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().join("memory.db");
+
+    let rows = [
+        (
+            "decision",
+            "Alpha decision",
+            "alpha body text",
+            vec!["infra"],
+            0.11f32,
+        ),
+        (
+            "context",
+            "Beta context",
+            "beta body text",
+            vec!["billing"],
+            0.22f32,
+        ),
+        (
+            "requirement",
+            "Gamma requirement",
+            "gamma body text",
+            vec!["auth", "urgent"],
+            0.33f32,
+        ),
+    ];
+    let mut ids = Vec::new();
+    {
+        let store = MemoryStore::open(&path).expect("build via runner");
+        for (kind, title, body, tags, fill) in &rows {
+            let (id, _) = store
+                .add_note(kind, title, body, tags, &[], None, None)
+                .unwrap();
+            let vector = vec![*fill; crate::embeddings::EMBEDDING_DIM];
+            store
+                .insert_embedding(id, &crate::embeddings::vec_to_blob(&vector))
+                .unwrap();
+            ids.push(id);
+        }
+        store.execute_batch("PRAGMA user_version = 0").unwrap();
+    }
+
+    let store = MemoryStore::open(&path).expect("reopen legacy");
+    assert_eq!(user_version(&store), super::MEMORY_SCHEMA_VERSION);
+
+    for (id, (kind, title, body, tags, fill)) in ids.iter().zip(rows.iter()) {
+        let note = store
+            .get(*id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("note {id} must survive re-inference"));
+        assert_eq!(&note.kind, kind, "note {id} kind must not cross-attribute");
+        assert_eq!(
+            &note.title, title,
+            "note {id} title must not cross-attribute"
+        );
+        assert_eq!(&note.body, body, "note {id} body must not cross-attribute");
+        assert_eq!(&note.tags, tags, "note {id} tags must not cross-attribute");
+
+        let embedding = store
+            .get_embedding(*id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("note {id} embedding must survive re-inference"));
+        let vector = crate::embeddings::blob_to_vec(&embedding);
+        assert!(
+            vector.iter().all(|v| (*v - *fill).abs() < 1e-4),
+            "note {id} embedding content must be its own, not another note's"
+        );
+
+        let hits: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH ?1",
+                rusqlite::params![title],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits, 1,
+            "note {id}'s own title must be findable via FTS after re-inference"
+        );
+    }
+}
+
+// Expected `Note::superseded_by` for a store-minted rowid.
+fn sup(id: i64) -> Option<crate::storage::memory::NoteId> {
+    Some(crate::storage::memory::NoteId::from_i64(id))
+}
+
+// ── list_by_entity_ids ───────────────────────────────────────────────────────
+
+// `list_by_entity_ids` returns exactly the rows whose entity_id is requested,
+// and applies the same active-only / include_archived gate as `list_filtered`.
+// This is the SQLite read-back that `memory list --source-ref` uses once the
+// git-notes anchor has resolved which entities belong to the commit.
+#[test]
+fn list_by_entity_ids_selects_and_respects_archived() {
+    use crate::storage::entity_id::entity_id;
+
+    let store = open_store();
+    let (id_a, _) = store
+        .add_note("decision", "A", "body a", &[], &[], None, None)
+        .unwrap();
+    store
+        .add_note("decision", "B", "body b", &[], &[], None, None)
+        .unwrap();
+
+    let ea = entity_id("decision", "A", "body a");
+    let eb = entity_id("decision", "B", "body b");
+
+    // Only the requested entity comes back.
+    let only_a = store
+        .list_by_entity_ids(std::slice::from_ref(&ea), 50, false, None)
+        .unwrap();
+    assert_eq!(only_a.len(), 1);
+    assert_eq!(only_a[0].title, "A");
+
+    // Both when both ids are requested.
+    let both = store
+        .list_by_entity_ids(&[ea.clone(), eb.clone()], 50, false, None)
+        .unwrap();
+    assert_eq!(both.len(), 2);
+
+    // An empty id list is a no-op, not a full-table scan.
+    assert!(
+        store
+            .list_by_entity_ids(&[], 50, false, None)
+            .unwrap()
+            .is_empty()
+    );
+
+    // An unknown id matches nothing.
+    assert!(
+        store
+            .list_by_entity_ids(&["deadbeef".to_string()], 50, false, None)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Archiving A hides it by default, but include_archived surfaces it again.
+    store.archive(id_a).unwrap();
+    assert!(
+        store
+            .list_by_entity_ids(std::slice::from_ref(&ea), 50, false, None)
+            .unwrap()
+            .is_empty(),
+        "archived entry must be hidden when include_archived is false"
+    );
+    let with_archived = store.list_by_entity_ids(&[ea], 50, true, None).unwrap();
+    assert_eq!(with_archived.len(), 1, "include_archived must surface it");
+    assert_eq!(with_archived[0].status, "archived");
 }

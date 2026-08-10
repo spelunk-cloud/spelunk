@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
 
-use super::memory::{MemoryEdge, MemoryStore, Note};
+use super::memory::{MemoryEdge, MemoryStore, Note, NoteId};
 
 /// Input for adding a note. Owned to avoid lifetime issues across async boundaries.
 pub struct NoteInput {
@@ -20,7 +20,7 @@ pub struct NoteInput {
     pub valid_at: Option<i64>,
     /// ID of an existing entry that this entry supersedes.
     /// When set, the old entry's invalid_at is set to now() atomically.
-    pub supersedes: Option<i64>,
+    pub supersedes: Option<NoteId>,
 }
 
 /// Abstraction over local SQLite and remote HTTP memory stores.
@@ -32,12 +32,14 @@ pub trait MemoryBackend: Send {
     /// backend whose `idx_notes_entity_id` has been promoted to UNIQUE, see
     /// `MemoryStore::add_note`). Backends that cannot detect this (git notes,
     /// remote) always return `true`.
-    async fn add(&self, input: NoteInput) -> Result<(i64, bool)>;
-    /// Semantic search over ALL notes (incl. archived), ordered by valid_at/created_at ASC.
+    async fn add(&self, input: NoteInput) -> Result<(NoteId, bool)>;
+    /// Topic-filtered search over ALL notes (incl. archived), ordered by
+    /// valid_at/created_at ASC — the `memory timeline` retrieval.
     ///
-    /// `query`: the raw query text. Local backends search by `query_blob` (a
-    /// pre-computed embedding) and ignore it; the remote backend has no local
-    /// embedder and sends `query` to the server, which embeds it server-side.
+    /// `query`: the raw query text. The local backend filters by full-text
+    /// (FTS5) relevance to `query` and ignores `query_blob`, so `timeline`
+    /// needs no inference server; the remote backend has no local embedder and
+    /// sends `query` to the server, which embeds it server-side.
     async fn search_timeline(
         &self,
         query_blob: &[u8],
@@ -86,10 +88,10 @@ pub trait MemoryBackend: Send {
         include_archived: bool,
         as_of: Option<i64>,
     ) -> Result<Vec<Note>>;
-    async fn get(&self, id: i64) -> Result<Option<Note>>;
+    async fn get(&self, id: NoteId) -> Result<Option<Note>>;
     async fn count(&self) -> Result<i64>;
-    async fn archive(&self, id: i64) -> Result<bool>;
-    async fn supersede(&self, old_id: i64, new_id: i64) -> Result<bool>;
+    async fn archive(&self, id: NoteId) -> Result<bool>;
+    async fn supersede(&self, old_id: NoteId, new_id: NoteId) -> Result<bool>;
     async fn harvested_shas(&self) -> Result<HashSet<String>>;
     /// Check whether any entry already has the given full SHA in source_ref.
     async fn has_source_ref(&self, sha: &str) -> Result<bool>;
@@ -107,6 +109,23 @@ pub trait MemoryBackend: Send {
 
 // ── Local SQLite backend ──────────────────────────────────────────────────────
 
+/// Narrow an opaque [`NoteId`] to the integer a locally-keyed store uses.
+///
+/// The SQLite store keys on a rowid and the git-notes carrier keys on a
+/// creation-time integer; neither can resolve a token minted elsewhere. A
+/// non-numeric id here therefore means the caller aimed a cloud-minted id at a
+/// local store, so the message says that rather than reporting the entry as
+/// missing.
+pub(crate) fn numeric_note_id(id: &NoteId) -> Result<i64> {
+    id.as_i64().ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{id}' is not an id this project's memory store can resolve: it numbers \
+             entries with integers, and this id was minted by a cloud-hosted project. \
+             Run `spelunk memory list` to see the ids this project actually uses."
+        )
+    })
+}
+
 /// Wraps `MemoryStore` in a `tokio::sync::Mutex` so `LocalMemoryBackend: Send + Sync`,
 /// satisfying the `async-trait` Send constraint without needing spawn_blocking.
 pub struct LocalMemoryBackend {
@@ -123,11 +142,12 @@ impl LocalMemoryBackend {
 
 #[async_trait]
 impl MemoryBackend for LocalMemoryBackend {
-    async fn add(&self, input: NoteInput) -> Result<(i64, bool)> {
+    async fn add(&self, input: NoteInput) -> Result<(NoteId, bool)> {
         let store = self.store.lock().await;
         let tags: Vec<&str> = input.tags.iter().map(String::as_str).collect();
         let files: Vec<&str> = input.linked_files.iter().map(String::as_str).collect();
         let (id, created) = if let Some(supersedes_id) = input.supersedes {
+            let supersedes_id = numeric_note_id(&supersedes_id)?;
             store.add_note_superseding(
                 &input.kind,
                 &input.title,
@@ -151,16 +171,16 @@ impl MemoryBackend for LocalMemoryBackend {
         if let Some(blob) = &input.embedding {
             store.insert_embedding(id, blob)?;
         }
-        Ok((id, created))
+        Ok((NoteId::from_i64(id), created))
     }
 
     async fn search_timeline(
         &self,
-        query_blob: &[u8],
-        _query: &str,
+        _query_blob: &[u8],
+        query: &str,
         limit: usize,
     ) -> Result<Vec<Note>> {
-        self.store.lock().await.search_timeline(query_blob, limit)
+        self.store.lock().await.search_timeline(query, limit)
     }
 
     async fn search(
@@ -224,19 +244,20 @@ impl MemoryBackend for LocalMemoryBackend {
         )
     }
 
-    async fn get(&self, id: i64) -> Result<Option<Note>> {
-        self.store.lock().await.get(id)
+    async fn get(&self, id: NoteId) -> Result<Option<Note>> {
+        self.store.lock().await.get(numeric_note_id(&id)?)
     }
 
     async fn count(&self) -> Result<i64> {
         self.store.lock().await.count()
     }
 
-    async fn archive(&self, id: i64) -> Result<bool> {
-        self.store.lock().await.archive(id)
+    async fn archive(&self, id: NoteId) -> Result<bool> {
+        self.store.lock().await.archive(numeric_note_id(&id)?)
     }
 
-    async fn supersede(&self, old_id: i64, new_id: i64) -> Result<bool> {
+    async fn supersede(&self, old_id: NoteId, new_id: NoteId) -> Result<bool> {
+        let (old_id, new_id) = (numeric_note_id(&old_id)?, numeric_note_id(&new_id)?);
         self.store.lock().await.supersede(old_id, new_id)
     }
 

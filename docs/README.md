@@ -66,6 +66,7 @@ before it.
 - [Memory model](memory.md): kinds, cross-project visibility, git-notes write-through
 - [Architecture](architecture.md) and [capability tiers](architecture/capability-tiers.md)
 - [Plumbing and porcelain](plumbing-and-porcelain.md): JSONL commands for scripts and agents
+- [Stability contract](stability.md): what a version bump may change, per surface, and what it may not
 - [Security](security/THREAT-MODEL.md): threat model and boundaries (secret scanning is defense-in-depth, not a boundary)
 
 ## 5. Local vs server vs team-server

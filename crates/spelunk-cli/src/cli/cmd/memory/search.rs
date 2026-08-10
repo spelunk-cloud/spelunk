@@ -3,7 +3,11 @@ use anyhow::Result;
 use super::super::helpers::{embed_query, require_server_client};
 use super::MemorySearchArgs;
 use super::{backend_err, parse_as_of, print_note_summary};
-use crate::{capability, config::Config, storage::open_memory_backend};
+use crate::{
+    capability,
+    config::Config,
+    storage::{NoteId, open_memory_backend},
+};
 
 pub(super) async fn memory_search(
     args: MemorySearchArgs,
@@ -13,6 +17,11 @@ pub(super) async fn memory_search(
 ) -> Result<()> {
     let index_db_path = crate::config::resolve_db(None, &cfg.db_path);
     crate::storage::record_usage_at(&index_db_path, "memory search");
+
+    // Fold in any fetched teammate notes before searching, so a teammate's
+    // newly-published entry is searchable on the default path without a re-init
+    // (ADR-077 D1).
+    super::reconcile::refresh_read_path_from_git_notes(cfg, mem_path, backend_override).await;
 
     // Discovery nudge: warn once when unimported server.db notes exist.
     super::reconcile::maybe_emit_nudge(mem_path, cfg);
@@ -68,22 +77,26 @@ pub(super) async fn memory_search(
     };
 
     let mut notes = if args.expand_graph {
-        let mut seen: std::collections::HashSet<i64> = notes.iter().map(|n| n.id).collect();
+        let mut seen: std::collections::HashSet<i64> =
+            notes.iter().filter_map(|n| n.id.as_i64()).collect();
         let mut expanded = notes;
         let mut neighbours = vec![];
         for n in &expanded {
-            let (outgoing, incoming) = backend.get_edges(n.id).await.map_err(backend_err)?;
+            let Some(rowid) = n.id.as_i64() else {
+                continue;
+            };
+            let (outgoing, incoming) = backend.get_edges(rowid).await.map_err(backend_err)?;
             for e in outgoing.iter().chain(incoming.iter()) {
                 if e.kind != "relates_to" {
                     continue;
                 }
-                let neighbour_id = if e.from_id == n.id {
+                let neighbour_id = if e.from_id == rowid {
                     e.to_id
                 } else {
                     e.from_id
                 };
                 if seen.insert(neighbour_id)
-                    && let Some(nb) = backend.get(neighbour_id).await?
+                    && let Some(nb) = backend.get(NoteId::from_i64(neighbour_id)).await?
                 {
                     neighbours.push(nb);
                 }
@@ -101,9 +114,9 @@ pub(super) async fn memory_search(
     // in the CLI path), filtered post-query to the `locked`/`cross-project`
     // tag set. Results are appended after local results per ADR-003 §6.
     if !args.local_only {
-        let mut seen: std::collections::HashSet<(String, i64)> = Default::default();
+        let mut seen: std::collections::HashSet<(String, NoteId)> = Default::default();
         for n in &notes {
-            seen.insert((String::new(), n.id));
+            seen.insert((String::new(), n.id.clone()));
         }
         let dep_notes =
             super::cross_project::collect_dep_cross_cutting(&index_db_path, &mut seen).await;

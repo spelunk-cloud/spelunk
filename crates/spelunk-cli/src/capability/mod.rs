@@ -34,14 +34,21 @@
 
 mod diagnostics;
 mod guard;
+mod llm_message;
+mod llm_route;
 mod probe;
 mod state;
 mod tier;
 
 pub use diagnostics::{ConnFailure, explicit_probe_failure};
 pub use guard::{inference_server_required_message, require_explicit_server_url, require_tier1};
+pub use llm_message::{LlmFeature, NoLlmReason, no_llm_message};
+// `LlmRoute` is named only inside `llm_route` and its tests; callers work
+// through the methods on the value `resolve_llm_route` hands back.
+#[allow(unused_imports)]
+pub use llm_route::{LlmRoute, resolve_llm_route};
 pub(crate) use probe::spelunk_state_dir;
-pub use probe::{get_inference_tier, get_tier, probe_tier_fresh};
+pub use probe::{get_inference_tier, get_inference_tier_fresh, get_tier};
 // `Capabilities` is only reached from outside this module by other crates'
 // `#[cfg(test)]` code (`Capabilities::all()`), so a non-test build sees this
 // re-export as unused.

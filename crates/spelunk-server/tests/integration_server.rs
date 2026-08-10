@@ -130,9 +130,10 @@ async fn list_notes_returns_added_note() {
         .await
         .unwrap();
     let notes: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(notes.as_array().unwrap().len(), 1);
-    assert_eq!(notes[0]["title"], "First note");
-    assert_eq!(notes[0]["status"], "active");
+    let entries = notes["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["title"], "First note");
+    assert_eq!(entries[0]["status"], "active");
 }
 
 // ── get_note ──────────────────────────────────────────────────────────────────
@@ -200,7 +201,7 @@ async fn archive_note_hides_it_from_list() {
         .await
         .unwrap();
     let notes: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(notes.as_array().unwrap().is_empty());
+    assert!(notes["entries"].as_array().unwrap().is_empty());
 }
 
 // ── delete ────────────────────────────────────────────────────────────────────

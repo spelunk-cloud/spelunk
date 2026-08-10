@@ -30,11 +30,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn write_no_server_url_config(dir: &Path) -> std::path::PathBuf {
     let db_path = dir.join("index.db");
     let config_path = dir.join("config.toml");
-    fs::write(
-        &config_path,
-        format!("db_path = {db_path:?}\nembedding_model = \"test-model\"\n"),
-    )
-    .expect("write config.toml");
+    fs::write(&config_path, format!("db_path = {db_path:?}\n")).expect("write config.toml");
     config_path
 }
 

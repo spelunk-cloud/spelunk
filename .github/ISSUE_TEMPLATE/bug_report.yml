@@ -1,0 +1,84 @@
+name: Bug report
+description: Something doesn't work the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Security issues do not belong here** — please use
+        [private vulnerability reporting](https://github.com/spelunk-cloud/spelunk/security/advisories/new) instead.
+  - type: input
+    id: version
+    attributes:
+      label: spelunk version
+      description: Output of `spelunk --version`
+      placeholder: spelunk 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel, built from source)
+        - Linux x86_64
+        - Linux arm64
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install spelunk?
+      options:
+        - Release tarball / zip
+        - Debian package (.deb)
+        - Built from source
+        - Package manager (brew / scoop)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: setup
+    attributes:
+      label: Setup
+      description: Which tier were you using when this happened?
+      options:
+        - Local only (no server)
+        - Local with auto-started server (Default)
+        - Team server (explicit server_url)
+        - Cloud
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. spelunk init
+        2. spelunk index .
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: >
+        Paste the output of `spelunk status` and `spelunk check`. If a server is
+        involved, add `spelunk server status` and any relevant lines from
+        `spelunk server logs`. Re-running the failing command with
+        `RUST_LOG=debug` often captures the useful detail. Please redact
+        anything sensitive — file paths and repo names are fine to keep.
+      render: text
+    validations:
+      required: false

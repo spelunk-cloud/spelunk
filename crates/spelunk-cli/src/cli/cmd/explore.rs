@@ -63,17 +63,32 @@ pub async fn explore(args: ExploreArgs, cfg: Config) -> Result<()> {
     let project_root = db_path.parent().unwrap_or(&db_path);
     let inference_tier = capability::get_inference_tier(&cfg).await;
     let eff_cfg = inference_tier.effective_config(&cfg, project_root);
-    let client = ServerInferenceClient::from_config(&eff_cfg).ok_or_else(|| {
+    let embed_client = ServerInferenceClient::from_config(&eff_cfg).ok_or_else(|| {
         anyhow::anyhow!(
             "'spelunk explore' requires spelunk-server.\n\
              Set server_url in ~/.config/spelunk/config.toml to enable this feature."
         )
     })?;
-    let client = Arc::new(client);
+
+    // Embedding and LLM inference resolve independently and can land on
+    // different servers, so they get their own clients rather than sharing one.
+    let route = capability::resolve_llm_route(&cfg, project_root).await;
+    let llm_client = match route.client() {
+        Some(client) => client,
+        None => anyhow::bail!(
+            "{}",
+            capability::no_llm_message(
+                route
+                    .reason()
+                    .unwrap_or(capability::NoLlmReason::NoLlmAnywhere),
+                capability::LlmFeature::Explore,
+            )
+        ),
+    };
 
     let sp = spinner("Connecting to inference server…");
-    let embedder = ServerEmbedAdapter(Arc::clone(&client));
-    let llm = ServerLlmAdapter(Arc::clone(&client));
+    let embedder = ServerEmbedAdapter(Arc::new(embed_client));
+    let llm = ServerLlmAdapter(Arc::new(llm_client));
     sp.finish_and_clear();
 
     let verbose = args.verbose || crate::utils::is_agent_mode();

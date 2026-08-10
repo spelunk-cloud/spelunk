@@ -39,9 +39,8 @@ impl Tier {
         matches!(self, Tier::Server { .. })
     }
 
-    // Used by check.rs / status.rs via pattern matching on the enum variant;
-    // also consumed by sub-issues #323/#324 UX wiring.
-    #[cfg(test)]
+    // Used by check.rs / status.rs via pattern matching on the enum variant,
+    // and by LLM routing to name the server it picked.
     pub fn server_url(&self) -> Option<&str> {
         match self {
             Tier::Server { url, .. } => Some(url),

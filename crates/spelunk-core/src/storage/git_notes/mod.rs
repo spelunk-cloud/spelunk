@@ -14,9 +14,11 @@ mod backend_impl;
 mod fold;
 mod lock;
 mod publish;
+mod refs;
 
 pub use lock::{LOCK_WAIT_BUDGET, LockAttempt, NotesLock, lock_notes};
 pub use publish::{PublishOutcome, SkipReason, publish_notes};
+pub use refs::NotesRefs;
 
 // ── Carry config: surviving history rewrites ─────────────────────────────────
 
@@ -787,6 +789,81 @@ impl GitNotesBackend {
         Ok(fold_records(records))
     }
 
+    /// Every spelunk record on the ref, each paired with the commit its note is
+    /// anchored to (newest commit first). Unlike [`folded_records`] this keeps
+    /// the per-commit provenance the `--source-ref` anchor lookup needs, so it
+    /// does not fold; callers fold (or anchor) as they need.
+    ///
+    /// `noted_commits` and `read_note_blobs` share one order (the latter reads
+    /// the former's blob shas in request order), so zipping them attributes each
+    /// blob's records to the right commit.
+    async fn records_with_commit(&self) -> Result<Vec<(String, NoteRecord)>> {
+        let noted = self.noted_commits().await?;
+        let blob_shas: Vec<String> = noted.iter().map(|(_, blob)| blob.clone()).collect();
+        let blobs = self.read_note_blobs(&blob_shas).await?;
+
+        let mut out = Vec::new();
+        for ((commit, _blob), body) in noted.iter().zip(blobs.iter()) {
+            for record in parse_records(body)? {
+                out.push((commit.clone(), record));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `entity_id`s of every entry whose memory note is anchored to a commit
+    /// whose sha begins with `sha_prefix`.
+    ///
+    /// The anchor — the git-notes attachment (commit → note object) — is the
+    /// only place a `memory add` entry records which commit it belongs to: its
+    /// SQLite `source_ref` column stays NULL (that column is harvest provenance,
+    /// ADR-062), so a `source_ref` column query can never surface it. Prefix
+    /// matching mirrors that column's `LIKE 'prefix%'` semantics — a plain
+    /// string prefix over the full commit sha — rather than git's own
+    /// abbreviated-object resolution, so a prefix that is ambiguous to git still
+    /// matches every noted commit it is a prefix of.
+    pub async fn entity_ids_anchored_to(&self, sha_prefix: &str) -> Result<Vec<String>> {
+        let records = self.records_with_commit().await?;
+        Ok(fold::anchor_commits(&records)
+            .into_iter()
+            .filter(|(_entity, commit)| commit.starts_with(sha_prefix))
+            .map(|(entity, _commit)| entity)
+            .collect())
+    }
+
+    /// Note-anchored entries whose anchor commit begins with `sha_prefix`, as
+    /// folded `Note`s. The git-notes analogue of the SQLite `source_ref` filter,
+    /// used when git notes is the primary store (`--backend git-notes` / the
+    /// pre-init carrier); the SQLite-primary path resolves the same anchors via
+    /// [`entity_ids_anchored_to`] and reads the authoritative rows back instead.
+    async fn list_anchored_to(
+        &self,
+        sha_prefix: &str,
+        include_archived: bool,
+        as_of: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<Note>> {
+        let records = self.records_with_commit().await?;
+        let anchors = fold::anchor_commits(&records);
+        // Fold across every commit so an entry's `status` reflects a
+        // state-update appended on a later commit, not just its original line.
+        let mut folded = fold_records(records.into_iter().map(|(_, r)| r).collect());
+
+        folded.retain(|record| {
+            anchors
+                .get(&record.resolve_entity_id())
+                .is_some_and(|commit| commit.starts_with(sha_prefix))
+                && record_in_window(record, include_archived, as_of)
+        });
+
+        // Match `collect`'s ordering and newest-wins truncation exactly.
+        folded.sort_by_key(|r| r.created_at);
+        if folded.len() > limit {
+            folded.drain(..folded.len() - limit);
+        }
+        Ok(folded.into_iter().map(record_to_note).collect())
+    }
+
     async fn collect(
         &self,
         kind_filter: Option<&str>,
@@ -800,19 +877,7 @@ impl GitNotesBackend {
             if kind_filter.is_some_and(|k| record.kind != k) {
                 return false;
             }
-            if !include_archived && record.status == "archived" {
-                return false;
-            }
-            if let Some(ts) = as_of {
-                let effective = record.valid_at.unwrap_or(record.created_at);
-                if effective > ts {
-                    return false;
-                }
-                if record.invalid_at.is_some_and(|ia| ia <= ts) {
-                    return false;
-                }
-            }
-            true
+            record_in_window(record, include_archived, as_of)
         });
 
         // Stable over first-encounter order, so ties keep blob order (D2).
@@ -825,6 +890,32 @@ impl GitNotesBackend {
 
         Ok(folded.into_iter().map(record_to_note).collect())
     }
+}
+
+/// Whether a folded record survives the archived / point-in-time gate shared by
+/// [`GitNotesBackend::collect`] and [`GitNotesBackend::list_anchored_to`].
+/// `kind` filtering (only `collect` does it) stays with the caller.
+///
+/// A point-in-time (`as_of`) query is governed entirely by the temporal window,
+/// independent of archived status: an entry archived or superseded AFTER T was
+/// live at T and must be returned, so the archived gate is skipped whenever
+/// `as_of` is set and `include_archived` then only affects the current-view
+/// listing.
+fn record_in_window(record: &NoteRecord, include_archived: bool, as_of: Option<i64>) -> bool {
+    if let Some(ts) = as_of {
+        let effective = record.valid_at.unwrap_or(record.created_at);
+        if effective > ts {
+            return false;
+        }
+        if record.invalid_at.is_some_and(|ia| ia <= ts) {
+            return false;
+        }
+        return true;
+    }
+    if !include_archived && record.status == "archived" {
+        return false;
+    }
+    true
 }
 
 /// Permissively parse the spelunk records from one note blob.
@@ -981,33 +1072,9 @@ mod cat_file_batch {
         );
     }
 
-    /// Drop the machine's global/system git config for every git this
-    /// process spawns, including a setup git this test module runs
-    /// directly. Must be process-wide, not per-`Command`: a helper that
-    /// only sets env on the `Command` it builds itself never reaches git
-    /// spawned by the code under test (`run_git`/`run_git_with_stdin`
-    /// inherit the process environment like any other `Command`).
-    ///
-    /// A temp repo's local config does not shadow an ambient value the
-    /// repo never sets, so an ambient `core.hooksPath` (husky, lefthook,
-    /// the pre-commit framework) fires a foreign pre-commit hook on the
-    /// commit below.
-    fn isolate_git_config() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            // SAFETY: every caller here calls this first and `Once` blocks
-            // the rest until it returns, so no thread can be spawning git
-            // (reading environ) while these run.
-            unsafe {
-                std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
-                std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
-            }
-        });
-    }
-
     /// A repo carrying one note, and that note's blob sha.
     fn repo_with_one_note() -> (tempfile::TempDir, String) {
-        isolate_git_config();
+        crate::test_support::isolate_git_config();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")

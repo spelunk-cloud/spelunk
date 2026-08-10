@@ -60,7 +60,7 @@ AI coding agents lose context between sessions and can't trace how code connects
 - **Code graph** — trace callers, callees, and imports across file boundaries without reading every file.
 - **Works without any server** — memory, code graph, and full-text/structural (ast-grep) search work with just the binary. No API keys, no configuration.
 - **Semantic search built in** — a local `spelunk-server` is autostarted on demand with a bundled native embedder (codefuse-ai/F2LLM-v2-330M, 896-dim, GPU-accelerated on macOS); no external inference server required. You can still point spelunk at your own OpenAI-compatible endpoint (LM Studio, Ollama, vLLM) if you prefer.
-- **100% local** — your code never leaves your machine. The server is self-hosted (local by default).
+- **100% local** — your code never leaves your machine. The server is self-hosted (local by default). This claim is enforced, not just asserted: `crates/spelunk-cli/tests/egress_containment.rs` traps every outbound connection across the local-tier command surface and fails loudly, naming the destination, on any escape past loopback.
 - **Agent-native** — JSON output (`AGENT=true`), git hooks, and a structured memory system built for the agent workflow loop.
 
 ### When to use spelunk vs grep
@@ -160,6 +160,7 @@ the first five minutes to running a shared memory server for a team.
 - [Memory](docs/memory.md): decisions, context, and requirements across sessions
 - [Agent Guide](docs/agent-guide.md): wiring spelunk into AI coding agents
 - [Commands](docs/commands.md): full reference for every subcommand
+- [Stability contract](docs/stability.md): which surfaces semver freezes, and which are free to change
 - [Architecture](docs/architecture.md): system design for contributors
 - [Examples](docs/examples/): real-world workflows
 
@@ -181,7 +182,10 @@ cargo test                    # test all crates
 
 ## Contributing
 
-Contributions welcome. See [Building from source](docs/building.md) for setup instructions.
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+workflow and [Building from source](docs/building.md) for setup instructions.
+Supported platforms and host requirements are listed in
+[docs/support.md](docs/support.md).
 
 ## License
 

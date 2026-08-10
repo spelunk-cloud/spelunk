@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-cli"
-version = "0.9.5"
+version = "0.9.7"
 edition = "2024"
 description = "spelunk — AI agent context retrieval CLI"
 license = "MIT"
@@ -51,7 +51,7 @@ percent-encoding = "2.3"
 blake3 = "1"
 regex = { version = "1", default-features = false, features = ["std"] }
 dirs = { workspace = true }
-gix = { version = "0.85.0", default-features = false, features = [
+gix = { version = "0.86.0", default-features = false, features = [
     "sha1",
     "status",
 ] }
@@ -67,6 +67,15 @@ tempfile = { workspace = true }
 spelunk-core = { path = "../spelunk-core", features = ["test-support"] }
 assert_cmd = "2.2"
 predicates = "3.1"
+# Upgrade-corpus fixtures only. The captured databases are mostly the vec0
+# extension's preallocated vector chunk, which is zeros: gzip takes them from
+# megabytes to tens of kilobytes, small enough to check in. Already in the
+# lockfile as a transitive dependency, so this adds no new supply-chain surface.
+flate2 = "1"
+# Upgrade-corpus fixtures only: verifies each checked-in wing still hashes to
+# the artifact its recorded expectations were captured from. Same version
+# spelunk-core already depends on, so it adds nothing to the lockfile.
+sha2 = "0.11"
 wiremock = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }

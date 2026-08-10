@@ -133,7 +133,7 @@ fn setup_context_project() -> (TempDir, PathBuf, PathBuf) {
 /// Write a minimal config.toml for the context tests.
 fn write_config_for_context(dir: &Path, db_path: &Path, api_base: &str) -> PathBuf {
     let cfg = format!(
-        "db_path = {:?}\napi_base_url = {:?}\nembedding_model = \"test-model\"\nllm_model = \"test-chat\"\n",
+        "db_path = {:?}\napi_base_url = {:?}\nllm_model = \"test-chat\"\n",
         db_path, api_base
     );
     let config_path = dir.join("config.toml");
@@ -622,7 +622,10 @@ fn context_exits_nonzero_when_config_invalid() {
 
     std::fs::write(
         &config_path,
-        format!("db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nembedding_model = \"test\"\nllm_model = \"test\"\n", db_path),
+        format!(
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nllm_model = \"test\"\n",
+            db_path
+        ),
     )
     .expect("write config");
 

@@ -1,6 +1,7 @@
 use super::color::cprintln;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
+use spelunk_core::storage::NoteId;
 use std::path::PathBuf;
 
 #[derive(Args, Debug)]
@@ -95,8 +96,15 @@ pub struct MemoryAddArgs {
     #[arg(long)]
     pub from_url: Option<String>,
 
-    /// Kind: decision, context, requirement, note, question, answer, handoff, intent, antipattern
-    #[arg(short, long, default_value = "note")]
+    /// Kind: decision, context, requirement, note, question, answer, handoff, intent, antipattern.
+    /// An unknown kind is rejected (it would be invisible to `memory list`,
+    /// `context`, and `memory failures`).
+    #[arg(
+        short,
+        long,
+        default_value = "note",
+        value_parser = spelunk_core::storage::parse_note_kind
+    )]
     pub kind: String,
 
     /// Comma-separated tags (e.g. auth,database)
@@ -115,7 +123,7 @@ pub struct MemoryAddArgs {
     /// ID of an existing entry that this new entry supersedes.
     /// The old entry's invalid_at is set to now atomically in the same transaction.
     #[arg(long, value_name = "ID")]
-    pub supersedes: Option<i64>,
+    pub supersedes: Option<NoteId>,
 
     /// ID of an existing entry this entry relates to (creates a relates_to edge).
     #[arg(long, value_name = "ID")]
@@ -186,7 +194,7 @@ pub struct MemoryListArgs {
 #[derive(Args, Debug)]
 pub struct MemoryShowArgs {
     /// Entry ID (from list or search output)
-    pub id: i64,
+    pub id: NoteId,
 
     /// Output format: text or json
     #[arg(long, default_value = "text")]
@@ -271,15 +279,15 @@ pub struct MemorySyncArgs {
 #[derive(Args, Debug)]
 pub struct MemoryArchiveArgs {
     /// ID of the entry to archive (from `spelunk memory list`)
-    pub id: i64,
+    pub id: NoteId,
 }
 
 #[derive(Args, Debug)]
 pub struct MemorySupersededArgs {
     /// ID of the entry to archive (the outdated one)
-    pub old_id: i64,
+    pub old_id: NoteId,
     /// ID of the entry that replaces it (the new one)
-    pub new_id: i64,
+    pub new_id: NoteId,
 }
 
 #[derive(Args, Debug)]
@@ -591,7 +599,7 @@ pub(super) fn print_note_summary(n: &crate::storage::memory::Note) {
     if !n.linked_files.is_empty() {
         println!("     files: {}", n.linked_files.join(", "));
     }
-    if let Some(sup) = n.superseded_by {
+    if let Some(sup) = &n.superseded_by {
         cprintln!("     \x1b[2msuperseded by #{sup}\x1b[0m");
     }
     if !matches!(n.kind.as_str(), "question" | "answer") {

@@ -622,7 +622,7 @@ fn embedder_status_line(
         },
         EmbedderState::Ready => "  embedder        ready".to_string(),
         EmbedderState::Disabled => {
-            "  embedder        disabled  [external embedding backend]".to_string()
+            "  embedder        disabled  [server built without a native embedder]".to_string()
         }
         // Older server without the readiness field: stay quiet rather than
         // print a confusing "unknown".
@@ -777,11 +777,19 @@ mod tests {
     }
 
     #[test]
-    fn embedder_line_disabled_notes_external_backend() {
+    fn embedder_line_disabled_notes_no_native_embedder() {
+        // `Disabled` now means only one thing: this server binary was built
+        // without the `embed-native` feature. The external-relocation
+        // backend this line used to describe no longer exists, so the line
+        // must not claim it does.
         let line =
             embedder_status_line(&EmbedderState::Disabled, None).expect("disabled renders a line");
         assert!(line.contains("disabled"));
-        assert!(line.contains("external"));
+        assert!(
+            !line.contains("external"),
+            "the external embedding backend concept no longer exists: {line}"
+        );
+        assert!(line.contains("native embedder"), "got: {line}");
     }
 
     #[test]

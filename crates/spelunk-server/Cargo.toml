@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-server"
-version = "0.9.5"
+version = "0.9.7"
 edition = "2024"
 description = "spelunk shared memory server"
 license = "MIT"
@@ -76,3 +76,7 @@ wiremock = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
 utoipa = { version = "5", features = ["axum_extras"] }
+# Builds a minimal-but-valid tokenizer.json fixture for embed_hub's
+# corrupt-GGUF test, so it exercises the GGUF parse path instead of failing
+# earlier on tokenizer parsing like the corrupt-tokenizer test.
+tokenizers = { workspace = true }

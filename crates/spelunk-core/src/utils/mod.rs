@@ -110,6 +110,40 @@ pub fn fts5_quote_literal(term: &str) -> String {
     out
 }
 
+/// Build an FTS5 `MATCH` expression that scores a multi-word query's terms
+/// **independently**, so it ranks documents that contain the terms regardless
+/// of their order or adjacency (BM25 over a bag of words) — rather than
+/// requiring the whole query to appear as one contiguous, ordered phrase.
+///
+/// The query is split into whitespace-separated terms; each term is quoted as a
+/// literal via [`fts5_quote_literal`] (so FTS5 query punctuation and the
+/// boolean/`NEAR` keywords inside user input stay literal and never parse as
+/// query syntax), and the quoted terms are combined with the FTS5 `OR`
+/// operator. `OR` — not `AND` — keeps a document that matches only some of the
+/// terms in the candidate set, so BM25 can rank a document matching more of the
+/// query terms above one matching fewer, instead of dropping the partial match
+/// entirely.
+///
+/// Tokenisation and stemming are exactly whatever the target table's FTS5
+/// tokenizer already applies — the default `unicode61` (case-folded, no
+/// stemming) — because every term is matched through that same tokenizer; this
+/// function never invents its own token rules.
+///
+/// A query with no terms (empty or all-whitespace) yields `""`, a valid FTS5
+/// literal that simply matches nothing — never a parse error.
+pub fn fts5_match_query(query: &str) -> String {
+    let mut terms = query.split_whitespace();
+    let Some(first) = terms.next() else {
+        return String::from("\"\"");
+    };
+    let mut out = fts5_quote_literal(first);
+    for term in terms {
+        out.push_str(" OR ");
+        out.push_str(&fts5_quote_literal(term));
+    }
+    out
+}
+
 /// Strip ANSI escape sequences and unsafe control characters from a string.
 ///
 /// Allows newline, carriage return, and tab. Strips all other C0 control
@@ -360,6 +394,56 @@ mod tests {
         let term = "before\0after";
         let quoted = fts5_quote_literal(term);
         assert_eq!(quoted, "\"beforeafter\"");
+    }
+
+    // ── fts5_match_query ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fts5_match_multi_word_joins_literal_terms_with_or() {
+        // Each word is a separate quoted literal combined with OR, so the query
+        // matches the terms independently rather than as one ordered phrase.
+        assert_eq!(fts5_match_query("leaky bucket"), "\"leaky\" OR \"bucket\"");
+        assert_eq!(
+            fts5_match_query("token bucket bursts"),
+            "\"token\" OR \"bucket\" OR \"bursts\""
+        );
+    }
+
+    #[test]
+    fn fts5_match_single_word_is_one_literal_no_or() {
+        assert_eq!(fts5_match_query("bucket"), "\"bucket\"");
+    }
+
+    #[test]
+    fn fts5_match_empty_or_whitespace_matches_nothing() {
+        // No terms → a single empty literal: valid FTS5 that matches nothing,
+        // never a parse error.
+        assert_eq!(fts5_match_query(""), "\"\"");
+        assert_eq!(fts5_match_query("   \t\n "), "\"\"");
+    }
+
+    #[test]
+    fn fts5_match_boolean_keywords_stay_literal_terms() {
+        // User words that look like FTS5 operators are quoted per-term, so only
+        // the injected separators are ever real OR operators.
+        assert_eq!(
+            fts5_match_query("a OR NOT b"),
+            "\"a\" OR \"OR\" OR \"NOT\" OR \"b\""
+        );
+    }
+
+    #[test]
+    fn fts5_match_escapes_and_strips_per_term() {
+        // Per-term delegation to fts5_quote_literal: internal quotes doubled,
+        // embedded NUL stripped.
+        assert_eq!(
+            fts5_match_query("say\"hi there"),
+            "\"say\"\"hi\" OR \"there\""
+        );
+        assert_eq!(
+            fts5_match_query("be\0fore after"),
+            "\"before\" OR \"after\""
+        );
     }
 
     // ── strip_ansi ────────────────────────────────────────────────────────────

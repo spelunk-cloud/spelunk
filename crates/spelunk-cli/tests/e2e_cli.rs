@@ -61,6 +61,27 @@ fn test_help_text_accuracy_guards() {
         .stdout(predicate::str::contains("alias").not());
 }
 
+// `spelunk --help` must list the first-class `explore` subcommand in its
+// top-level command list. `explore` is a documented feature ("Agentic search
+// loop"), so an agent or user enumerating capabilities from `--help` must be
+// able to discover it. It was previously hidden from `--help` whenever no chat
+// model was configured; it must now always list.
+//
+// The test HOME is an isolated temp dir with no `llm_model` set, so this pins
+// down the no-llm case specifically. Running `explore` without an LLM still
+// fails with the locked-feature message (unchanged) — only its visibility in
+// `--help` changes. "explore" appears in `--help` output only when the command
+// is listed (no other command's about text or the crate description contains
+// that substring), so asserting its presence is a faithful proxy.
+#[test]
+fn test_help_lists_explore() {
+    spelunk_bin()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("explore"));
+}
+
 /// regression: `spelunk search --as-of <sha>` (snapshot search) was removed
 /// outright — the flag no longer exists on the top-level `search` command.
 /// `spelunk search --help` must not mention `--as-of`.
@@ -188,11 +209,7 @@ async fn test_index_and_status() {
     fs::write(
         &config_path,
         format!(
-            concat!(
-                "db_path = {:?}\n",
-                "embedding_model = \"test-model\"\n",
-                "llm_model = \"test-chat-model\"\n",
-            ),
+            concat!("db_path = {:?}\n", "llm_model = \"test-chat-model\"\n",),
             db_path,
         ),
     )
@@ -306,11 +323,7 @@ async fn test_index_encodes_project_id_with_slashes_as_single_segment() {
         fs::write(
             &config_path,
             format!(
-                concat!(
-                    "db_path = {:?}\n",
-                    "embedding_model = \"test-model\"\n",
-                    "llm_model = \"test-chat-model\"\n",
-                ),
+                concat!("db_path = {:?}\n", "llm_model = \"test-chat-model\"\n",),
                 db_path,
             ),
         )
@@ -321,8 +334,18 @@ async fn test_index_encodes_project_id_with_slashes_as_single_segment() {
         write_project_server_config(&project_dir, &mock_server.uri(), project_id);
 
         // Index the project — must reach the embedding phase without a 404.
+        //
+        // This test's purpose is the project_id slash-encoding in the embed
+        // request path, not local-vs-remote embed routing, so it needs an
+        // explicit `server_url` to legitimately serve embedding. Under the
+        // default `local_first` mode that routing is now correctly refused
+        // (see the `get_inference_tier` routing fix), so force `cloud_first`
+        // here: `.spelunk/config.toml` doesn't recognize a `mode` key (see
+        // `write_project_server_config`), so this must go through the env
+        // var.
         spelunk_bin()
             .current_dir(&project_dir)
+            .env("SPELUNK_MODE", "cloud_first")
             .arg("--config")
             .arg(&config_path)
             .arg("index")
@@ -402,7 +425,7 @@ async fn test_status_shows_offline_tier() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -603,7 +626,7 @@ async fn test_status_json_stable_schema() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = {:?}\nembedding_model = \"test-model\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = {:?}\nllm_model = \"test\"\n",
             db_path,
             mock_server.uri()
         ),
@@ -721,7 +744,7 @@ async fn test_status_json_top_level_keys_are_exactly_the_documented_set() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -862,7 +885,7 @@ async fn test_check_reports_server_unreachable() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = {:?}\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = {:?}\nllm_model = \"test\"\n",
             db_path, bad_url
         ),
     )
@@ -889,6 +912,156 @@ async fn test_check_reports_server_unreachable() {
         .stdout(predicate::str::contains("unreachable"));
 }
 
+// Porcelain mode must keep stdout a pure, machine-parseable `key=value` stream:
+// the server-reachability line (and its Unicode ✓/✗ glyphs) is a human
+// diagnostic and belongs on stderr, never mixed into the stdout a script reads
+// with `while read -r line`. The signal itself must not be dropped — it still
+// has to reach a human on stderr.
+#[tokio::test]
+async fn test_check_porcelain_routes_server_line_to_stderr() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "ok",
+            "version": "test",
+            "capabilities": ["memory", "search.semantic", "explore"]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/v1/projects/.+/index/embed$"))
+        .respond_with(IndexEmbedResponder)
+        .mount(&mock_server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+    fs::write(project_dir.join("main.rs"), "fn main() {}").unwrap();
+
+    let db_path = temp.path().join("index.db");
+    let config_path = write_config_with_server(
+        temp.path(),
+        &db_path,
+        &mock_server.uri(),
+        &mock_server.uri(),
+        &project_dir,
+    );
+
+    let mut cmd = spelunk_bin();
+    cmd.current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("index")
+        .arg(&project_dir)
+        .assert()
+        .success();
+
+    let mut cmd = spelunk_bin();
+    cmd.current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check")
+        .arg("--format")
+        .arg("porcelain")
+        .assert()
+        // Fresh index → exit 0, exactly as in text mode.
+        .success()
+        // stdout carries ONLY the stable key=value summary …
+        .stdout(predicate::str::contains("stale="))
+        .stdout(predicate::str::contains("total="))
+        .stdout(predicate::str::contains("last_indexed="))
+        // … and none of the human diagnostics or their glyphs.
+        .stdout(predicate::str::contains("Server:").not())
+        .stdout(predicate::str::contains("Active agent sessions").not())
+        .stdout(predicate::str::contains('·').not())
+        .stdout(predicate::str::contains('⚠').not())
+        .stdout(predicate::str::contains('✓').not())
+        .stdout(predicate::str::contains('✗').not())
+        // The reachability signal is preserved for a human — on stderr.
+        .stderr(predicate::str::contains("Server:"))
+        .stderr(predicate::str::contains("semantic search"));
+}
+
+// Exit code contract holds in BOTH modes: a stale index exits 1. Porcelain
+// stdout stays key=value even when stale, and the server line is still routed
+// to stderr rather than stdout.
+#[tokio::test]
+async fn test_check_exit_1_when_stale_in_both_modes() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "ok",
+            "version": "test",
+            "capabilities": ["memory", "search.semantic", "explore"]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/v1/projects/.+/index/embed$"))
+        .respond_with(IndexEmbedResponder)
+        .mount(&mock_server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+    fs::write(project_dir.join("main.rs"), "fn main() {}").unwrap();
+
+    let db_path = temp.path().join("index.db");
+    let config_path = write_config_with_server(
+        temp.path(),
+        &db_path,
+        &mock_server.uri(),
+        &mock_server.uri(),
+        &project_dir,
+    );
+
+    let mut cmd = spelunk_bin();
+    cmd.current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("index")
+        .arg(&project_dir)
+        .assert()
+        .success();
+
+    // Mutate the indexed file so its on-disk hash no longer matches the index.
+    fs::write(project_dir.join("main.rs"), "fn main() { /* changed */ }").unwrap();
+
+    // Porcelain mode: exit 1, stdout still pure key=value, server line on stderr.
+    let mut cmd = spelunk_bin();
+    cmd.current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check")
+        .arg("--format")
+        .arg("porcelain")
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("stale=1"))
+        .stdout(predicate::str::contains("Server:").not())
+        .stderr(predicate::str::contains("Server:"));
+
+    // Text (human) mode: same exit code, and the server line stays on stdout.
+    let mut cmd = spelunk_bin();
+    cmd.current_dir(&project_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check")
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("Server:"));
+}
+
 // Investigation found no shared server/port/filesystem state this test could
 // race on (SPELUNK_NO_SERVER short-circuits before any is touched); flakes
 // under the parallel runner are attributed to generic child-process
@@ -907,23 +1080,28 @@ async fn test_index_prints_note_when_no_server_configured() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
     .unwrap();
 
     let mut cmd = spelunk_bin();
+    // Run in the temp project like the sibling tests, else the project-config walk-up
+    // reaches the repo's own .spelunk/config.toml (server_url set) and suppresses the notice.
     cmd.env("SPELUNK_NO_SERVER", "1") // ensure offline even if a local server is running
+        .current_dir(&project_dir)
         .arg("--config")
         .arg(&config_path)
         .arg("index")
         .arg(&project_dir)
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "Skipping summaries (no server_url configured)",
-        ));
+        // Offline is the reason here, so that is what the notice must name.
+        // Summaries no longer key off `server_url`, so a notice mentioning it
+        // would be the old bug rather than a passing assertion.
+        .stderr(predicate::str::contains("Skipping chunk summaries"))
+        .stderr(predicate::str::contains("offline mode is on"));
 }
 
 #[test]
@@ -938,7 +1116,7 @@ fn test_status_json_offline_tier() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -995,7 +1173,7 @@ fn test_search_no_index_falls_back_to_ast_grep_or_clean_message() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1234\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -1039,7 +1217,7 @@ fn test_search_index_but_no_embedder_falls_back_to_ast_grep() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -1070,90 +1248,6 @@ fn test_search_index_but_no_embedder_falls_back_to_ast_grep() {
 
     // Must not print the old opaque error message.
     assert.stdout(predicate::str::contains("Make sure the index has embeddings").not());
-}
-
-/// Explicit `--mode hybrid` with no reachable server must fall through to FTS
-/// text search with a notice on stderr — not fail (#303-F2 / spelunk#323).
-#[test]
-fn test_search_explicit_hybrid_no_embedder_falls_back_to_text() {
-    let temp = tempdir().unwrap();
-    let project_dir = temp.path().join("project");
-    fs::create_dir(&project_dir).unwrap();
-    fs::write(project_dir.join("lib.rs"), "pub fn foo() {}").unwrap();
-
-    let config_path = temp.path().join("config.toml");
-    let db_path = temp.path().join("index.db");
-    fs::write(
-        &config_path,
-        format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:19999\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
-            db_path
-        ),
-    )
-    .unwrap();
-
-    spelunk_bin()
-        .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
-        .arg("--config")
-        .arg(&config_path)
-        .arg("index")
-        .arg(&project_dir)
-        .assert()
-        .success();
-
-    // Explicit --mode hybrid with no server → succeeds with text search silently
-    // (ADR-004: inference-only routing; fallback is resolved at capability detection,
-    // no per-query notice is emitted).
-    spelunk_bin()
-        .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
-        .current_dir(&project_dir)
-        .arg("--config")
-        .arg(&config_path)
-        .arg("search")
-        .arg("--mode")
-        .arg("hybrid")
-        .arg("foo")
-        .assert()
-        .success()
-        .stderr(predicate::str::is_empty());
-}
-
-/// Explicit `--mode semantic` with no reachable server must also fall through.
-#[test]
-fn test_search_explicit_semantic_no_server_falls_back_to_text() {
-    let temp = tempdir().unwrap();
-    let project_dir = temp.path().join("project");
-    fs::create_dir(&project_dir).unwrap();
-    fs::write(project_dir.join("lib.rs"), "pub fn foo() {}").unwrap();
-
-    let config_path = temp.path().join("config.toml");
-    let db_path = temp.path().join("index.db");
-    fs::write(&config_path, format!("db_path = {:?}\n", db_path)).unwrap();
-
-    spelunk_bin()
-        .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
-        .arg("--config")
-        .arg(&config_path)
-        .arg("index")
-        .arg(&project_dir)
-        .assert()
-        .success();
-
-    // Explicit --mode semantic with no server configured → silent fallback to
-    // text search (ADR-004: no explicit server_url = inference-only routing,
-    // fallback notice is suppressed; same as the hybrid test above).
-    spelunk_bin()
-        .env("SPELUNK_NO_SERVER", "1") // prevent accidental loopback auto-discovery
-        .current_dir(&project_dir)
-        .arg("--config")
-        .arg(&config_path)
-        .arg("search")
-        .arg("--mode")
-        .arg("semantic")
-        .arg("foo")
-        .assert()
-        .success()
-        .stderr(predicate::str::is_empty());
 }
 
 // ── spelunk server error-path tests ──────────────────────────────────────────
@@ -1472,7 +1566,7 @@ async fn test_memory_add_then_search_round_trip_on_local_store_with_auto_discove
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -1582,7 +1676,7 @@ async fn test_memory_add_then_search_round_trip_local_first_with_explicit_server
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nembedding_model = \"test\"\nllm_model = \"test\"\nserver_url = \"https://cloud.invalid.example:1\"\nproject_id = \"team/proj\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nllm_model = \"test\"\nserver_url = \"https://cloud.invalid.example:1\"\nproject_id = \"team/proj\"\n",
             db_path
         ),
     )
@@ -1658,7 +1752,7 @@ async fn test_memory_timeline_reads_local_store_with_auto_discovered_server() {
     fs::write(
         &config_path,
         format!(
-            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+            "db_path = {:?}\napi_base_url = \"http://127.0.0.1:1\"\nllm_model = \"test\"\n",
             db_path
         ),
     )
@@ -1909,7 +2003,7 @@ fn offline_indexed_project(home: &std::path::Path) -> (std::path::PathBuf, std::
     let config_path = home.join("config.toml");
     fs::write(
         &config_path,
-        "api_base_url = \"http://127.0.0.1:19999\"\nembedding_model = \"test\"\nllm_model = \"test\"\n",
+        "api_base_url = \"http://127.0.0.1:19999\"\nllm_model = \"test\"\n",
     )
     .unwrap();
     spelunk_bin_in(home)
@@ -2264,7 +2358,17 @@ async fn test_search_auto_partial_coverage_emits_warmup_notice_on_stderr() {
     );
 
     // Pass 1: embed everything via the mock server (full coverage).
+    //
+    // This test's purpose is the partial-vs-zero coverage warmup notice, not
+    // local-vs-remote embed routing, so it needs an explicit `server_url` to
+    // legitimately serve embedding here. Under the default `local_first`
+    // mode that routing is now correctly refused (see the `get_inference_tier`
+    // routing fix) in favor of the local loopback embedder, which this test
+    // does not configure - so force `cloud_first` via env (a project-level
+    // `.spelunk/config.toml`, which `write_config_with_server` writes to,
+    // silently drops a `mode` key; see `write_project_server_config`).
     spelunk_bin_in(home.path())
+        .env("SPELUNK_MODE", "cloud_first")
         .current_dir(&project_dir)
         .arg("--config")
         .arg(&config_path)

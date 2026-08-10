@@ -20,6 +20,19 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 use super::{MemoryStore, Note};
+use crate::storage::backend::numeric_note_id;
+
+// Dedupe is a local-SQLite-only maintenance pass, so every `Note` it sees was
+// read straight out of `memory.db` and its id is always a rowid. The narrowing
+// is still fallible rather than an unwrap so a future caller handing it
+// remote-minted notes fails with the shared message instead of panicking.
+fn rowid(n: &Note) -> anyhow::Result<i64> {
+    numeric_note_id(&n.id)
+}
+
+fn superseded_rowid(n: &Note) -> Option<i64> {
+    n.superseded_by.as_ref().and_then(|id| id.as_i64())
+}
 use crate::storage::entity_id::note_entity_id;
 
 // Summary of one `dedupe_entity_ids` run (or dry-run estimate).
@@ -145,13 +158,13 @@ impl MemoryStore {
         let mut note_group_of: HashMap<i64, usize> = HashMap::new();
         let mut survivor_ids: HashSet<i64> = HashSet::new();
         for (gi, group) in duplicate_groups.iter().enumerate() {
-            let survivor_id = group[0].id;
+            let survivor_id = rowid(group[0])?;
             survivor_ids.insert(survivor_id);
             for n in group {
-                note_group_of.insert(n.id, gi);
+                note_group_of.insert(rowid(n)?, gi);
             }
             for loser in &group[1..] {
-                loser_to_survivor.insert(loser.id, survivor_id);
+                loser_to_survivor.insert(rowid(loser)?, survivor_id);
             }
         }
 
@@ -197,9 +210,10 @@ impl MemoryStore {
             // cleared every live reference to these ids.
             for group in &duplicate_groups {
                 for (li, loser) in group[1..].iter().enumerate() {
-                    self.delete_note_embedding(loser.id)?;
-                    self.delete_edges_for_note(loser.id)?;
-                    self.delete_note(loser.id)?;
+                    let loser_id = rowid(loser)?;
+                    self.delete_note_embedding(loser_id)?;
+                    self.delete_edges_for_note(loser_id)?;
+                    self.delete_note(loser_id)?;
                     if loser_fault_due(li) {
                         anyhow::bail!(
                             "injected test fault after deleting loser index {li} within group"
@@ -243,7 +257,7 @@ impl MemoryStore {
     ) -> Result<()> {
         let survivor = group[0];
         let losers = &group[1..];
-        let survivor_id = survivor.id;
+        let survivor_id = rowid(survivor)?;
 
         // tags / linked_files: union, add-wins
         let mut new_tags: Vec<String> = Vec::new();
@@ -282,7 +296,7 @@ impl MemoryStore {
 
         let external_values: Vec<i64> = group
             .iter()
-            .filter_map(|n| n.superseded_by.and_then(resolve))
+            .filter_map(|n| superseded_rowid(n).and_then(resolve))
             .collect();
         let resolved_survivor_target = external_values.first().copied();
         if let Some(val) = resolved_survivor_target {
@@ -299,7 +313,8 @@ impl MemoryStore {
         // supersede_self_edges_dropped counts only the survivor's own value
         // resolving to nothing; losers' references are handled (and not
         // counted) by rewrite_cross_references, since those rows are deleted.
-        let survivor_self_edge_dropped = matches!(survivor.superseded_by.map(resolve), Some(None));
+        let survivor_self_edge_dropped =
+            matches!(superseded_rowid(survivor).map(resolve), Some(None));
         if survivor_self_edge_dropped {
             summary.supersede_self_edges_dropped += 1;
         }
@@ -312,19 +327,19 @@ impl MemoryStore {
 
         // apply phase (real run only)
         if !new_tags.is_empty() || !new_files.is_empty() {
-            self.union_tags_and_files(survivor.id, &new_tags, &new_files)?;
+            self.union_tags_and_files(survivor_id, &new_tags, &new_files)?;
         }
         if any_archived {
-            self.archive(survivor.id)?;
+            self.archive(survivor_id)?;
         }
         match resolved_survivor_target {
-            Some(val) if survivor.superseded_by != Some(val) => {
-                self.set_superseded_by(survivor.id, val)?;
+            Some(val) if superseded_rowid(survivor) != Some(val) => {
+                self.set_superseded_by(survivor_id, val)?;
             }
             None if survivor.superseded_by.is_some() => {
                 // Resolved to nothing (self-referential) with no external
                 // fallback in the group: clear rather than leave stale.
-                self.clear_superseded_by(survivor.id)?;
+                self.clear_superseded_by(survivor_id)?;
             }
             _ => {}
         }
@@ -349,10 +364,11 @@ impl MemoryStore {
         apply: bool,
     ) -> Result<()> {
         for note in all_notes {
-            if survivor_ids.contains(&note.id) {
+            let note_id = rowid(note)?;
+            if survivor_ids.contains(&note_id) {
                 continue; // the survivor's own field is resolved separately
             }
-            let Some(v) = note.superseded_by else {
+            let Some(v) = superseded_rowid(note) else {
                 continue;
             };
             let Some(&target) = loser_to_survivor.get(&v) else {
@@ -361,14 +377,14 @@ impl MemoryStore {
             // In-group rewrites are inert clean-up (target is deleted
             // regardless), so only cross-group rewrites count as a "repoint".
             let same_group = matches!(
-                (note_group_of.get(&note.id), note_group_of.get(&v)),
+                (note_group_of.get(&note_id), note_group_of.get(&v)),
                 (Some(a), Some(b)) if a == b
             );
             if !same_group {
                 summary.supersede_edges_repointed += 1;
             }
             if apply {
-                self.set_superseded_by(note.id, target)?;
+                self.set_superseded_by(note_id, target)?;
             }
         }
         Ok(())

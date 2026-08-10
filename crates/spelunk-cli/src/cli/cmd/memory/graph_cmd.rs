@@ -2,7 +2,10 @@ use anyhow::Result;
 
 use super::super::color::cprintln;
 use super::{MemoryGraphArgs, backend_err};
-use crate::{config::Config, storage::open_memory_backend};
+use crate::{
+    config::Config,
+    storage::{NoteId, open_memory_backend},
+};
 
 pub(super) async fn memory_graph(
     args: MemoryGraphArgs,
@@ -12,7 +15,7 @@ pub(super) async fn memory_graph(
 ) -> Result<()> {
     let backend = open_memory_backend(cfg, mem_path, backend_override).await?;
     let root = backend
-        .get(args.id)
+        .get(NoteId::from_i64(args.id))
         .await?
         .ok_or_else(|| anyhow::anyhow!("No memory entry with id {}.", args.id))?;
 
@@ -27,13 +30,13 @@ pub(super) async fn memory_graph(
         }
         #[derive(serde::Serialize)]
         struct GraphJson {
-            id: i64,
+            id: NoteId,
             title: String,
             outgoing: Vec<EdgeJson>,
             incoming: Vec<EdgeJson>,
         }
         let graph = GraphJson {
-            id: root.id,
+            id: root.id.clone(),
             title: root.title.clone(),
             outgoing: outgoing
                 .iter()
@@ -65,7 +68,7 @@ pub(super) async fn memory_graph(
 
     for e in &outgoing {
         let target_title = backend
-            .get(e.to_id)
+            .get(NoteId::from_i64(e.to_id))
             .await?
             .map(|n| n.title)
             .unwrap_or_else(|| "(deleted)".to_string());
@@ -79,7 +82,7 @@ pub(super) async fn memory_graph(
     }
     for e in &incoming {
         let src_title = backend
-            .get(e.from_id)
+            .get(NoteId::from_i64(e.from_id))
             .await?
             .map(|n| n.title)
             .unwrap_or_else(|| "(deleted)".to_string());

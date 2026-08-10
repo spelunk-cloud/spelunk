@@ -36,22 +36,25 @@ fn write_fixture(dir: &Path, name: &str) {
     .expect("write Cargo.toml");
 }
 
-/// `spelunk index` as a raw `std::process::Command` so the test can hold a live
-/// `Child` across the gate; `assert_cmd`'s runner blocks until exit.
-/// Mirrors `plumbing_helpers::spelunk_bin_in`'s keychain/home pinning.
-///
-/// `SPELUNK_MODE=cloud_first`: every test in this file drives its fixture's
-/// explicit `server_url` for LLM summaries (2026-07-23 ADR-004 revision).
-/// `index/summaries.rs::generate_summaries` calls
-/// `ServerInferenceClient::from_config` directly on the loaded `Config` with
-/// no loopback auto-discovery bridging, so under the default `local_first`
-/// mode a bare `server_url` no longer resolves to any inference target at
-/// all. `cloud_first` is what makes this file's premise — an explicit
-/// `server_url` IS used for summaries — hold.
+// `spelunk index` as a raw `std::process::Command` so the test can hold a live
+// `Child` across the gate; `assert_cmd`'s runner blocks until exit.
+// Mirrors `plumbing_helpers::spelunk_bin_in`'s keychain/home pinning.
+//
+// `SPELUNK_MODE=cloud_first`: every test in this file drives its fixture's
+// explicit `server_url` for LLM summaries (2026-07-23 ADR-004 revision), and
+// `cloud_first` is the mode where that server owns inference. These tests are
+// about the summary pass being awaited, not about which server serves it, so
+// pinning the mode keeps the mock the single possible target regardless of
+// what happens to be listening on the machine's loopback ports.
 fn index_command(home: &Path, config: &Path, db: &Path, project: &Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("spelunk"));
     cmd.env("SPELUNK_SECRET_STORE", "file")
         .env("HOME", home)
+        // Derived from this test's own `HOME` rather than inherited: an ambient
+        // `SPELUNK_CONFIG_DIR` wins over `HOME`, so without this every test in
+        // the file would share one config and secret store instead of getting
+        // an isolated one.
+        .env("SPELUNK_CONFIG_DIR", home.join(".config").join("spelunk"))
         .env("SPELUNK_MODE", "cloud_first")
         .env_remove("XDG_CONFIG_HOME")
         // Project-level config discovery walks up from CWD; every caller here

@@ -148,8 +148,10 @@ to maintain, plus a forced memory re-embed/re-harvest on migration) buys nothing
 
 The dimension upgrade for pre-0.9 `FLOAT[768]` databases is handled **per store**:
 `Database::apply_dim_upgrade_migration` rebuilds the chunk table as
-`INT8[896]`, while `MemoryStore::migrate` rebuilds `note_embeddings` as
-`FLOAT[896]` (each guarded by its own marker table). There is no path that leaves
+`INT8[896]`, while `MemoryStore::apply_dim_upgrade_migration` (one step in
+`MemoryStore::run_migrations`, the same forward-only `PRAGMA user_version`-gated
+runner `index.db` uses) rebuilds `note_embeddings` as `FLOAT[896]` (each still
+guarded by its own marker table). There is no path that leaves
 memory stranded on the stale 768-dim layout. The `note_embeddings` rebuild is
 empty rather than converting the old vectors, so semantic recall on pre-upgrade
 notes is lost until they are re-embedded with `spelunk memory reindex`; a
@@ -157,7 +159,7 @@ one-line notice after the upgrade points the user at that command.
 
 ### Backend abstraction
 
-The `EmbeddingBackend` and `LlmBackend` traits (in spelunk-core's `embeddings/` and `llm/`) are the only interface between spelunk and inference. spelunk-core ships **no** concrete implementations. The native F2LLM embedder engine lives in its own `spelunk-embed` library crate (`crates/spelunk-embed/src/embedder_native.rs`, `NativeEmbedder`), which only loads the model from local files already on disk (`load_from_path`) and carries no download dependency. `spelunk-server` depends on that crate, owns the Hugging Face Hub download path that resolves those local files (`crates/spelunk-server/src/embed_hub.rs`), and additionally provides the OpenAI-compatible HTTP clients. The CLI reaches inference only through `ServerLlmClient` / `ServerEmbedClient` in `crates/spelunk-cli/src/server_client.rs`.
+The `EmbeddingBackend` and `LlmBackend` traits (in spelunk-core's `embeddings/` and `llm/`) are the only interface between spelunk and inference. spelunk-core ships **no** concrete implementations. The native F2LLM embedder engine lives in its own `spelunk-embed` library crate (`crates/spelunk-embed/src/embedder_native.rs`, `NativeEmbedder`), which only loads the model from local files already on disk (`load_from_path`) and carries no download dependency. `spelunk-server` depends on that crate, owns the Hugging Face Hub download path that resolves those local files (`crates/spelunk-server/src/embed_hub.rs`), and additionally provides the OpenAI-compatible HTTP clients. The CLI reaches inference only through `ServerInferenceClient` in `crates/spelunk-cli/src/server_client.rs`, with `ServerEmbedAdapter` and `ServerLlmAdapter` as thin trait adapters over it. Embedding and LLM inference are routed by separate rules and can resolve to different servers in a single command, so a caller needing both builds two clients; the LLM rule lives in `crates/spelunk-cli/src/capability/llm_route.rs`.
 
 To add a new backend: implement the trait (in `spelunk-embed` for an embedder, or in spelunk-server for an LLM/HTTP backend) and wire it into the server's endpoint handlers. Nothing in spelunk-core imports a concrete backend.
 
@@ -165,7 +167,7 @@ To add a new backend: implement the trait (in `spelunk-embed` for an embedder, o
 
 `src/indexer/secrets.rs` runs regex patterns against the full text that will be persisted and embedded for each chunk (docstring + content) before storage, and separately against LLM-generated summaries when they're produced (summaries don't exist yet at chunk-store time). Chunks matching known credential patterns (AWS keys, PEM headers, GitHub PATs, etc.) are silently dropped in full — including their docstring — and a warning naming only the symbol is logged; a secret-bearing summary is stored as an empty string instead.
 
-This scanner is **best-effort defense-in-depth, not a security boundary** — a finite set of regexes cannot catch every credential format. The actual boundary is that code never leaves the local machine unless a team `server_url` is explicitly configured; the scanner only reduces the chance of a credential being embedded/stored (and, on that explicit-server path, transmitted) by accident.
+This scanner is **best-effort defense-in-depth, not a security boundary** — a finite set of regexes cannot catch every credential format. The actual boundary is that code never leaves the local machine unless a team `server_url` is explicitly configured; the scanner only reduces the chance of a credential being embedded/stored (and, on that explicit-server path, transmitted) by accident. This boundary is enforced by `crates/spelunk-cli/tests/egress_containment.rs`, which traps every outbound connection across local-tier CLI flows and fails loudly, naming the destination, on any escape past loopback.
 
 ### Multi-project registry
 

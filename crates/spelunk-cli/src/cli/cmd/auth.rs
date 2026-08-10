@@ -1,18 +1,19 @@
 //! `spelunk auth set-key` / `spelunk auth list-servers`: manage the
 //! per-server bearer credentials a self-hosted `server_url` resolves through
-//! (ADR-071 D1/D3).
+//! (ADR-071 D1/D3), plus the credential for a configured LLM endpoint.
 //!
 //! These are the credential's front door: the key is read from stdin or an
 //! interactive prompt, never from argv (a positional or flag-valued secret
-//! lands in shell history and `ps` output). `set-key` stores it in the
-//! per-origin map (`spelunk_core::config::server_keys`); `list-servers`
-//! prints only origins, never key material.
+//! lands in shell history and `ps` output). `set-key --server` stores it in
+//! the per-origin map (`spelunk_core::config::server_keys`); `set-key --llm`
+//! stores the single LLM credential (`spelunk_core::config::llm_key`);
+//! `list-servers` prints only origins, never key material.
 
 use anyhow::{Context, Result};
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
 use std::io::{IsTerminal, Write};
 
-use spelunk_core::config::server_keys;
+use spelunk_core::config::{llm_key, server_keys};
 
 #[derive(Args, Debug)]
 pub struct AuthArgs {
@@ -22,32 +23,56 @@ pub struct AuthArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
-    /// Store a bearer key for a self-hosted spelunk-server, read from stdin/prompt
+    /// Store a credential, read from stdin/prompt: a self-hosted spelunk-server's
+    /// bearer key (`--server`) or the LLM endpoint's key (`--llm`)
     SetKey(AuthSetKeyArgs),
     /// List servers with a stored key (origins only, never prints key material)
     ListServers,
 }
 
 #[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("key_kind")
+        .required(true)
+        .multiple(false)
+        .args(["server", "llm"])
+))]
 pub struct AuthSetKeyArgs {
     /// Server URL this key belongs to (normalized to its origin before storage)
     #[arg(long)]
-    pub server: String,
+    pub server: Option<String>,
+
+    /// Store the credential for the configured LLM endpoint (`llm_url`) instead
+    /// of a server key. The value is read from stdin/prompt, never argv.
+    #[arg(long)]
+    pub llm: bool,
 }
 
 pub async fn auth(args: AuthArgs) -> Result<()> {
     match args.command {
-        AuthCommand::SetKey(set_key_args) => set_key(&set_key_args.server),
+        AuthCommand::SetKey(a) => match a.server.as_deref() {
+            Some(server) => set_server_key(server),
+            // The ArgGroup guarantees exactly one of the two was supplied.
+            None => set_llm_key(),
+        },
         AuthCommand::ListServers => list_servers(),
     }
 }
 
-fn set_key(server: &str) -> Result<()> {
-    let key = read_secret_from_stdin_or_prompt()?;
+fn set_server_key(server: &str) -> Result<()> {
+    let key = read_secret_from_stdin_or_prompt("Server key")?;
     let store = spelunk_core::config::default_secret_store()?;
     let origin = server_keys::set_key_for_origin(server, &key, store.as_ref())
         .context("storing the server key")?;
     println!("Stored a server key for {origin}.");
+    Ok(())
+}
+
+fn set_llm_key() -> Result<()> {
+    let key = read_secret_from_stdin_or_prompt("LLM key")?;
+    let store = spelunk_core::config::default_secret_store()?;
+    llm_key::set_with_store(&key, store.as_ref()).context("storing the LLM key")?;
+    println!("Stored an LLM key in the {} secret store.", store.kind());
     Ok(())
 }
 
@@ -71,19 +96,19 @@ fn list_servers() -> Result<()> {
 }
 
 /// Read a secret from stdin: piped input if present, else an interactive
-/// prompt. Never accepted via a CLI flag/argv (D3).
-fn read_secret_from_stdin_or_prompt() -> Result<String> {
+/// prompt labelled `label`. Never accepted via a CLI flag/argv (D3).
+fn read_secret_from_stdin_or_prompt(label: &str) -> Result<String> {
     if std::io::stdin().is_terminal() {
-        eprint!("Server key: ");
+        eprint!("{label}: ");
         std::io::stderr().flush().ok();
     }
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)
-        .context("reading server key from stdin")?;
+        .with_context(|| format!("reading {} from stdin", label.to_lowercase()))?;
     let key = line.trim().to_string();
     if key.is_empty() {
-        anyhow::bail!("no server key provided (empty input)");
+        anyhow::bail!("no {} provided (empty input)", label.to_lowercase());
     }
     Ok(key)
 }

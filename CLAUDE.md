@@ -49,7 +49,7 @@ Full reference: `SKILL.md` and `docs/agent-guide.md`.
 
 **Semantic search via spelunk-server:** from v0.9.0 the default UX runs a local `spelunk-server` (auto-bound on `127.0.0.1`). The server bundles a native embedder (codefuse-ai/F2LLM-v2-330M, 896-dim, candle runtime, Metal/GPU on macOS) — no external embedding endpoint required. Semantic search, `spelunk explore`, `spelunk memory harvest`, and LLM summaries all route through the server's inference endpoints; the CLI talks to it via `server_client.rs`. Manage the daemon with `spelunk server start|stop|status|logs`. This **auto-discovered loopback server is an inference backend only** — it embeds queries and runs LLM calls, but it is **never** a memory store. A project's memory always lives in its local `memory.db`; the loopback server holds no authoritative memory.
 
-**Optional: team memory server** (`server_url` *explicitly* set in config, pointing at a shared instance): share memory (decisions, requirements) across a team. Setting an explicit `server_url` is the **only** way memory moves off the local `memory.db`, and how it moves is governed by the `mode` config (see `SyncMode` in `sync_mode.rs`): the default `local_first` keeps reads and writes in the local store with the server as a converging replica; `mode = "cloud_first"` relocates the store of record to the shared server, and reads/writes fail loudly when it is unreachable (no silent local fallback). Each developer's code stays local. (Note the distinction: an auto-discovered loopback server provides inference and never owns memory; an explicit team `server_url` does own memory. They must not be conflated.) When a team server routes projects by an internal UUID, a human `project_id` slug is auto-resolved to that UUID on first use and cached in `.spelunk/cloud-project-id.lock` (see ADR-005); a raw UUID `project_id` is used directly.
+**Optional: team memory server** (`server_url` *explicitly* set in config, pointing at a shared instance): share memory (decisions, requirements) across a team. Setting an explicit `server_url` is the **only** way memory moves off the local `memory.db`, and how it moves is governed by the `mode` config (see `SyncMode` in `sync_mode.rs`): the default `local_first` keeps reads and writes in the local store with the server as a converging replica; `mode = "cloud_first"` relocates the store of record to the shared server, and reads/writes fail loudly when it is unreachable (no silent local fallback). Each developer's code stays local. (Note the distinction: an auto-discovered loopback server provides inference and never owns memory; an explicit team `server_url` does own memory. They must not be conflated.) `project_id` is sent to the server exactly as configured, slug or UUID: both a self-hosted spelunk-server and the hosted cloud API accept either, so there is no resolution step and nothing is cached (see ADR-005).
 
 You search with spelunk, then reason over the results yourself.
 
@@ -57,7 +57,7 @@ You search with spelunk, then reason over the results yourself.
 
 ## Workspace Structure
 
-This is a Cargo workspace with four crates:
+This is a Cargo workspace with five crates:
 
 ```
 Cargo.toml                    — workspace root; [workspace.dependencies] for shared versions
@@ -67,6 +67,8 @@ crates/
   spelunk-cli/                — `spelunk` binary; depends on spelunk-core
   spelunk-embed/              — library: native F2LLM-v2-330M embedder (candle); depends on spelunk-core
   spelunk-server/             — `spelunk-server` binary + lib; depends on spelunk-core + spelunk-embed
+  spelunk-export/             — `spelunk-export` binary: reads local stores and writes a portable
+                                dump; depends on no other crate in this workspace
 ```
 
 ## Module Map
@@ -86,6 +88,10 @@ config/
   tls.rs         — custom CA trust-anchor application
   secret_store.rs — OS keychain / file secret-store backend
   server_keys.rs — per-origin server-key map + bearer_for() resolution (ADR-071)
+  llm_key.rs     — LLM endpoint credential: SPELUNK_LLM_KEY / secret-store resolution,
+                   plus the SPELUNK_LLM_URL / SPELUNK_LLM_MODEL variable names. Deliberately
+                   not a Config field and never read by Config::load; only the daemon-spawn
+                   path resolves it
 utils/
   mod.rs         — strip_ansi(), misc helpers
   dates.rs       — date parsing helpers
@@ -171,15 +177,27 @@ capability/      — Tier 0/1 capability detection (server reachable probe, cach
   probe.rs       — loopback auto-discovery, explicit server_url health probing, the Tier cache
   diagnostics.rs — probe-failure classification + TLS error rendering
   guard.rs       — require_tier1 / require_explicit_server_url: feature-gating checks
-server_client.rs — ServerLlmClient + ServerEmbedClient: HTTP clients for spelunk-server inference endpoints
+  llm_route.rs:    LlmRoute + resolve_llm_route: where LLM calls go (local tier /
+                   explicit server_url / nowhere-with-a-reason). Separate from embed
+                   routing; never consults Config::resolve_inference_url
+  llm_message.rs:  no_llm_message: the user-facing text over (NoLlmReason x LlmFeature),
+                   shared by index summaries, explore and memory harvest
+server_client.rs:  ServerInferenceClient, the single HTTP client for spelunk-server's
+                   inference endpoints, plus ServerEmbedAdapter / ServerLlmAdapter, two
+                   thin trait adapters over the same Arc. Embedding and LLM can resolve
+                   to different base URLs, so a caller needing both builds two clients
 
 cli/
   mod.rs         — clap structs (Cli, Command, *Args)
   cmd/
     mod.rs       — re-exports one pub fn per subcommand
-    auth.rs      — `spelunk auth set-key/list-servers` handlers (ADR-071)
+    auth.rs      — `spelunk auth set-key/list-servers` handlers (ADR-071); `--llm` stores
+                   the LLM endpoint credential
     check.rs     — `spelunk check` handler
     context.rs   — `spelunk context` handler (agent session entry point)
+    daemon_llm.rs — LlmSpawn: resolves the spawned daemon's LLM url/model/credential and
+                   splits them across argv (url, model) and the child environment (all
+                   three, pinned so nothing is left to inheritance)
     explore.rs   — `spelunk explore` handler
     graph.rs     — `spelunk graph` handler
     helpers.rs   — shared output / progress helpers
@@ -234,7 +252,25 @@ cli/
 main.rs            — entry point: parse args, register sqlite-vec, start Axum server
 lib.rs             — AppState, router, auth_middleware, AppError, ApiDoc (utoipa)
 db.rs              — ServerDb: SQLite schema, memory CRUD, KNN search, embedding dim guard
-handlers.rs        — Axum route handlers for all /v1/ endpoints
+handlers/
+  mod.rs           — shared validation/rate-limit helpers, module re-exports
+  health.rs        — GET /v1/health
+  projects.rs      — list_projects, project_stats
+  notes.rs         — note CRUD wire types + add/list/get/search/delete/archive/supersede handlers
+  batch.rs         — POST /memory/batch (wire parity with cloud-api)
+  sync.rs          — harvested_shas, GET /memory/since, GET /memory/stream (SSE)
+  index.rs         — POST /index/embed (server-side embedding, not stored)
+  search.rs        — POST /search (query-embedding proxy for CLI-side KNN)
+  explore.rs       — POST /explore (LLM reasoning loop, SSE)
+  llm.rs           — POST /llm/complete (generic streaming completion primitive)
+  tests/           — #[cfg(test)] suite, split by theme; see mod.rs for the file list
+    support.rs     — shared app/router builders + HTTP helpers used by every theme
+    *_tests.rs     — one file per theme (notes, health, embed, search/explore, batch,
+                     batch dedupe, sync, timeout, concurrency, liveness-under-embed)
+server_llm.rs      — ServerLlm: the external chat-completions HTTP shim behind `--llm-url`,
+                     plus resolve_llm_key (--llm-key / --llm-key-file / SPELUNK_LLM_KEY) and
+                     check_llm_transport, which refuses to start when a credential would
+                     travel in the clear
 embed_hub.rs       — Hugging Face Hub download path for the bundled native embedder (gated by
                      `embed-native`); fetches the pre-quantized GGUF/tokenizer/config to disk, then
                      calls spelunk-embed's `NativeEmbedder::load_from_path`. The only place in the
@@ -248,14 +284,20 @@ migrations/  (crates/spelunk-server/migrations/)
 The native embedder engine lives in the `spelunk-embed` crate (below). The
 server's `embed-native` feature enables the optional `spelunk-embed` dep (and
 the server's own hf-hub download path); `metal` forwards to `spelunk-embed`'s
-`metal` feature. `spelunk-embed` depends on candle unconditionally — the crate
-is only worth depending on for its native embedder, so there is no feature to
-gate candle out. Its only remaining feature is `metal` (macOS GPU accel).
+`metal` feature. `spelunk-embed` gates candle/tokenizers behind its own
+default-on `native` feature. `spelunk-core` depends on it with
+`default-features = false` to get only the `EmbeddingBackend` trait + `MODEL_ID`
+(no candle): spelunk-cli only ever calls inference over HTTP via
+`server_client.rs`, never constructs a `NativeEmbedder`, so it has no reason to
+statically link candle. spelunk-server keeps `native` on, since it's the one
+binary that actually constructs one.
 
 ### spelunk-embed (`crates/spelunk-embed/src/`)
 
 ```
-lib.rs             — crate root; re-exports NativeEmbedder + DIM (candle is unconditional)
+lib.rs             - crate root; re-exports NativeEmbedder + DIM behind the default-on
+                     `native` feature (candle/tokenizers gated with it); trait +
+                     MODEL_ID stay available with `default-features = false`
 embedder_native.rs — native embedder (F2LLM-v2-330M via candle, 896-dim, Metal/GPU on macOS).
                      NativeEmbedder::load_from_path(gguf, tokenizer, config) loads local files
                      already on disk with zero network access — the crate's only load entry
@@ -269,21 +311,48 @@ embedder_native.rs — native embedder (F2LLM-v2-330M via candle, 896-dim, Metal
 ## Inference Backend
 
 All AI inference goes through **spelunk-server**. The CLI calls the server via
-`ServerLlmClient` and `ServerEmbedClient` in `crates/spelunk-cli/src/server_client.rs`
-— these are the only places in spelunk-cli that issue AI inference requests.
+`ServerInferenceClient` in `crates/spelunk-cli/src/server_client.rs`: the only
+place in spelunk-cli that issues AI inference requests. `ServerEmbedAdapter` and
+`ServerLlmAdapter` in the same file are thin trait adapters over one `Arc` of
+that client, not separate clients. (There is no `ServerLlmClient` or
+`ServerEmbedClient`; those names are long gone.)
 
 `spelunk-core` defines the `EmbeddingBackend` and `LlmBackend` traits
 (`embeddings/mod.rs`, `llm/mod.rs`) but ships **no concrete implementations**.
 The native embedding *engine* lives in the `spelunk-embed` crate
 (`NativeEmbedder`, local-path load only); spelunk-server's `embed_hub` module
 owns the Hugging Face Hub download path that resolves the (pre-quantized)
-model artifacts before handing them to it. The LLM backend and the external
-HTTP embedder shim live in spelunk-server (`main.rs`).
+model artifacts before handing them to it. There is no external embedder
+backend: embedding always runs through the bundled native engine. The LLM
+backend (with its own external HTTP shim, `--llm-url`) lives in spelunk-server
+(`server_llm.rs`). The endpoint, model and credential that shim runs on are
+resolved client-side by `spelunk-cli`'s `cli/cmd/daemon_llm.rs` and handed to
+the spawned daemon: url and model in argv, the credential in the child
+environment only, because the detached daemon must never open the keychain
+itself.
 
 `capability/` probes server availability at startup and exposes a `Tier`
 enum so commands degrade gracefully when no server is configured.
 
-**Inference vs. memory storage are separate concerns.** Reaching the server for inference (`ServerLlmClient` / `ServerEmbedClient`) does **not** mean memory is stored there. For an auto-discovered loopback server, memory CRUD (`add`, `list`, `search`, `timeline`, `context`, `harvest`, `read-memory`) resolves to the project's local `memory.db`; the server is used only to embed the query for `memory search`, with the vector KNN run locally against `memory.db`. Memory lives on a server **only** when an explicit team `server_url` is configured with `mode = "cloud_first"`; under the default `local_first` mode, reads and writes stay in `memory.db` and the server is a converging replica. See `docs/adr/004-unified-memory-storage.md` and the sync-mode table in `crates/spelunk-core/src/config/sync_mode.rs`.
+**Embed routing and LLM routing are separate rules and can resolve to different
+servers in one command.** Embedding uses `Config::resolve_inference_url` plus
+`capability::get_inference_tier`, unchanged: under the default `local_first`
+mode it prefers the local tier even when `server_url` is set. LLM inference uses
+`capability::resolve_llm_route` (`capability/llm_route.rs`), which never
+consults `resolve_inference_url`. Its order is: explicit offline gives nothing
+and probes nothing; a local tier advertising `llm.complete` wins; a set
+`llm_url` whose local server does not serve an LLM **stops** rather than falling
+through to the remote (the privacy guard, which by construction does not apply
+in `cloud_first`, where the inference tier already is `server_url`); otherwise an
+LLM-capable `server_url`; otherwise nothing. `Capabilities.llm_complete`
+(`capability/state.rs`) is the availability signal, parsed from `/v1/health`.
+Keying on `explore` instead would misfire across version skew, since `explore`
+predates the `/llm/complete` route. A call site needing both concerns builds two
+clients: see `cli/cmd/memory/harvest.rs::harvest_clients` for the shape. The
+user-facing text for every no-LLM outcome comes from
+`capability::no_llm_message`, never from an ad-hoc string at the call site.
+
+**Inference vs. memory storage are separate concerns.** Reaching the server for inference does **not** mean memory is stored there. For an auto-discovered loopback server, memory CRUD (`add`, `list`, `search`, `timeline`, `context`, `harvest`, `read-memory`) resolves to the project's local `memory.db`; the server is used only to embed the query for `memory search`, with the vector KNN run locally against `memory.db`. Memory lives on a server **only** when an explicit team `server_url` is configured with `mode = "cloud_first"`; under the default `local_first` mode, reads and writes stay in `memory.db` and the server is a converging replica. See `docs/adr/004-unified-memory-storage.md` and the sync-mode table in `crates/spelunk-core/src/config/sync_mode.rs`.
 
 ---
 
@@ -351,7 +420,9 @@ stored. **This is best-effort defense-in-depth, not a security boundary**: a fin
 cannot catch every credential format. The real boundary is that code never leaves the local
 machine unless a team `server_url` is explicitly configured (see above); the scanner only reduces
 the chance of a credential being embedded/stored (and, on that explicit-server path, transmitted)
-by accident.
+by accident. That boundary is enforced by `crates/spelunk-cli/tests/egress_containment.rs`, which
+traps every outbound connection across local-tier CLI flows (`init`, `index`, `search`, `memory`,
+`graph --live`, plumbing) and fails loudly, naming the destination, on any escape past loopback.
 
 ### Prompt structure
 The ask prompt uses XML-style delimiters to separate untrusted RAG context

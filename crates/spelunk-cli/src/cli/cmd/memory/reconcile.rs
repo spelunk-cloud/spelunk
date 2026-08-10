@@ -361,7 +361,10 @@ async fn reconcile_project(
     // left alone; the oldest is the stable edge target.
     let mut entity_to_local: HashMap<String, i64> = HashMap::new();
     for n in &existing_notes {
-        entity_to_local.entry(note_entity_id(n)).or_insert(n.id);
+        // Read straight out of memory.db, so every id here is a rowid.
+        if let Some(rowid) = n.id.as_i64() {
+            entity_to_local.entry(note_entity_id(n)).or_insert(rowid);
+        }
     }
 
     // ── Step 4: build reconcile set (source rows not in memory.db) ───────────
@@ -654,7 +657,7 @@ pub(crate) async fn import_git_notes_into_memory(
     git_root: &std::path::Path,
     mem_path: &std::path::Path,
 ) -> Result<usize> {
-    use crate::storage::{GitNotesBackend, MemoryBackend};
+    use crate::storage::{GitNotesBackend, MemoryBackend, NotesRefs};
 
     let backend = GitNotesBackend::with_root(git_root.to_path_buf());
     // include_archived=true so archived git-notes entries import and participate
@@ -662,7 +665,23 @@ pub(crate) async fn import_git_notes_into_memory(
     let notes = backend
         .list(None, GIT_NOTES_IMPORT_LIMIT, true, None)
         .await?;
+
+    // The working-ref OID this import reflects, read in process (ADR-077 D2).
+    // Stamped in the SAME transaction as the imported rows so a crash cannot
+    // leave the marker and the store disagreeing; the read-path gate then skips
+    // this walk until the ref moves again.
+    let working_oid = NotesRefs::discover(Some(git_root)).and_then(|r| r.working_oid());
+
     if notes.is_empty() {
+        // Nothing on the carrier. Never create a store just to stamp — an empty
+        // ref must leave no memory.db (no churn); only advance the marker when a
+        // store already exists, so a bare-but-present notes ref does not re-walk
+        // on every read.
+        if mem_path.exists()
+            && let Ok(store) = MemoryStore::open(mem_path)
+        {
+            let _ = store.set_notes_imported_working_oid(working_oid.as_deref());
+        }
         return Ok(0);
     }
 
@@ -682,6 +701,9 @@ pub(crate) async fn import_git_notes_into_memory(
         .filter(|&n| existing.insert(note_entity_id(n)))
         .collect();
     if to_import.is_empty() {
+        // Everything on the ref is already imported: advance the marker (so the
+        // gate stops re-walking) without inserting a row.
+        let _ = store.set_notes_imported_working_oid(working_oid.as_deref());
         return Ok(0);
     }
 
@@ -709,6 +731,8 @@ pub(crate) async fn import_git_notes_into_memory(
                 note.created_at,
             )?;
         }
+        // Crash-atomic with the inserts above (ADR-077 D2).
+        store.set_notes_imported_working_oid(working_oid.as_deref())?;
         Ok(to_import.len())
     })();
 
@@ -723,6 +747,97 @@ pub(crate) async fn import_git_notes_into_memory(
             let _ = store.execute_batch("ROLLBACK");
             Err(e)
         }
+    }
+}
+
+// ── Read-path notes import (ADR-077 D1/D2), called by list/search/show/context ─
+
+/// Fold fetched teammate notes into `memory.db` on a read — but only when the
+/// notes refs moved since the last import (ADR-077 D1/D2).
+///
+/// Two in-process ref reads gate the work: the merge subprocess runs only when
+/// the tracking ref (`refs/notes/origin/spelunk`) moved, and the import walk
+/// runs only when the working ref (`refs/notes/spelunk`) moved. The steady
+/// state — nothing fetched since the last import — spawns zero git subprocesses
+/// and does no import walk. Does no network: it merges and imports only what the
+/// user's own `git fetch` already wrote.
+///
+/// Routing:
+/// - `--backend git-notes` (git notes as the primary store, incl. the pre-init
+///   carrier) reads the ref directly, so it only needs the merge; there is no
+///   `memory.db` marker to gate on, so the merge is unconditional, as before.
+/// - A `cloud_first` server owns the store remotely, so the local carrier is
+///   not consulted at all.
+/// - Otherwise (the default local SQLite path) the gated merge + import runs.
+///
+/// Never fails the caller: a read must not break because the refresh could not
+/// run.
+pub(crate) async fn refresh_read_path_from_git_notes(
+    cfg: &Config,
+    mem_path: &std::path::Path,
+    backend_override: Option<&str>,
+) {
+    use crate::config::SyncMode;
+    use crate::storage::NotesRefs;
+
+    // Git notes is the primary store here: fold the tracking ref in so the
+    // direct read sees fetched entries. No marker store exists on this path
+    // (the pre-init carrier has no memory.db), so the merge stays unconditional,
+    // exactly as list/context did before ADR-077.
+    if backend_override == Some("git-notes") {
+        crate::storage::merge_tracking_notes(None).await;
+        return;
+    }
+    // A cloud_first server is the store of record; the local notes carrier is
+    // not read, so make no merge and no import attempt.
+    if cfg.resolve_mode() == SyncMode::CloudFirst && cfg.server_url.is_some() {
+        return;
+    }
+
+    // Default local SQLite path: gate on the notes-ref OIDs, read in process.
+    let Some(refs) = NotesRefs::discover(None) else {
+        return; // not inside a git repo → nothing to import
+    };
+    let tracking = refs.tracking_oid();
+    let mut working = refs.working_oid();
+    if tracking.is_none() && working.is_none() {
+        return; // nothing on either notes ref → no store churn
+    }
+
+    // Read the persisted markers. A store that does not exist yet has none, and
+    // opening one here just to read them would churn an empty memory.db, so
+    // treat "no store" as "no marker".
+    let marker = if mem_path.exists() {
+        MemoryStore::open(mem_path)
+            .ok()
+            .and_then(|s| s.notes_import_state().ok())
+            .unwrap_or_default()
+    } else {
+        crate::storage::NotesImportMarker::default()
+    };
+
+    let git_root = refs.workdir();
+
+    // Merge only when the tracking ref moved since the last merge.
+    let tracking_moved = tracking != marker.last_merged_tracking_oid;
+    if tracking_moved {
+        crate::storage::merge_tracking_notes(git_root).await;
+        working = refs.working_oid(); // the merge may have advanced the working ref
+    }
+
+    // Import only when the working ref moved since the last import. The import
+    // stamps `last_imported_working_oid` in its own transaction.
+    if working != marker.last_imported_working_oid
+        && let Some(git_root) = git_root
+        && let Err(e) = import_git_notes_into_memory(git_root, mem_path).await
+    {
+        tracing::warn!("read-path git-notes import skipped (non-fatal): {e}");
+    }
+
+    // Persist the tracking marker (the import handled the working marker). Done
+    // after the merge/import established the store, and only when the ref moved.
+    if tracking_moved && let Ok(store) = MemoryStore::open(mem_path) {
+        let _ = store.set_notes_merged_tracking_oid(tracking.as_deref());
     }
 }
 

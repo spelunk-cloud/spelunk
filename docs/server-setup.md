@@ -420,13 +420,12 @@ precedence over any stored key:
 export SPELUNK_SERVER_KEY=your-shared-api-key
 ```
 
-`project_id` is a human-readable slug. If the server routes projects by an
-internal UUID (as a team/cloud memory server does), the CLI resolves the slug to
-that UUID automatically on first use and caches it in
-`.spelunk/cloud-project-id.lock`. You don't need to look the UUID up by hand.
-The cache is keyed on the slug, so renaming the project re-resolves it
-automatically; set `SPELUNK_NO_SLUG_CACHE=1` to force a fresh lookup. A raw UUID
-in `project_id` is used as-is. (See [ADR-005](adr/005-cli-slug-uuid-resolution.md).)
+`project_id` is a human-readable slug, and it goes on the wire exactly as you
+wrote it. Both a self-hosted spelunk-server and the hosted cloud API accept
+either a slug or a UUID as the project key, so nothing is looked up or cached:
+whatever is in `project_id` is what the server sees. (See
+[ADR-005](adr/005-cli-slug-uuid-resolution.md) for the resolution step this
+replaced.)
 
 > **Rotating a key you committed under the old model.** Earlier versions of
 > this doc suggested a plaintext `server_key = "..."` line in the personal
@@ -606,9 +605,9 @@ environment.
 ### Embedding CPU thread budget
 
 On a CPU-only host the bundled native embedder (candle) would otherwise fan a
-single embed batch across every core, briefly starving the server's own request
-handling (`/v1/health` can go unresponsive during a large index). To leave
-headroom, the server caps candle's thread count at startup.
+single embed batch across every core, leaving the server's own request handling
+to compete with it for CPU. To leave headroom, the server caps candle's thread
+count at startup.
 
 | Env | Default | Purpose |
 |---|---|---|
@@ -618,6 +617,11 @@ Precedence: `SPELUNK_EMBED_THREADS` > an already-set `RAYON_NUM_THREADS` >
 the bounded default. A pre-set `RAYON_NUM_THREADS` is respected and never
 overridden. The resolved value and its source are logged at startup
 (`embed CPU thread budget resolved`). GPU (Metal/CUDA) builds are unaffected.
+
+This budget is not what keeps the server answering while an embedder is busy,
+and lowering it will not make a slow probe fast. `/v1/health` and every other
+endpoint that does not itself embed never touch the embedder's forward pass, so
+they stay responsive for the whole of an index whatever this value is set to.
 
 This budget only bounds CPU contention *within* a single embed batch; embed
 requests themselves are still serialized behind a single mutex on both device
@@ -649,6 +653,94 @@ So the supported way to reach the server from another machine (including a
 container) is a routable bind with `--tls-cert`/`--tls-key` and a key, where the
 server terminates HTTPS itself. Plaintext off-host stays refused with no
 override.
+
+## Air-gapped / no-egress install
+
+`spelunk-server` normally fetches the bundled F2LLM-v2-330M embedder from
+Hugging Face Hub the first time it's needed (see [Getting
+started](getting-started.md)). On a host with no route to `huggingface.co`,
+an air-gapped network, a strict corp firewall, a build image with no egress,
+that download has nothing to reach. `--model-dir` (or `SPELUNK_MODEL_DIR`)
+points the bundled native embedder at a directory you provisioned out of
+band instead, with zero network access at startup or at runtime:
+
+```bash
+spelunk-server --model-dir /srv/spelunk/models
+# or
+export SPELUNK_MODEL_DIR=/srv/spelunk/models
+spelunk-server
+```
+
+Only consulted when the bundled native embedder is enabled (the
+`embed-native` build feature); ignored otherwise.
+
+### Directory layout
+
+`--model-dir` expects a flat directory, no nested subdirectories, containing:
+
+| File | Required | Notes |
+|---|---|---|
+| `f2llm-v2-330m-q8_0.gguf` | yes | pre-quantized Q8_0 embedder weights |
+| `tokenizer.json` | yes | matching tokenizer |
+| `config.json` | no | auto-written from an embedded copy if absent; supply it only to override that default |
+
+A missing directory, or a missing GGUF or tokenizer inside it, fails fast
+with an error naming the missing piece and pointing back at this section.
+
+### Fetch-and-transfer procedure
+
+Produce that directory on a machine that does have network access, then
+carry it to the air-gapped host:
+
+1. On the connected machine, run `spelunk-server` once with no `--model-dir`.
+   This populates the normal online cache at `~/.local/share/spelunk/models/`
+   (Linux: `$XDG_DATA_HOME/spelunk/models/`), which ends up holding:
+   - `f2llm-v2-330m-q8_0.gguf`
+   - `config.json`
+   - a nested `tokenizer.json`, under
+     `models--spelunk-cloud--F2LLM-v2-330M-Q8_0-GGUF/snapshots/<rev>/tokenizer.json`
+     (hf-hub's own cache layout)
+2. Copy the GGUF and that nested `tokenizer.json` into a new, flat directory.
+   `config.json` doesn't need to come along; a missing one is regenerated on
+   the air-gapped host.
+   ```bash
+   mkdir -p offline-model
+   cp ~/.local/share/spelunk/models/f2llm-v2-330m-q8_0.gguf offline-model/
+   cp ~/.local/share/spelunk/models/models--spelunk-cloud--F2LLM-v2-330M-Q8_0-GGUF/snapshots/*/tokenizer.json \
+      offline-model/
+   ```
+3. Transfer `offline-model/` to the air-gapped host by whatever out-of-band
+   means your environment allows (removable media, an internal artifact
+   store, etc.), and point `--model-dir` / `SPELUNK_MODEL_DIR` at it there.
+
+### Verifying integrity
+
+Both files come from the first-party `spelunk-cloud/F2LLM-v2-330M-Q8_0-GGUF`
+Hugging Face repo; see [Model attribution](model-attribution.md) for
+provenance and license. As fetched at time of writing, their SHA-256 sums are:
+
+| File | SHA-256 |
+|---|---|
+| `f2llm-v2-330m-q8_0.gguf` | `2c12aad2951f1d9a3b457f890a2586d1ee19b755b377c0fb424e856e615b8f2b` |
+| `tokenizer.json` | `7e295e5bb91a3d35335f92fa4294a6e4e0ab4aa586db853e14312a62135bfddc` |
+
+`spelunk-server` fetches from that repo's `main` branch rather than a pinned
+commit, so these values track whatever is currently published there. Treat
+them as a convenience check, not a permanent guarantee: for integrity
+verification on artifacts fetched later, recompute and compare against the
+source's own published hash instead of trusting this table indefinitely.
+
+```bash
+shasum -a 256 f2llm-v2-330m-q8_0.gguf tokenizer.json
+```
+
+Hugging Face also serves each file's hash directly, in the `x-linked-etag`
+response header:
+
+```bash
+curl -sI https://huggingface.co/spelunk-cloud/F2LLM-v2-330M-Q8_0-GGUF/resolve/main/f2llm-v2-330m-q8_0.gguf \
+  | grep -i x-linked-etag
+```
 
 ## Related
 

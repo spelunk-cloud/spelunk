@@ -73,6 +73,14 @@ impl Database {
 
     /// FTS5 full-text search. Returns results ranked by BM25 (best match first).
     ///
+    /// The query's words are scored as **independent terms** (BM25 bag-of-words
+    /// via [`crate::utils::fts5_match_query`]): a multi-word query ranks chunks
+    /// that contain the terms regardless of their order or adjacency, and a
+    /// chunk containing more of the terms ranks above one containing fewer. It
+    /// is deliberately not matched as a contiguous phrase. Tokenisation follows
+    /// the `chunks_fts` tokenizer (default `unicode61`: case-folded, no
+    /// stemming).
+    ///
     /// BM25 in FTS5 returns negative values (more negative = better match).
     /// We negate the score so that higher `distance` values indicate better matches,
     /// consistent with the convention used in `SearchResult`.
@@ -94,7 +102,7 @@ impl Database {
              ORDER BY score
              LIMIT ?2",
         )?;
-        let fts_query = crate::utils::fts5_quote_literal(query);
+        let fts_query = crate::utils::fts5_match_query(query);
         let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
             let bm25_score: f64 = row.get(8)?;
             Ok(crate::search::SearchResult {
@@ -282,5 +290,119 @@ mod tests {
         let result = db.search_text("content:nonexistent_term_xyz", 10);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    // The documented `--mode text` contract is BM25 over independent terms: a
+    // multi-word query ranks chunks that contain the terms regardless of their
+    // order or adjacency. Before the fix the whole query was matched as a single
+    // quoted FTS5 phrase, so word order alone decided whether there was a hit.
+    #[test]
+    fn search_text_scores_terms_independent_of_order() {
+        let db = open_db();
+        seed_chunk(
+            &db,
+            "We chose a token bucket over a leaky bucket because bursts are expected.",
+        );
+
+        // The natural order and every reordering must hit the one chunk that
+        // contains all the terms — order and adjacency must not decide the hit.
+        for q in [
+            "leaky bucket",
+            "bucket leaky",
+            "bursts are expected",
+            "expected bursts",
+            "token bucket bursts",
+        ] {
+            let hits = db.search_text(q, 10).expect("search ok");
+            assert!(
+                !hits.is_empty(),
+                "query {q:?} must match the chunk containing all its terms, \
+                 regardless of word order"
+            );
+        }
+    }
+
+    // Partial-overlap ranking: a chunk containing more of the query terms ranks
+    // above one containing fewer, and the fewer-term chunk still appears (OR /
+    // bag-of-words semantics, ranked by BM25) rather than being dropped — which
+    // is what phrase matching did.
+    #[test]
+    fn search_text_ranks_more_term_overlap_higher() {
+        let db = open_db();
+
+        let all_terms = db
+            .upsert_file("src/all.rs", Some("rust"), "aaaa1111", 0)
+            .expect("upsert file");
+        db.insert_chunk(
+            all_terms,
+            "function",
+            Some("all"),
+            1,
+            5,
+            "token bucket bursts all three present here",
+            None,
+            8,
+        )
+        .expect("insert chunk");
+
+        let one_term = db
+            .upsert_file("src/one.rs", Some("rust"), "bbbb2222", 0)
+            .expect("upsert file");
+        db.insert_chunk(
+            one_term,
+            "function",
+            Some("one"),
+            1,
+            5,
+            "a single bucket and lots of unrelated padding padding padding",
+            None,
+            8,
+        )
+        .expect("insert chunk");
+
+        let hits = db
+            .search_text("token bucket bursts", 10)
+            .expect("search ok");
+
+        // Both chunks share the term "bucket", so both are candidates under
+        // bag-of-words scoring.
+        assert!(
+            hits.len() >= 2,
+            "the chunk sharing only one term must still be a candidate: {:?}",
+            hits.iter().map(|h| &h.content).collect::<Vec<_>>()
+        );
+        assert!(
+            hits[0].content.contains("all three present"),
+            "the chunk containing all three query terms must rank first, got: {:?}",
+            hits.iter().map(|h| &h.content).collect::<Vec<_>>()
+        );
+        assert!(
+            hits.iter().any(|h| h.content.contains("single bucket")),
+            "the single-term chunk must still appear (ranked lower), not be excluded"
+        );
+    }
+
+    // Stemming decision, locked in: `--mode text` uses the table's default FTS5
+    // tokenizer (`unicode61`), which case-folds but does NOT stem. So `bursts`
+    // matches the literal token `bursts`; a query for `burst` does NOT match a
+    // chunk that only contains `bursts`; and matching is case-insensitive.
+    // If the tokenizer ever gains stemming, this test flags it.
+    #[test]
+    fn search_text_does_not_stem_and_is_case_insensitive() {
+        let db = open_db();
+        seed_chunk(&db, "the queue absorbs bursts of traffic");
+
+        assert!(
+            !db.search_text("bursts", 10).expect("ok").is_empty(),
+            "the exact token must match"
+        );
+        assert!(
+            db.search_text("burst", 10).expect("ok").is_empty(),
+            "unstemmed: a query for `burst` must NOT match a chunk containing only `bursts`"
+        );
+        assert!(
+            !db.search_text("BURSTS", 10).expect("ok").is_empty(),
+            "matching is case-insensitive (unicode61 case-folding)"
+        );
     }
 }

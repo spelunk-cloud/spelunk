@@ -5,12 +5,56 @@
 //! a fixed 768-dimensional vector, so no real server is needed.
 
 mod plumbing_helpers;
-use plumbing_helpers::{FIXTURE_PROJECT_ID, IndexEmbedResponder, spelunk_bin};
+use plumbing_helpers::{
+    FIXTURE_PROJECT_ID, IndexEmbedResponder, mount_health, mount_index_embed, spelunk_bin,
+    spelunk_bin_in,
+};
 
 use predicates::prelude::*;
+use std::path::Path;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+// Point loopback auto-discovery (`SPELUNK_STATE_DIR`/`server.port`, step 3a of
+// `capability::probe`) at `url`, so a mock `MockServer` on a random port stands
+// in for a locally-running `spelunk-server` the CLI discovers on its own —
+// exactly as `index_embed_tier_routing.rs` does.
+fn write_loopback_state(state_dir: &Path, url: &str) {
+    std::fs::create_dir_all(state_dir).expect("create state dir");
+    let port: u16 = url
+        .rsplit(':')
+        .next()
+        .expect("uri has a port")
+        .trim_end_matches('/')
+        .parse()
+        .expect("uri port is numeric");
+    std::fs::write(state_dir.join("server.port"), format!("{port}\n")).expect("write server.port");
+}
+
+// Build a `spelunk plumbing embed` command that auto-discovers the loopback
+// server via `SPELUNK_STATE_DIR`, with every ambient `SPELUNK_*` var these
+// tests isolate scrubbed so a developer/CI shell value can't change which tier
+// is probed.
+fn embed_loopback_cmd(
+    home: &Path,
+    project: &Path,
+    state_dir: &Path,
+    config: &Path,
+) -> assert_cmd::Command {
+    let mut cmd = spelunk_bin_in(home);
+    cmd.current_dir(project)
+        .env_remove("SPELUNK_SERVER_URL")
+        .env_remove("SPELUNK_MODE")
+        .env_remove("SPELUNK_PROJECT_ID")
+        .env_remove("SPELUNK_NO_SERVER")
+        .env("SPELUNK_STATE_DIR", state_dir)
+        .arg("--config")
+        .arg(config)
+        .arg("plumbing")
+        .arg("embed");
+    cmd
+}
 
 // Build a config.toml with `embedding_model`, and separately point
 // `server_url`/`project_id` at `<dir>/.spelunk/config.toml`: `Config::load`
@@ -18,15 +62,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // the global `--config` file. The caller's `Command` must set
 // `.current_dir(dir.path())`.
 //
-// `mode = "cloud_first"` in the global config is required since the
-// 2026-07-23 ADR-004 revision: `plumbing embed` has no
-// loopback-auto-discovery bridging (unlike `memory add`/`search`/etc, it
-// calls `require_server_client` directly on the loaded `Config`, with no
-// `effective_config` step), so a bare `server_url` with the default
-// `local_first` mode no longer resolves to any inference target at all — by
-// design, `local_first` never falls back to `server_url` for inference. This
-// test's whole premise (a mocked `server_url` that IS used for embedding, no
-// local server involved) is exactly the `cloud_first` case.
+// `mode = "cloud_first"` in the global config makes the explicit `server_url`
+// the inference target: since the 2026-07-23 ADR-004 revision, a bare
+// `server_url` under the default `local_first` mode is a memory sync replica
+// only and never serves inference. These tests exercise that explicit-remote
+// path (a mocked `server_url` that IS used for embedding, no local server
+// involved), which is exactly the `cloud_first` case. `plumbing embed` now
+// bridges loopback auto-discovery the same way `search`/`memory search` do —
+// covered separately by `embed_finds_auto_discovered_loopback_server` below,
+// which needs no `server_url` at all.
 fn write_server_config(dir: &TempDir, server_uri: &str) -> std::path::PathBuf {
     let config = dir.path().join("config.toml");
     std::fs::write(
@@ -112,7 +156,14 @@ async fn embed_document_mode_produces_jsonl_vector() {
     assert_eq!(rows.len(), 1, "one stdin line → one embedding");
 
     let row = &rows[0];
-    assert!(row.get("model").is_some(), "missing 'model'");
+    // The config.toml written by `write_server_config` sets a *different*
+    // `embedding_model` value ("test-model"): the reported model must be the
+    // pinned constant regardless, never that config default.
+    assert_eq!(
+        row.get("model").and_then(|v| v.as_str()),
+        Some(spelunk_core::embeddings::MODEL_ID),
+        "'model' must report the pinned model id, not a config value"
+    );
     assert!(row.get("dimensions").is_some(), "missing 'dimensions'");
     assert!(row.get("vector").is_some(), "missing 'vector'");
 
@@ -206,8 +257,85 @@ async fn embed_multiple_lines_produce_multiple_vectors() {
     assert_eq!(rows.len(), 3, "three stdin lines → three embeddings");
 }
 
-// ── error path: no server configured ─────────────────────────────────────────
+// ── happy path: auto-discovered loopback server (no server_url configured) ────
 
+// The reported bug: a healthy local `spelunk-server` discovered via loopback
+// auto-discovery (`SPELUNK_STATE_DIR`/`server.port`) — with NO explicit
+// `server_url` and the default `local_first` mode — must be found by `plumbing
+// embed`, exactly as `search --mode semantic` / `memory search` already find
+// it. Before the fix, `embed` skipped the capability-tier / `effective_config`
+// bridge those commands use and reported `requires spelunk-server` here, even
+// while every other server-backed command found the same server.
+#[tokio::test]
+async fn embed_finds_auto_discovered_loopback_server() {
+    let mock = MockServer::start().await;
+    mount_health(&mock).await;
+    mount_index_embed(&mock).await;
+
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    // No `.spelunk/config.toml` at all: no server_url, no project_id — pure
+    // loopback auto-discovery, the default no-team-server case.
+    let state_dir = home.path().join("state");
+    write_loopback_state(&state_dir, &mock.uri());
+
+    let config = project.path().join("config.toml");
+    std::fs::write(&config, "embedding_model = \"test-model\"\n").unwrap();
+
+    let output = embed_loopback_cmd(home.path(), project.path(), &state_dir, &config)
+        .write_stdin("hello world\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows = plumbing_helpers::parse_jsonl(&output);
+    assert_eq!(rows.len(), 1, "one stdin line → one embedding");
+    assert!(rows[0].get("vector").is_some(), "missing 'vector'");
+    assert_eq!(
+        rows[0].get("model").and_then(|v| v.as_str()),
+        Some(spelunk_core::embeddings::MODEL_ID),
+    );
+}
+
+// The `--query` prefix path must reach the same auto-discovered loopback
+// server (it routes through `embed_query_vec`, a distinct code path from the
+// document branch).
+#[tokio::test]
+async fn embed_query_finds_auto_discovered_loopback_server() {
+    let mock = MockServer::start().await;
+    mount_health(&mock).await;
+    mount_index_embed(&mock).await;
+
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let state_dir = home.path().join("state");
+    write_loopback_state(&state_dir, &mock.uri());
+
+    let config = project.path().join("config.toml");
+    std::fs::write(&config, "embedding_model = \"test-model\"\n").unwrap();
+
+    let output = embed_loopback_cmd(home.path(), project.path(), &state_dir, &config)
+        .arg("--query")
+        .write_stdin("how does greet work?\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows = plumbing_helpers::parse_jsonl(&output);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].get("vector").is_some(), "missing 'vector'");
+}
+
+// ── error path: no server reachable (gate preserved) ─────────────────────────
+
+// The locked-feature gate must survive the fix: with no server reachable
+// (here forced with `SPELUNK_NO_SERVER=1` so the result is deterministic
+// regardless of any real server on the default loopback port), `plumbing
+// embed` still fails with the actionable `requires spelunk-server` error.
 #[test]
 fn embed_exits_nonzero_when_no_server_configured() {
     let tmp = TempDir::new().unwrap();
@@ -215,11 +343,13 @@ fn embed_exits_nonzero_when_no_server_configured() {
     std::fs::write(&config, "embedding_model = \"test-model\"\n").unwrap();
 
     spelunk_bin()
+        .env("SPELUNK_NO_SERVER", "1")
         .arg("--config")
         .arg(&config)
         .arg("plumbing")
         .arg("embed")
         .write_stdin("some text\n")
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains("requires spelunk-server"));
 }

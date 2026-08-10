@@ -155,12 +155,15 @@ async fn cli_push_then_repush_is_idempotent_then_since_roundtrips() {
 
     // Confirm no duplicates server-side via the list endpoint.
     let list_url = format!("{base_url}/v1/projects/{project}/memory?limit=50");
-    let notes: Vec<serde_json::Value> = reqwest::get(&list_url)
+    let body: serde_json::Value = reqwest::get(&list_url)
         .await
         .expect("GET /memory")
         .json()
         .await
         .expect("parse /memory list");
+    let notes = body["entries"]
+        .as_array()
+        .expect("list envelope must carry an `entries` array");
     assert_eq!(
         notes.len(),
         2,
@@ -268,12 +271,15 @@ async fn concurrent_identical_batches_settle_without_duplicates_or_500s() {
 
     // The store itself must never end up with two rows for one external_id.
     let list_url = format!("{base_url}/v1/projects/{project}/memory?limit=50");
-    let notes: Vec<serde_json::Value> = reqwest::get(&list_url)
+    let body: serde_json::Value = reqwest::get(&list_url)
         .await
         .expect("GET /memory")
         .json()
         .await
         .expect("parse /memory list");
+    let notes = body["entries"]
+        .as_array()
+        .expect("list envelope must carry an `entries` array");
     assert_eq!(
         notes.len(),
         1,

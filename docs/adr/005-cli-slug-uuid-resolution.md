@@ -15,7 +15,7 @@ or (b) a resolution mechanism built into the CLI.
 
 ### What cloud-api exposes today
 
-`GET /v1/projects` (cloud-api `src/routes/projects.rs`, `listProjects`) returns the
+`GET /v1/projects` (cloud-api's `listProjects` operation) returns the
 authenticated key's visible projects:
 
 ```json
@@ -37,8 +37,8 @@ The endpoint is authenticated (any valid API key) and already deployed at
 
 **There is no dedicated slug-lookup endpoint.** All downstream routes
 (`/v1/projects/{project_id}/memory`, `/memory/since`, `/memory/batch`,
-`/memory/stream`, `/mcp`, `/llm/complete`, etc.) use `Path<Uuid>` — a raw UUID
-parsed directly out of the path segment.
+`/memory/stream`, `/mcp`, `/llm/complete`, etc.) declared `{project_id}` as a
+UUID: a raw UUID parsed directly out of the path segment.
 
 ### What the CLI does today (spelunk-oss)
 
@@ -49,8 +49,8 @@ as the path segment — the local server stores it in `projects.slug` and treats
 the slug as the persistence key. That pattern works because the OSS
 spelunk-server accepts any string as the project identifier.
 
-**cloud-api does not.** Its `{project_id}` parameter is typed `Path<Uuid>`; a
-non-UUID value (e.g., `"spelunk"`) causes Axum's extractor to return 422. So a
+**cloud-api does not.** Its `{project_id}` parameter accepts a UUID only; a
+non-UUID value (e.g., `"spelunk"`) is rejected 422. So a
 config of `project_id = "spelunk"` with `server_url = "https://api.spelunk.cloud"`
 fails immediately.
 
@@ -68,6 +68,52 @@ No new cloud-api endpoint is needed.
 ---
 
 ## Decision
+
+> **Amendment: the resolution trigger below is retired for the memory-backend
+> path.** The Context above records the situation as it stood on 2026-06-19 and
+> is left as provenance. Its load-bearing premise, that cloud-api's
+> `{project_id}` path parameter accepted a UUID only and therefore rejected a
+> slug, no longer holds: cloud-api's published contract now documents
+> `{project_id}` as "Project id (UUID) or slug" on `POST /memory`,
+> `GET /memory`, `GET /memory/since`, `POST /memory/batch`, `/edges`, `/graph`
+> and `/stream` alike. The self-hosted spelunk-server has always accepted
+> either.
+>
+> The two per-entry routes are the exception: `GET` and `DELETE
+> /memory/{entry_id}` are still `Path<(Uuid, Uuid)>`, so the project parameter
+> is UUID-only on those two. It does not affect the passthrough, which is why
+> they are absent from the list above, but it constrains any later work that
+> makes `cloud_first` serve memory against the hosted API.
+>
+> The mechanism was not merely redundant against the self-hosted peer, it was
+> breaking it: a self-hosted spelunk-server answers `GET /v1/projects` in a
+> shape the resolver cannot deserialize, so the documented `cloud_first` client
+> configuration failed at backend open and took every memory command with it.
+> Retiring the resolution is the repair, not a cleanup that followed one.
+>
+> With both peers slug-accepting, D1's "if it does not parse as a UUID, resolve
+> it" branch is never the correct thing to do, so D1 and D6's resolution
+> trigger, along with D2's `GET /v1/projects` lookup and D4's
+> `.spelunk/cloud-project-id.lock` cache, are gone. `Config.project_id` is now
+> passed through verbatim as the project path segment, percent-encoded into a
+> single segment, exactly as `CloudSyncClient` has always done. D5's raw-UUID
+> behaviour survives as a consequence of that passthrough rather than as a
+> special case. `SPELUNK_NO_SLUG_CACHE` no longer does anything.
+>
+> Live surface: `open_remote_memory_backend_with_bearer` in
+> `crates/spelunk-core/src/storage/mod.rs`, and `RemoteMemoryBackend::url` /
+> `encode_project_id` in `crates/spelunk-core/src/storage/remote/mod.rs`.
+>
+> **Second amendment: the per-entry-route exception above is also retired.**
+> `GET`/`DELETE /v1/projects/{project_id}/memory/{entry_id}` now accept a
+> project slug or a UUID, matching every other memory route, closing the last
+> gap this ADR flagged as "constrains any later work that makes `cloud_first`
+> serve memory against the hosted API." `CloudApiMemoryBackend` (added to
+> serve exactly that later work) no longer rejects a slug `project_id` on
+> `get`/`archive`/`supersede` (`per_entry_project` and its call sites removed
+> from `crates/spelunk-core/src/storage/remote/cloud_api.rs`). With this gone,
+> a slug-configured `cloud_first` project works identically against both
+> peers for every memory operation.
 
 ### D1. Slug detection and resolution trigger
 
@@ -190,7 +236,7 @@ no cache write. This path is zero-cost for users who already have a UUID.
 ### D7. No cloud-api changes required
 
 The resolution contract relies entirely on the existing `GET /v1/projects` endpoint
-(`routes/projects.rs`, `listProjects`). No new endpoint, no schema change, no
+(the `listProjects` operation). No new endpoint, no schema change, no
 migration needed on the cloud-api side.
 
 ---

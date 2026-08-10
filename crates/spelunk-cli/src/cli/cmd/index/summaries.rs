@@ -1,9 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
 
 use crate::{
+    capability::{self, LlmFeature},
     config::Config,
-    server_client::{ServerInferenceClient, ServerLlmAdapter},
+    server_client::ServerLlmAdapter,
     storage::Database,
 };
 
@@ -11,33 +12,39 @@ use crate::{
 ///
 /// Fetches chunks without summaries in batches, calls the LLM via
 /// spelunk-server, and stores results.
-/// If `server_url` is not configured or `no_summaries` is true, returns early.
+///
+/// Summaries are optional, so every no-LLM outcome is a skip with a notice and
+/// an `Ok`, never a failed index.
 pub(super) async fn generate_summaries(
     no_summaries: bool,
     summary_batch_size: usize,
     cfg: &Config,
     db: &Database,
+    project_root: &std::path::Path,
 ) -> Result<()> {
     if no_summaries {
         return Ok(());
     }
 
-    if cfg.server_url.is_none() {
-        eprintln!("  Skipping summaries (no server_url configured)");
-        return Ok(());
-    }
-
-    // Count total chunks needing summaries for progress reporting.
+    // Count total chunks needing summaries for progress reporting. Checked
+    // before routing so a re-index with nothing to summarise neither probes
+    // nor prints a notice about an LLM it was never going to call.
     let batch_size = summary_batch_size.max(1);
     let first_batch = db.chunks_without_summaries(1)?;
     if first_batch.is_empty() {
         return Ok(());
     }
 
-    // Build the LLM adapter via spelunk-server.
-    let client = ServerInferenceClient::from_config(cfg).with_context(
-        || "server_url is set but could not build ServerInferenceClient for summaries",
-    )?;
+    let route = capability::resolve_llm_route(cfg, project_root).await;
+    let Some(client) = route.client() else {
+        if let Some(reason) = route.reason() {
+            eprintln!(
+                "{}",
+                capability::no_llm_message(reason, LlmFeature::Summaries)
+            );
+        }
+        return Ok(());
+    };
     let llm = ServerLlmAdapter(Arc::new(client));
 
     // Count pending chunks for progress display.

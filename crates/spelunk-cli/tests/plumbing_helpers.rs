@@ -3,33 +3,33 @@
 //! Every test that needs an indexed project DB should call
 //! `index_fixture_project()`.  Tests that need no index still share helpers
 //! for constructing `Command` instances.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// Drop the machine's global/system git config for every git this process
-/// spawns, including a setup git a test runs directly. Must be process-wide,
-/// not per-`Command`: a helper only controls the git it spawns itself, never
-/// one the code under test spawns for itself.
-///
-/// A temp repo's local config does not shadow an ambient value the repo never
-/// sets. A global `commit.gpgsign = true` makes setup commits sign as the
-/// fabricated test identity below, which no contributor holds a key for, so
-/// the commit exits non-zero.
-///
-/// `/dev/null` is not a Windows path, but git skips a scope whenever its var
-/// is set, whatever the path resolves to, so this isolates on Windows too.
-pub fn isolate_git_config() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: every git-touching helper here calls this first and `Once`
-        // blocks the rest until it returns, so no thread can be spawning git
-        // (reading environ) while these run.
+// Git-config isolation lives once in `spelunk_core::test_support`, reached
+// here via the `test-support`-featured dev-dependency in this crate's
+// Cargo.toml. `scripts/check-git-isolation.sh` enforces that a test file
+// spawning `git` wires in `isolate_git_config`/`git_command`, however
+// qualified, including through this re-export.
+pub use spelunk_core::test_support::isolate_git_config;
+
+// A spawned `spelunk` binary registers sqlite-vec for its own process, but a
+// `rusqlite::Connection` opened here does not inherit that: without this, any
+// query touching a `vec0` table (`embeddings`, memory vectors) fails, and an
+// assertion reading through `unwrap_or(0)` misreports the error as "empty".
+// `sqlite3_auto_extension` is process-global, so the `OnceLock` is what keeps
+// concurrent tests in one binary from racing on it.
+pub fn register_sqlite_vec() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        #[allow(clippy::missing_transmute_annotations)]
         unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
-            std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
         }
     });
 }
@@ -150,7 +150,7 @@ pub fn spelunk_cmd(db_path: &Path, config_path: &Path) -> Command {
 /// API base URL.  Returns the config file path.
 pub fn write_config(dir: &Path, db_path: &Path, api_base: &str) -> PathBuf {
     let cfg = format!(
-        "db_path = {:?}\napi_base_url = {:?}\nembedding_model = \"test-model\"\nllm_model = \"test-chat\"\n",
+        "db_path = {:?}\napi_base_url = {:?}\nllm_model = \"test-chat\"\n",
         db_path, api_base
     );
     let config_path = dir.join("config.toml");
@@ -248,7 +248,12 @@ pub async fn mount_health(server: &wiremock::MockServer) {
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "ok",
                 "version": "test",
-                "capabilities": ["memory", "index.embed", "search.semantic", "explore", "plan"],
+                // `llm.complete` is what LLM routing keys on. `explore` cannot
+                // stand in for it: it predates both that capability and the
+                // route behind it.
+                "capabilities": [
+                    "memory", "index.embed", "search.semantic", "explore", "plan", "llm.complete"
+                ],
             })),
         )
         .mount(server)
@@ -311,7 +316,12 @@ pub fn index_project_dir(project_dir: &Path) -> (TempDir, PathBuf, PathBuf) {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "ok",
                 "version": "test",
-                "capabilities": ["memory", "index.embed", "search.semantic", "explore", "plan"],
+                // `llm.complete` is what LLM routing keys on. `explore` cannot
+                // stand in for it: it predates both that capability and the
+                // route behind it.
+                "capabilities": [
+                    "memory", "index.embed", "search.semantic", "explore", "plan", "llm.complete"
+                ],
             })))
             .mount(&server)
             .await;
@@ -347,8 +357,18 @@ pub fn index_project_dir(project_dir: &Path) -> (TempDir, PathBuf, PathBuf) {
     // `.current_dir(tmp.path())`: the project-level config discovery walks up
     // from CWD, not from the `project_dir` positional arg (which may be an
     // unrelated source tree, e.g. the shared fixture).
+    //
+    // `SPELUNK_MODE=cloud_first`: this fixture's whole point is a Tier 1
+    // index with real embeddings landed via the mock `server_url` above, not
+    // exercising local-vs-remote routing. Under the default `local_first`
+    // mode an explicit `server_url` with no loopback embedder configured is
+    // now correctly refused, which would leave chunks unembedded and every
+    // KNN-dependent consumer of this fixture broken. `.spelunk/config.toml`
+    // doesn't recognize a `mode` key (see `write_project_server_config`), so
+    // this must go through the env var.
     spelunk_bin_in(tmp.path())
         .current_dir(tmp.path())
+        .env("SPELUNK_MODE", "cloud_first")
         .arg("--config")
         .arg(&config_path)
         .arg("index")

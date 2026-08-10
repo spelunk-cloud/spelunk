@@ -493,7 +493,7 @@ def main() -> None:
 
     # Resolve API key
     api_key = args.api_key or os.environ.get("DEEPSEEK_API_KEY")
-    api_key_source = "flag:--api-key" if args.api_key else "env:DEEPSEEK_API_KEY"
+    provenance_label = "flag:--api-key" if args.api_key else "env:DEEPSEEK_API_KEY"
     if not api_key:
         parser.error(
             "No API key provided. Use --api-key or set DEEPSEEK_API_KEY env var."
@@ -622,7 +622,7 @@ def main() -> None:
         "model": args.model,
         "model_source": "api",
         "api_base_url": args.api_base_url,
-        "api_key_source": api_key_source,
+        "api_key_source": provenance_label,
         "spelunk_version": get_spelunk_version(),
         "seed": args.seed,
         "run_seed": args.seed,

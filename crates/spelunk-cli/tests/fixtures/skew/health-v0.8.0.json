@@ -1,0 +1,11 @@
+{
+  "capabilities": [
+    "memory",
+    "index.embed",
+    "search.semantic"
+  ],
+  "instance_id": "df5fe788-ce5b-4276-a772-9addb42aea65",
+  "started_by": 501,
+  "status": "ok",
+  "version": "0.8.0"
+}

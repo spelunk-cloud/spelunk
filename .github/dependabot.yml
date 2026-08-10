@@ -9,6 +9,13 @@ updates:
       candle:
         patterns:
           - "candle-*"
+      gix:
+        patterns:
+          - "gix"
+          - "gix-*"
+      ast-grep:
+        patterns:
+          - "ast-grep-*"
 
   - package-ecosystem: github-actions
     directory: /

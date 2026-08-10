@@ -135,7 +135,7 @@ pub(super) async fn nudge_after_write(cfg: &Config, mem_path: &std::path::Path) 
     };
 
     if std::io::stdin().is_terminal() {
-        let _ = super::super::server::ensure_server_running(7777).await;
+        let _ = super::super::server::ensure_server_running(7777, cfg).await;
     }
 
     let Some(port) = super::super::server::probe_local_relay_port().await else {

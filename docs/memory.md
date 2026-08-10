@@ -159,7 +159,10 @@ synced at least once, the clause persists even after the outbox fully
 drains, for example `mode  local_first  ·  up to date, last synced 4m ago`.
 Use `spelunk sync` (or the one-way `spelunk memory push` / `spelunk memory
 pull`) whenever you want to force a synchronous reconcile with the server
-instead of waiting on the background drain.
+instead of waiting on the background drain. Both commands also embed the entries
+they push into the local `memory.db` first, so a pushed entry stays findable by
+semantic `memory search` on your own machine (see [Repair during push and
+sync](#repair-during-push-and-sync)).
 
 **`cloud_first`** makes the server authoritative: reads and writes go straight
 to it, and an unreachable or untrusted server is a hard error naming the cause
@@ -171,6 +174,23 @@ server_url = "https://spelunk.internal.example.com"
 project_id = "my-awesome-app"
 mode = "cloud_first"
 ```
+
+`server_url` may point at a self-hosted `spelunk-server` or at the hosted API.
+The two expose different memory routes, so spelunk settles which to speak when
+the backend opens, by reading the capability list `/v1/health` already
+advertises. A peer advertising SSE memory streaming is the hosted API; anything
+else, including a probe that times out, is unreachable, or answers without a
+capability list, is treated as a self-hosted server. The probe is
+unauthenticated and never sends your server key.
+
+`project_id` may be a slug or a UUID against either peer; every memory
+command, including `spelunk memory show` and `spelunk memory archive`, resolves
+either form the same way.
+
+Against the hosted API, `spelunk memory harvest`'s duplicate check filters
+locally, because that API has no server-side commit filter. It stays correct,
+but its cost grows with the size of the project rather than staying an indexed
+lookup.
 
 **`offline`** guarantees no server contact at all, even with `server_url`
 set. `SPELUNK_NO_SERVER=1` forces it regardless of config.
@@ -541,6 +561,13 @@ spelunk memory list --as-of 2026-01-01
 spelunk memory list --source-ref abc1234
 ```
 
+`--source-ref <sha>` returns every entry associated with that commit, matched
+two ways: harvested entries carry the commit SHA they were harvested from in
+their `source_ref` provenance field, and entries added with `spelunk memory add`
+are anchored to a commit by the git note that carries them (the same note you
+see under `git notes --ref=spelunk show <sha>`). Both are found; the SHA may be
+given in full or as a prefix.
+
 `question` and `answer` entries show titles only in list view to avoid context saturation. Use `spelunk memory show <id>` to read the full body.
 
 ## Cross-project visibility
@@ -642,13 +669,15 @@ spelunk memory graph 42 --format json
 `spelunk memory harvest` reads your git log, sends commit messages to the LLM, and automatically extracts significant entries. Requires a reachable `spelunk-server` with a chat model loaded; there is no local-model path, and setting `llm_model` in `~/.config/spelunk/config.toml` has no effect on this command (see [Config reference](config-reference.md#llm_model)).
 
 ```bash
-# Default: last 10 commits
+# Default: last 10 commits (fewer if the repo has fewer than 10)
 spelunk memory harvest
 
 # Custom range
 spelunk memory harvest --git-range HEAD~30..HEAD
 spelunk memory harvest --git-range v1.0..HEAD
 ```
+
+The default range is clamped to the commits that actually exist, so harvest works on a brand-new repo with a single commit — it never fails with a raw `git` "bad revision" error just because the history is shorter than the range.
 
 Already-harvested commits are skipped (tracked via a `git:<sha>` tag). Routine commits ("fix typo", "wip", etc.) are ignored by the LLM.
 
@@ -810,11 +839,14 @@ to be able to undo it).
 
 ## Backfilling missing embeddings
 
-A note's semantic vector is created only when the note is first added
-(`spelunk memory add`). If no embedder was reachable at that moment, or the
-store was upgraded across the 768→896 embedding-dimension change (which drops
-the old vectors and rebuilds `note_embeddings` empty), the note stays in
-`memory.db` **present but unembedded**. Such a note is still found by text
+A note's semantic vector is normally minted when the note is first added
+(`spelunk memory add`), and `spelunk memory push` / `spelunk sync` mint one for
+any entry in the set they are about to push that still lacks it (see [Repair
+during push and sync](#repair-during-push-and-sync)). A note that misses both
+moments, because no embedder was reachable, or because the store was upgraded
+across the 768→896 embedding-dimension change (which drops the old vectors and
+rebuilds `note_embeddings` empty), stays in `memory.db` **present but
+unembedded**. Such a note is still found by text
 search (`--mode text`), `memory list`, `memory timeline`, and `context`; it is
 only missing from *semantic* `memory search`, because semantic ranking is a KNN
 over the embedding vectors and this note has none.
@@ -867,6 +899,56 @@ a one-line notice naming the count and pointing at `spelunk memory reindex`, so
 the recall gap is discoverable without `RUST_LOG`. The notice is a pointer, not
 an auto-repair: it embeds nothing itself. Running `reindex` is what restores
 semantic recall.
+
+### Repair during push and sync
+
+`spelunk memory push` and `spelunk sync` embed what they are about to push.
+Before the batch is built, every entry in the push set that has no usable local
+vector is embedded through the local loopback embedder, using the same document
+text and the same document-side embedding call `spelunk memory reindex` uses,
+and each vector is committed to `memory.db` as it completes. A pushed entry is
+therefore findable by semantic `memory search` on your own machine afterwards,
+with no separate `reindex` step. Previously a push left `memory.db` exactly as
+it found it, so entries it had just pushed stayed invisible to local semantic
+search and nothing said so.
+
+This changes what is stored locally, not what is sent. `kind`, `title`, and
+`body` are serialised on every push and always were; the vector fields are
+additive, so the same entry text travels either way. What a local vector adds is
+that a destination advertising `accepts_pushed_vectors` can store the entry
+as-is instead of re-embedding it.
+
+Scope and limits:
+
+- Only the push set is repaired: entries that are active and not yet synced.
+  Entries already synced, and entries arriving through `spelunk memory pull`,
+  are outside it and still need `spelunk memory reindex`.
+- The embed always runs against the local loopback embedder, never against a
+  configured team `server_url`. This is the same way `reindex` resolves its
+  embedder.
+- Skipped entirely in `cloud_first` mode with a team `server_url` set, where
+  `memory.db` is not the store of record. That is the same condition
+  `spelunk memory reindex` declines under, so the two commands agree about when
+  local embeddings are meaningful.
+- With no local embedder reachable, the push still runs to completion and exits
+  exactly as it did before, every entry text-only. It prints one warning:
+
+  ```
+  warning: 2 entries pushed without a local embedding, so `spelunk memory search` cannot surface them in this project until `spelunk memory reindex` is run.
+  ```
+
+  A single entry's embed failure behaves the same way: that entry goes out
+  text-only and is counted in the warning, the rest of the push still gets
+  vectors, and the command does not abort.
+- The summary line reports how many entries were embedded locally, separately
+  from `created` / `skipped` / `failed`:
+
+  ```
+  Done. Pushed 4 entries (created 4, skipped 0). Embedded 2 locally.
+  ```
+
+  A push that neither minted nor missed a vector prints the summary line
+  unchanged.
 
 ## Using memory as context
 

@@ -30,6 +30,14 @@ spelunk will not adopt a separate vector database (Qdrant, Milvus, Turbopuffer, 
 
 ### 3. Embedding-model agnostic, not embedding-model provider
 
+> **Superseded (2026-07-26).** spelunk now bundles and pins a single embedding
+> model (F2LLM-v2-330M@896) as the sole compute path, product-wide; the
+> configurable, agnostic OpenAI-compatible embedding backend this section
+> describes, including any option to relocate where embeddings are computed,
+> no longer exists. Kept as the original record of the reasoning at the time.
+> See `docs/third-party-models.md` and `docs/config-reference.md` for current
+> behavior.
+
 spelunk calls an embedding API. It does not bundle, host, fine-tune, or distribute embedding models.
 
 The backend trait (`EmbeddingBackend`) accepts any service that speaks the OpenAI-compatible `/v1/embeddings` protocol. LM Studio is the default because it runs locally, but any compatible endpoint works (Ollama, vLLM, OpenAI, etc.).

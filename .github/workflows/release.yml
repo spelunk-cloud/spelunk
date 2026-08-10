@@ -108,14 +108,6 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
-      - name: Strip binaries (Linux)
-        if: contains(matrix.target, 'linux')
-        shell: bash
-        run: |
-          set -euo pipefail
-          strip "target/${{ matrix.target }}/release/spelunk"
-          strip "target/${{ matrix.target }}/release/spelunk-server"
-
       # The whole point of the container build: fail the release if either
       # binary needs a glibc symbol newer than the 2.31 floor. Pinned forever,
       # not measured once: must keep failing even after toolchain bumps. A

@@ -42,6 +42,20 @@ pub struct SyncRow {
     pub archived: bool,
 }
 
+/// A local `relates_to` edge ready to propagate to the cloud.
+///
+/// Both endpoints are already synced (each carries a cloud `remote_id`), so the
+/// server knows them by their `external_id` (the entry's stable `uuid`), the
+/// only id the batch edge route resolves. The local row ids are kept so the
+/// caller can push only edges touching entries synced in the current round.
+#[derive(Debug, Clone)]
+pub struct SyncEdge {
+    pub from_local_id: i64,
+    pub to_local_id: i64,
+    pub from_external_id: String,
+    pub to_external_id: String,
+}
+
 impl MemoryStore {
     /// Assign a fresh UUIDv7 to `note_id` if it lacks one; return the entry's
     /// UUID. Idempotent. This is the Founder-decided backfill (§3) — a *fresh*
@@ -292,6 +306,39 @@ impl MemoryStore {
             .optional()?
             .flatten();
         Ok(cursor)
+    }
+
+    /// Every `relates_to` edge whose BOTH endpoints are already synced to the
+    /// cloud (each has a `remote_id`) and carry a stable `uuid`.
+    ///
+    /// Only `relates_to` is enumerated: a `supersedes` edge already travels
+    /// with its entry's lifecycle on push, and `contradicts` is server-derived
+    /// and never pushed up. An edge with an unsynced endpoint is omitted here,
+    /// so it is skipped until a later sync lands that endpoint. The row ids are
+    /// returned so the caller can narrow to edges touching entries synced in
+    /// the current round.
+    pub fn relates_to_edges_for_sync(&self) -> Result<Vec<SyncEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.from_id, e.to_id, nf.uuid, nt.uuid \
+             FROM memory_edges e \
+             JOIN notes nf ON nf.id = e.from_id \
+             JOIN notes nt ON nt.id = e.to_id \
+             WHERE e.kind = 'relates_to' \
+               AND nf.remote_id IS NOT NULL AND nt.remote_id IS NOT NULL \
+               AND nf.uuid IS NOT NULL AND nt.uuid IS NOT NULL \
+             ORDER BY e.created_at, e.from_id, e.to_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SyncEdge {
+                    from_local_id: r.get(0)?,
+                    to_local_id: r.get(1)?,
+                    from_external_id: r.get(2)?,
+                    to_external_id: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Count of active (non-archived) rows still in the push outbox

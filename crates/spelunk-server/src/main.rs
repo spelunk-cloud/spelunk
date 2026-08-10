@@ -18,6 +18,9 @@ use spelunk_core::embeddings::MODEL_ID as NATIVE_MODEL_ID;
 #[cfg(feature = "embed-native")]
 use spelunk_server::embed_hub;
 
+mod server_llm;
+use server_llm::{ServerLlm, check_llm_transport, resolve_llm_key};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "spelunk-server",
@@ -82,22 +85,14 @@ struct Args {
     #[arg(long, default_value_t = default_conflict_threshold())]
     conflict_threshold: f32,
 
-    /// Base URL of an OpenAI-compatible embedding server for server-side embedding
-    /// (e.g. `http://127.0.0.1:1234`). Overrides `SPELUNK_EMBEDDING_URL`.
-    /// Relocates *where* embeddings are computed only; the model stays fixed to
-    /// F2LLM-v2-330M@896 — the endpoint must serve that model. When set, entries
-    /// posted without a pre-computed `embedding` field are embedded by the server
-    /// before storage.
-    #[arg(long, env = "SPELUNK_EMBEDDING_URL")]
-    embedding_url: Option<String>,
-
-    /// Deprecated and ignored. The embedding model is fixed to F2LLM-v2-330M@896
-    /// product-wide; a mismatched model silently corrupts the shared
-    /// vector space. Retained hidden only so a legacy
-    /// `SPELUNK_EMBEDDING_MODEL` / `--embedding-model` warns and is ignored
-    /// instead of hard-failing an old deployment on upgrade. Never selects a model.
-    #[arg(long, env = "SPELUNK_EMBEDDING_MODEL", hide = true)]
-    embedding_model: Option<String>,
+    /// Directory holding a pre-provisioned F2LLM-v2-330M GGUF + tokenizer (see
+    /// "Air-gapped / no-egress install" in docs/server-setup.md), for hosts
+    /// with no route to huggingface.co. When set, the bundled native embedder
+    /// loads from this directory instead of the Hugging Face Hub: zero
+    /// network access, at startup or at runtime. Only consulted when the
+    /// bundled native embedder is the active backend; ignored otherwise.
+    #[arg(long, env = "SPELUNK_MODEL_DIR", value_name = "PATH")]
+    model_dir: Option<PathBuf>,
 
     /// Base URL of an OpenAI-compatible chat completions server for LLM features
     /// (`/explore`). Overrides `SPELUNK_LLM_URL`.
@@ -107,6 +102,26 @@ struct Args {
     /// LLM model name (e.g. `google/gemma-3n-e4b`). Overrides `SPELUNK_LLM_MODEL`.
     #[arg(long, env = "SPELUNK_LLM_MODEL", default_value = "")]
     llm_model: String,
+
+    /// `reasoning_effort` sent on every LLM request, to suppress chain-of-thought
+    /// on reasoning models (DeepSeek, Gemini, o-series, …). Defaults to `none`
+    /// (reasoning off), because harvest/explore want the answer, not the model's
+    /// thinking, and an unbounded reasoning pass exhausts the token budget before
+    /// any content is emitted. Set `minimal`/`low`/`medium`/`high` to allow it, or
+    /// `default` to omit the field entirely for endpoints that reject it.
+    #[arg(long, env = "SPELUNK_LLM_REASONING_EFFORT", default_value = "none")]
+    llm_reasoning_effort: String,
+
+    /// Credential for the `--llm-url` endpoint, passed inline. Visible in the
+    /// process table: prefer `--llm-key-file` or `SPELUNK_LLM_KEY`. Distinct
+    /// from `--key`, which is this server's own inbound bearer.
+    #[arg(long, value_name = "KEY")]
+    llm_key: Option<String>,
+
+    /// File whose whole (trimmed) contents are the `--llm-url` credential.
+    /// An unreadable path is fatal, never a fall-through to another source.
+    #[arg(long, value_name = "PATH")]
+    llm_key_file: Option<PathBuf>,
 
     /// Print the OpenAPI spec as JSON and exit (for Postman / Newman import).
     #[arg(long)]
@@ -118,6 +133,18 @@ struct Args {
     /// `--host` is probed over loopback.
     #[arg(long)]
     health_check: bool,
+}
+
+/// Map the `--llm-reasoning-effort` value to what travels on the wire: `default`
+/// / `model` / blank means "omit the field, use the model's own default";
+/// anything else is sent verbatim (`none` suppresses reasoning).
+fn normalize_reasoning_effort(v: &str) -> Option<String> {
+    let v = v.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("default") || v.eq_ignore_ascii_case("model") {
+        None
+    } else {
+        Some(v.to_string())
+    }
 }
 
 fn main() -> Result<()> {
@@ -176,12 +203,6 @@ async fn run(budget: ThreadBudget) -> Result<()> {
         "embed CPU thread budget resolved"
     );
 
-    // Legacy embedding-model override is ignored, not honoured (the model is
-    // fixed product-wide). Warn instead of hard-failing an old deployment.
-    if let Some(msg) = legacy_embedding_model_warning(args.embedding_model.as_deref()) {
-        tracing::warn!("{msg}");
-    }
-
     // Resolve the API key from --key / --key-file / SPELUNK_SERVER_KEY /
     // systemd LoadCredential (see resolve_api_key for precedence). A blank
     // value from any source counts as "no key" — a set-but-empty
@@ -203,6 +224,22 @@ async fn run(budget: ThreadBudget) -> Result<()> {
     // bind is refused unless BOTH in-process TLS and an API key are configured.
     // Fail fast, before touching the DB or warming the embedder.
     check_bind_safety(&args.host, args.port, api_key.is_some(), tls_enabled)?;
+
+    // The upstream LLM credential never comes from a keychain: this process is
+    // usually a detached daemon with no user session, so a keychain read would
+    // be an invisible, unanswerable authorization prompt. The spawning CLI
+    // resolves it and hands it over out of band.
+    let env_llm_key = std::env::var("SPELUNK_LLM_KEY").ok();
+    let llm_key = resolve_llm_key(
+        args.llm_key.as_deref(),
+        args.llm_key_file.as_deref(),
+        env_llm_key.as_deref(),
+    )?;
+    // Alongside the bind check, and for the same reason: refuse a credential
+    // over a plaintext non-loopback hop before touching the DB or the embedder.
+    if let Some(url) = &args.llm_url {
+        check_llm_transport(url, llm_key.is_some())?;
+    }
 
     let db = ServerDb::open(&args.db, args.embedding_dim, NATIVE_MODEL_ID)
         .with_context(|| format!("opening server db at {}", args.db.display()))?;
@@ -235,32 +272,15 @@ async fn run(budget: ThreadBudget) -> Result<()> {
     let auth: Arc<dyn spelunk_server::auth::AuthProvider> =
         Arc::new(ApiKeyAuth::new(api_key.clone()));
 
-    // Build the server-side embedder readiness slot.
-    //
-    // The external `--embedding-url` backend is ready synchronously (it has no
-    // local model to warm up), so it starts `ready`. The bundled native embedder
-    // is CPU-/download-heavy, so we start the slot `loading` and defer the actual
-    // `embed_hub::load_from_hub()` to a background task spawned *after* the listener
-    // binds (below) — that way `/v1/health` is live immediately with
-    // `embedder.state = "loading"` instead of being dark for the whole first-run
-    // model download. When no embedder is configured at all, the slot is
+    // Build the server-side embedder readiness slot. The bundled native
+    // embedder is CPU-/download-heavy, so the slot starts `loading` and the
+    // actual `embed_hub::load_from_hub()` is deferred to a background task
+    // spawned *after* the listener binds (below) — that way `/v1/health` is
+    // live immediately with `embedder.state = "loading"` instead of being
+    // dark for the whole first-run model download. A server built without the
+    // `embed-native` feature has no embed path at all, so the slot is
     // `disabled` (embed endpoints return a permanent 400).
-    let (embedder, load_native): (EmbedderSlot, bool) = if let Some(base_url) = args.embedding_url {
-        // Model is fixed product-wide; the URL relocates compute only.
-        tracing::info!("server-side embedding enabled: {base_url} model={NATIVE_MODEL_ID}");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .context("building HTTP client for server-side embedder")?;
-        let backend: Arc<dyn spelunk_core::embeddings::EmbeddingBackend> =
-            Arc::new(ServerEmbedder {
-                client,
-                base_url,
-                model: NATIVE_MODEL_ID.to_string(),
-            });
-        (EmbedderSlot::ready(backend), false)
-    } else {
-        // No --embedding-url: try the bundled native embedder (embed-native feature).
+    let (embedder, load_native): (EmbedderSlot, bool) = {
         #[cfg(feature = "embed-native")]
         {
             (EmbedderSlot::loading(), true)
@@ -271,7 +291,6 @@ async fn run(budget: ThreadBudget) -> Result<()> {
         }
     };
 
-    // Build the optional LLM backend.
     let llm: Option<Arc<dyn spelunk_core::llm::LlmBackend>> = if let Some(base_url) = args.llm_url {
         let model = if args.llm_model.is_empty() {
             "default".to_string()
@@ -287,6 +306,8 @@ async fn run(budget: ThreadBudget) -> Result<()> {
             client,
             base_url,
             model,
+            api_key: llm_key,
+            reasoning_effort: normalize_reasoning_effort(&args.llm_reasoning_effort),
         }))
     } else {
         None
@@ -321,6 +342,7 @@ async fn run(budget: ThreadBudget) -> Result<()> {
     // Keep a handle to the embedder slot so the background load task can flip it
     // `loading → ready | unavailable` after the listener binds.
     let embedder_slot = state.embedder.clone();
+    let model_dir = args.model_dir.clone();
 
     let app = router(state);
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
@@ -366,15 +388,24 @@ async fn run(budget: ThreadBudget) -> Result<()> {
     tracing::info!("spelunk-server listening on {scheme}://{addr}");
 
     // Load the native embedder on a background task now that health is live.
-    // `embed_hub::load_from_hub()` is blocking/CPU-heavy, so run it on the blocking
-    // pool; publish the backend into the slot on success (state → ready) or
-    // record the failure (state → unavailable). Only the native path warms up
-    // here — external/disabled slots are already in a terminal state.
+    // Both `embed_hub::load_from_hub()` (network) and `load_from_model_dir()`
+    // (offline, when `--model-dir`/`SPELUNK_MODEL_DIR` is set) are
+    // blocking/CPU-heavy, so run whichever applies on the blocking pool;
+    // publish the backend into the slot on success (state → ready) or record
+    // the failure (state → unavailable) either way: an offline host with no
+    // (or bad) provisioned artifacts reaches the same terminal `unavailable`
+    // state as a failed Hub download, just with an error naming the offline
+    // docs instead of a connection failure. Only the native path warms up
+    // here: disabled slots are already in a terminal state.
     #[cfg(feature = "embed-native")]
     if load_native {
         let slot = embedder_slot.clone();
         tokio::spawn(async move {
-            match tokio::task::spawn_blocking(embed_hub::load_from_hub).await {
+            let load = move || match model_dir {
+                Some(dir) => embed_hub::load_from_model_dir(&dir),
+                None => embed_hub::load_from_hub(),
+            };
+            match tokio::task::spawn_blocking(load).await {
                 Ok(Ok(native)) => {
                     tracing::info!("native embedding model loaded (dim={})", NATIVE_EMBED_DIM);
                     slot.set_ready(
@@ -384,8 +415,7 @@ async fn run(budget: ThreadBudget) -> Result<()> {
                 Ok(Err(e)) => {
                     let msg = embedder_load_failure_message(&e);
                     tracing::warn!(
-                        "native embedding model failed to load: {msg}; \
-                         embedder unavailable (set --embedding-url to override)"
+                        "native embedding model failed to load: {msg}; embedder unavailable"
                     );
                     slot.set_unavailable(msg);
                 }
@@ -401,7 +431,7 @@ async fn run(budget: ThreadBudget) -> Result<()> {
     }
     // Silence "unused" for the non-embed-native build (no background load).
     #[cfg(not(feature = "embed-native"))]
-    let _ = (load_native, &embedder_slot);
+    let _ = (load_native, &embedder_slot, &model_dir);
 
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
     match tls_config {
@@ -478,21 +508,6 @@ fn resolve_embed_thread_budget() -> ThreadBudget {
         "default"
     };
     ThreadBudget { threads, source }
-}
-
-// ── Legacy embedding-model override ───────────────────────────────────────────
-
-/// Warning to emit when a legacy `SPELUNK_EMBEDDING_MODEL` / `--embedding-model`
-/// is set. The embedding model is fixed to `NATIVE_MODEL_ID` product-wide
-/// and can no longer be selected; a non-blank value is ignored, not
-/// honoured. Returns `None` when unset/blank so upgrades stay quiet.
-fn legacy_embedding_model_warning(model: Option<&str>) -> Option<String> {
-    let value = model.map(str::trim).filter(|m| !m.is_empty())?;
-    Some(format!(
-        "Ignoring embedding model override '{value}': the embedding model is fixed to \
-         {NATIVE_MODEL_ID} product-wide and can no longer be selected. Remove \
-         SPELUNK_EMBEDDING_MODEL / --embedding-model."
-    ))
 }
 
 // ── Bind-safety guard ─────────────────────────────────────────────────────────
@@ -729,178 +744,42 @@ fn effective_uid() -> Option<u32> {
     }
 }
 
-// ── Inline embedder for the server binary ─────────────────────────────────────
-
-struct ServerEmbedder {
-    client: reqwest::Client,
-    base_url: String,
-    model: String,
-}
-
-#[async_trait::async_trait]
-impl spelunk_core::embeddings::EmbeddingBackend for ServerEmbedder {
-    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        #[derive(serde::Serialize)]
-        struct Req<'a> {
-            model: &'a str,
-            input: &'a [&'a str],
-        }
-        #[derive(serde::Deserialize)]
-        struct Resp {
-            data: Vec<Data>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Data {
-            embedding: Vec<f32>,
-        }
-
-        let resp: Resp = self
-            .client
-            .post(format!("{}/v1/embeddings", self.base_url))
-            .json(&Req {
-                model: &self.model,
-                input: texts,
-            })
-            .send()
-            .await
-            .context("calling embedding server")?
-            .error_for_status()
-            .context("embedding server returned an error")?
-            .json()
-            .await
-            .context("parsing embedding response")?;
-
-        anyhow::ensure!(!resp.data.is_empty(), "embedding server returned 0 vectors");
-        Ok(resp.data.into_iter().map(|d| d.embedding).collect())
-    }
-
-    fn dimension(&self) -> usize {
-        0 // dimension is model-dependent; not used server-side
-    }
-}
-
-// ── Inline LLM for the server binary ─────────────────────────────────────────
-
-struct ServerLlm {
-    client: reqwest::Client,
-    base_url: String,
-    model: String,
-}
-
-#[async_trait::async_trait]
-impl spelunk_core::llm::LlmBackend for ServerLlm {
-    async fn generate(
-        &self,
-        messages: &[spelunk_core::llm::Message],
-        max_tokens: usize,
-        tx: tokio::sync::mpsc::Sender<spelunk_core::llm::Token>,
-        json_schema: Option<serde_json::Value>,
-    ) -> anyhow::Result<()> {
-        use futures_util::StreamExt;
-
-        #[derive(serde::Serialize)]
-        struct ChatReq<'a> {
-            model: &'a str,
-            messages: Vec<ChatMsg<'a>>,
-            stream: bool,
-            max_tokens: usize,
-            temperature: f32,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            response_format: Option<serde_json::Value>,
-        }
-        #[derive(serde::Serialize)]
-        struct ChatMsg<'a> {
-            role: &'a str,
-            content: &'a str,
-        }
-        #[derive(serde::Deserialize)]
-        struct StreamChunk {
-            choices: Vec<StreamChoice>,
-        }
-        #[derive(serde::Deserialize)]
-        struct StreamChoice {
-            delta: Delta,
-        }
-        #[derive(serde::Deserialize)]
-        struct Delta {
-            content: Option<String>,
-        }
-
-        let chat_messages: Vec<ChatMsg> = messages
-            .iter()
-            .map(|m| ChatMsg {
-                role: &m.role,
-                content: &m.content,
-            })
-            .collect();
-
-        let response_format =
-            json_schema.map(|s| serde_json::json!({ "type": "json_schema", "json_schema": s }));
-
-        let req = ChatReq {
-            model: &self.model,
-            messages: chat_messages,
-            stream: true,
-            max_tokens,
-            temperature: 0.7,
-            response_format,
-        };
-
-        let mut stream = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .json(&req)
-            .send()
-            .await
-            .context("calling LLM server")?
-            .error_for_status()
-            .context("LLM server returned an error")?
-            .bytes_stream();
-
-        let mut buffer = String::new();
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.context("reading SSE byte chunk")?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-            while let Some(pos) = buffer.find("\n\n") {
-                let event = buffer[..pos].to_string();
-                buffer.drain(..pos + 2);
-
-                for line in event.lines() {
-                    let data = match line.strip_prefix("data: ") {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    if data == "[DONE]" {
-                        return Ok(());
-                    }
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                        for choice in chunk.choices {
-                            if let Some(content) = choice.delta.content
-                                && !content.is_empty()
-                                && tx.send(content).await.is_err()
-                            {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
 // ── Args default tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod arg_tests {
-    use super::Args;
+    use super::{Args, normalize_reasoning_effort};
     use clap::Parser;
+
+    // Reasoning is off by default: harvest/explore want the answer, and an
+    // unbounded reasoning pass exhausts the token budget before any content
+    // (the DeepSeek-v4 harvest failure). The default must send `none`.
+    #[test]
+    fn reasoning_is_disabled_by_default() {
+        let args = Args::parse_from(["spelunk-server"]);
+        assert_eq!(args.llm_reasoning_effort, "none");
+        assert_eq!(
+            normalize_reasoning_effort(&args.llm_reasoning_effort),
+            Some("none".to_string()),
+            "the default must be sent on the wire as reasoning_effort=none"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_default_and_model_and_blank_omit_the_field() {
+        for opt_out in ["default", "Default", "model", "  ", ""] {
+            assert_eq!(
+                normalize_reasoning_effort(opt_out),
+                None,
+                "'{opt_out}' must omit reasoning_effort so strict endpoints aren't sent it"
+            );
+        }
+        assert_eq!(
+            normalize_reasoning_effort("minimal"),
+            Some("minimal".to_string()),
+            "an explicit effort level passes through verbatim"
+        );
+    }
 
     /// The server binary default host must be loopback (127.0.0.1), not the
     /// wildcard (0.0.0.0). The wildcard bind is an explicit `--host 0.0.0.0`
@@ -912,6 +791,37 @@ mod arg_tests {
             args.host, "127.0.0.1",
             "server binary default host must be 127.0.0.1 (loopback), not the wildcard"
         );
+    }
+
+    // `--llm-key` deliberately carries no clap `env` attribute. With one,
+    // SPELUNK_LLM_KEY would populate `args.llm_key`, which `resolve_llm_key`
+    // ranks above `--llm-key-file`, silently inverting the documented
+    // precedence. Precedence lives in `resolve_llm_key` alone, so this pins the
+    // absence against a future tidy-up.
+    #[test]
+    #[serial_test::serial(llm_key_env)]
+    fn the_key_env_var_does_not_populate_the_inline_key_arg() {
+        // SAFETY: pinned to the `llm_key_env` serial group, so no other test
+        // reads or writes SPELUNK_LLM_KEY concurrently.
+        unsafe { std::env::set_var("SPELUNK_LLM_KEY", "sk-from-env") };
+        let args = Args::parse_from(["spelunk-server"]);
+        unsafe { std::env::remove_var("SPELUNK_LLM_KEY") };
+
+        assert_eq!(
+            args.llm_key, None,
+            "SPELUNK_LLM_KEY must not reach args.llm_key: it would outrank --llm-key-file"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(llm_key_env)]
+    fn the_key_env_var_does_not_populate_the_key_file_arg_either() {
+        // SAFETY: see the sibling test; same serial group.
+        unsafe { std::env::set_var("SPELUNK_LLM_KEY", "/etc/passwd") };
+        let args = Args::parse_from(["spelunk-server"]);
+        unsafe { std::env::remove_var("SPELUNK_LLM_KEY") };
+
+        assert_eq!(args.llm_key_file, None);
     }
 
     /// `--host 0.0.0.0` still binds all interfaces when explicitly requested
@@ -1276,40 +1186,121 @@ mod arg_tests {
         );
     }
 
-    // ── Legacy embedding-model override ──────────────────────────────────────
+    // ── Offline / air-gapped model-dir ───────────────────────────────────────
 
-    /// A legacy `--embedding-model` / `SPELUNK_EMBEDDING_MODEL` still parses
-    /// (hidden, not removed) so an old deployment doesn't hard-fail clap on
-    /// upgrade — but it never selects a model.
+    /// `--model-dir` parses as a path arg, for the air-gapped load path.
     #[test]
-    fn legacy_embedding_model_flag_still_parses() {
-        let args = Args::parse_from(["spelunk-server", "--embedding-model", "some-model"]);
-        assert_eq!(args.embedding_model.as_deref(), Some("some-model"));
-    }
-
-    /// A set (non-blank) legacy value yields a visible warning that names the
-    /// value and the fixed model, and tells the operator to remove it.
-    #[test]
-    fn legacy_embedding_model_value_warns() {
-        let msg = super::legacy_embedding_model_warning(Some("gemma-300m"))
-            .expect("a non-blank legacy value must warn");
-        assert!(msg.contains("gemma-300m"), "warning names the value: {msg}");
-        assert!(
-            msg.contains(super::NATIVE_MODEL_ID),
-            "warning names the fixed model: {msg}"
-        );
-        assert!(
-            msg.contains("SPELUNK_EMBEDDING_MODEL"),
-            "warning tells the operator which key to remove: {msg}"
+    fn model_dir_flag_parses() {
+        let args = Args::parse_from(["spelunk-server", "--model-dir", "/srv/spelunk/models"]);
+        assert_eq!(
+            args.model_dir.as_deref(),
+            Some(std::path::Path::new("/srv/spelunk/models"))
         );
     }
 
-    /// Unset or blank → no warning, so a clean upgrade stays quiet.
+    /// Unset by default: the online Hugging Face Hub path stays the default
+    /// (no regression for the common case).
     #[test]
-    fn legacy_embedding_model_unset_or_blank_is_silent() {
-        assert!(super::legacy_embedding_model_warning(None).is_none());
-        assert!(super::legacy_embedding_model_warning(Some("")).is_none());
-        assert!(super::legacy_embedding_model_warning(Some("   ")).is_none());
+    #[serial_test::serial(model_dir_env)]
+    fn model_dir_defaults_to_none() {
+        // Serialized against model_dir_env_var_is_honoured: both read/write
+        // the real process env var, and cargo test runs in threads within one
+        // process, so an unguarded reader can observe another test's
+        // temporarily-set value.
+        let prev = std::env::var("SPELUNK_MODEL_DIR").ok();
+        // SAFETY: guarded by #[serial] so no other test reads/writes this var
+        // concurrently.
+        unsafe { std::env::remove_var("SPELUNK_MODEL_DIR") };
+
+        let args = Args::parse_from(["spelunk-server"]);
+
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("SPELUNK_MODEL_DIR", v) };
+        }
+
+        assert_eq!(args.model_dir, None);
+    }
+
+    /// `SPELUNK_MODEL_DIR` is a first-class equal source, not just a flag:
+    /// the same convention as `SPELUNK_SERVER_TLS_CERT`/`SPELUNK_LLM_URL`, so
+    /// a systemd unit or container entrypoint can set it without a flag.
+    #[test]
+    #[serial_test::serial(model_dir_env)]
+    fn model_dir_env_var_is_honoured() {
+        let prev = std::env::var("SPELUNK_MODEL_DIR").ok();
+        // SAFETY: guarded by #[serial] so no other test reads/writes this var
+        // concurrently; restored before returning.
+        unsafe { std::env::set_var("SPELUNK_MODEL_DIR", "/srv/spelunk/models") };
+
+        let args = Args::parse_from(["spelunk-server"]);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("SPELUNK_MODEL_DIR", v) },
+            None => unsafe { std::env::remove_var("SPELUNK_MODEL_DIR") },
+        }
+
+        assert_eq!(
+            args.model_dir.as_deref(),
+            Some(std::path::Path::new("/srv/spelunk/models"))
+        );
+    }
+
+    // ── Removed external-embedding relocation options ────────────────────────
+    //
+    // The embedding model is pinned product-wide to the bundled native
+    // embedder: `--embedding-url` / `SPELUNK_EMBEDDING_URL` (relocate compute)
+    // and the legacy `--embedding-model` / `SPELUNK_EMBEDDING_MODEL` (select a
+    // model) must no longer exist as parseable flags at all.
+
+    /// `--embedding-url` is unknown to clap, not silently accepted.
+    #[test]
+    fn embedding_url_flag_is_unknown() {
+        let err = Args::try_parse_from(["spelunk-server", "--embedding-url", "http://x:1234"])
+            .expect_err("--embedding-url must no longer parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// `--embedding-model` is unknown to clap, not silently accepted.
+    #[test]
+    fn embedding_model_flag_is_unknown() {
+        let err = Args::try_parse_from(["spelunk-server", "--embedding-model", "some-model"])
+            .expect_err("--embedding-model must no longer parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// `--help` must not advertise either removed flag.
+    #[test]
+    fn help_omits_removed_embedding_flags() {
+        use clap::CommandFactory as _;
+        let help = Args::command().render_long_help().to_string();
+        assert!(
+            !help.contains("embedding-url"),
+            "help must not mention --embedding-url: {help}"
+        );
+        assert!(
+            !help.contains("embedding-model"),
+            "help must not mention --embedding-model: {help}"
+        );
+    }
+
+    /// `SPELUNK_EMBEDDING_URL` / `SPELUNK_EMBEDDING_MODEL` in the environment
+    /// are plain unread variables now (no `env = "..."` attribute maps them to
+    /// any field): parsing must succeed and must not be influenced by them.
+    #[test]
+    #[serial_test::serial]
+    fn embedding_env_vars_are_inert() {
+        // SAFETY: test-only, guarded by #[serial_test::serial] against
+        // concurrent env mutation from other tests.
+        unsafe {
+            std::env::set_var("SPELUNK_EMBEDDING_URL", "http://127.0.0.1:1234");
+            std::env::set_var("SPELUNK_EMBEDDING_MODEL", "some-model");
+        }
+        let args = Args::parse_from(["spelunk-server"]);
+        assert_eq!(args.host, "127.0.0.1", "parsing must succeed unaffected");
+        unsafe {
+            std::env::remove_var("SPELUNK_EMBEDDING_URL");
+            std::env::remove_var("SPELUNK_EMBEDDING_MODEL");
+        }
     }
 
     // ── Self-contained health probe ──────────────────────────────────────────
