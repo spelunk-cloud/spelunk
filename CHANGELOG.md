@@ -22,6 +22,13 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
   An `inventory` subcommand reports what a store holds without touching it.
 
+  Releases now carry `spelunk-export` as its own download for each of the four
+  supported targets (`spelunk-export-<tag>-<target>.tar.gz`, `.zip` on
+  Windows), separate from the `spelunk` archive and absent from the `.deb`. It
+  is a single self-contained file that links no system SQLite, so it can be
+  fetched on its own, verified against the sha256 digest GitHub records for the
+  asset, run against a store and deleted again, without installing anything.
+
 ## [0.9.7] — 2026-08-05
 
 ### Added

@@ -12,7 +12,10 @@
 # What this proves: the Linux x86_64 build links against the glibc floor,
 # the .deb's Depends line is floor-derived (so it can actually install on
 # debian:11 / ubuntu:20.04), and the installed package survives real
-# subcommands, not just `apt-get install`.
+# subcommands, not just `apt-get install`. It also packages the standalone
+# spelunk-export asset the same way release.yml does, asserts it links no
+# system SQLite and no libdbus, and runs it against a store the .deb smoke
+# test just wrote.
 #
 # What this does NOT prove: macOS or Windows builds, the arm64 Linux leg,
 # the actual GitHub Release, or the Homebrew/Scoop publish steps. Those are
@@ -125,9 +128,10 @@ build_in_floor_container() {
       cargo build --release --target '"${TARGET}"' --features '"${FEATURES}"'
       strip "target/'"${TARGET}"'/release/spelunk"
       strip "target/'"${TARGET}"'/release/spelunk-server"
+      strip "target/'"${TARGET}"'/release/spelunk-export"
     ' || die "container build failed (see docker output above)"
 
-  for bin in spelunk spelunk-server; do
+  for bin in spelunk spelunk-server spelunk-export; do
     [ -x "target/${TARGET}/release/${bin}" ] || die "expected binary target/${TARGET}/release/${bin} not found after build"
   done
 }
@@ -146,7 +150,7 @@ enforce_glibc_ceiling() {
       set -euo pipefail
       apt-get update -qq
       apt-get install -y -qq --no-install-recommends binutils >/dev/null
-      for bin in spelunk spelunk-server; do
+      for bin in spelunk spelunk-server spelunk-export; do
         path="target/'"${TARGET}"'/release/${bin}"
         raw="$(objdump -T "$path")"
         ceiling="$(printf "%s\n" "$raw" | grep -o "GLIBC_[0-9.]*" | sort -Vu | tail -1 || true)"
@@ -221,6 +225,41 @@ build_deb() {
   [ -f "${DEB_PATH}" ] || die "expected .deb not found at ${DEB_PATH} after dpkg-deb --build"
 }
 
+# --- stage 4b: package the export tool's own archive ---------------------
+#
+# Mirrors release.yml's "Package export tool archive (unix)" step. The tool is
+# published as a standalone per-platform asset, never inside the product
+# archive or the .deb, so this stage is the only thing that produces it and
+# the only thing that inspects what it links. The linkage assertion is the
+# point: rusqlite's `bundled` feature compiles SQLite into the binary, and a
+# build that lost that feature would still succeed here and still pass the
+# glibc ceiling, then fail on any machine without libsqlite3 installed.
+package_export_archive() {
+  log_stage "package export tool archive + check dynamic linkage"
+
+  EXPORT_ARCHIVE="${WORKDIR}/spelunk-export-${VERSION}-${TARGET}.tar.gz"
+  tar -czf "${EXPORT_ARCHIVE}" -C "target/${TARGET}/release" spelunk-export \
+    || die "could not create ${EXPORT_ARCHIVE}"
+  [ -f "${EXPORT_ARCHIVE}" ] || die "expected archive not found at ${EXPORT_ARCHIVE}"
+
+  docker run --rm --name "${CONTAINER_PREFIX}-ldd" \
+    --platform "${DOCKER_PLATFORM}" \
+    -v "${REPO_ROOT}:/repo:ro" -w /repo \
+    "${BUILD_IMAGE}" bash -euc '
+      set -euo pipefail
+      linkage="$(ldd "target/'"${TARGET}"'/release/spelunk-export")"
+      echo "$linkage"
+      if echo "$linkage" | grep -qi "sqlite"; then
+        echo "ERROR: spelunk-export links a system SQLite; rusqlite bundled is not in effect" >&2
+        exit 1
+      fi
+      if echo "$linkage" | grep -qi "dbus"; then
+        echo "ERROR: spelunk-export links libdbus; it must carry no keyring dependency" >&2
+        exit 1
+      fi
+    ' || die "dynamic linkage check failed for spelunk-export"
+}
+
 # --- stage 5: install + smoke-test on the floor (and current) images -----
 #
 # apt-get install succeeds on a .deb whose Depends omits a linked library;
@@ -229,12 +268,20 @@ build_deb() {
 # SPELUNK_SECRET_STORE=file keeps the smoke test from touching a keychain
 # inside the container. The scratch git repo lives in the container's own
 # filesystem, never in this checkout.
+#
+# The export tool's archive is unpacked into the same container and run
+# against the store that round trip just wrote. It is deliberately absent
+# from the .deb (it is a standalone download, not part of the install), so
+# mounting its archive alongside is the only way to exercise it here.
+# Reading a real store, rather than `--version`, is what proves the SQLite it
+# statically links works on an image carrying no libsqlite3 at all.
 smoke_test_deb() {
   for image in ${SMOKE_IMAGES}; do
-    log_stage "install + smoke-test .deb (${image})"
+    log_stage "install + smoke-test .deb and export tool (${image})"
     docker run --rm --name "${CONTAINER_PREFIX}-smoke" \
       --platform "${DOCKER_PLATFORM}" \
       -v "${REPO_ROOT}/${DEB_PATH}:/pkg/spelunk_${DEB_VERSION}_amd64.deb:ro" \
+      -v "${REPO_ROOT}/${EXPORT_ARCHIVE}:/pkg/spelunk-export.tar.gz:ro" \
       -e SPELUNK_SECRET_STORE=file \
       "${image}" bash -euc '
         set -euo pipefail
@@ -256,6 +303,13 @@ smoke_test_deb() {
         spelunk init --no-index
         spelunk memory add --kind note --title "deb smoke" --body "runs on this image"
         spelunk memory list | grep -q "deb smoke"
+
+        mkdir -p /t && tar -xzf /pkg/spelunk-export.tar.gz -C /t
+        store="$(find /w "$HOME" -name memory.db -print -quit 2>/dev/null || true)"
+        test -n "$store"
+        /t/spelunk-export inventory --store "$store"
+        /t/spelunk-export export --store "$store" --out /tmp/dump.jsonl
+        grep -q "deb smoke" /tmp/dump.jsonl
       ' || die "install/smoke-test failed on ${image}"
   done
 }
@@ -269,12 +323,14 @@ main() {
   enforce_glibc_ceiling
   assemble_deb
   build_deb
+  package_export_archive
   smoke_test_deb
 
   echo ""
   echo "=== release-dry-run: PASS ==="
   echo "Built and smoke-tested: ${DEB_PATH}"
-  echo "This proves the Linux x86_64 build, glibc-2.31 floor, and .deb install/smoke are release-safe."
+  echo "Built and smoke-tested: ${EXPORT_ARCHIVE}"
+  echo "This proves the Linux x86_64 build, glibc-2.31 floor, .deb install/smoke, and the standalone export asset are release-safe."
   echo "It does NOT exercise macOS/Windows builds, the GitHub Release, or the Homebrew/Scoop publish steps."
 }
 
