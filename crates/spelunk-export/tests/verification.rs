@@ -87,13 +87,13 @@ fn a_file_that_reads_back_truncated_is_refused_and_removed() {
     assert!(!out.with_extension("partial").exists());
 }
 
-// A whole-binary version of the two above: the store reads fine, the write
-// succeeds, and the bytes that land are still not the bytes that were written.
-// A sink swallows the write and reads back empty, which is what a full disk or
-// a misdirected path does to a dump.
-#[cfg(unix)]
+// The temporary's path is derived from the output's, so it can collide with a
+// file that was already there. Overwriting it and then unlinking it on failure
+// destroys a user's file, silently, in the one tool whose contract is that it
+// removes nothing. Creating the temporary exclusively turns the collision into
+// a refusal that names the path, and the file is still there afterwards.
 #[test]
-fn an_export_whose_bytes_do_not_land_publishes_nothing_and_leaves_nothing() {
+fn a_file_already_at_the_temporary_path_stops_the_run_and_survives_it() {
     let dir = tmp();
     let store = dir.path().join("memory.db");
     let out = dir.path().join("dump.jsonl");
@@ -102,15 +102,31 @@ fn an_export_whose_bytes_do_not_land_publishes_nothing_and_leaves_nothing() {
         add_entry(&conn, LATEST, "a", 1_000);
     }
     let temp = out.with_extension("partial");
-    std::os::unix::fs::symlink("/dev/null", &temp).unwrap();
+    std::fs::write(&temp, b"something the user put here").unwrap();
 
-    assert!(export(&store, &out, 1_700_000_000).is_err());
-    assert!(!out.exists(), "an unproved dump must not be published");
+    let err = format!("{:#}", export(&store, &out, 1_700_000_000).unwrap_err());
+
+    assert!(err.contains("already exists"), "got: {err}");
     assert!(
-        !temp.exists() && std::fs::symlink_metadata(&temp).is_err(),
-        "the unproved file must not be left behind"
+        err.contains("dump.partial"),
+        "the refusal must name it: {err}"
     );
+    assert_eq!(
+        std::fs::read(&temp).unwrap(),
+        b"something the user put here",
+        "the file was destroyed by an export that did not create it"
+    );
+    assert!(!out.exists(), "an unproved dump must not be published");
 }
+
+// There used to be a whole-binary version of the two above, which put a
+// symlink to /dev/null at the temporary's path so the write succeeded and the
+// readback came up empty. Exclusive creation refuses anything already sitting
+// there, symlink included, so that route is gone and with it the class of
+// failure it stood for: reaching a sink through this path now needs a file the
+// export declined to open. What the readback still guards against, bytes that
+// land differently from how they were written, is exercised directly on
+// `write_verified` above, where it can be provoked without a filesystem trick.
 
 #[test]
 fn a_clean_run_claims_only_what_it_proved() {

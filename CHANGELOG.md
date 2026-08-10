@@ -24,6 +24,12 @@ spelunk uses [Semantic Versioning](https://semver.org/).
   needs no SQLite installed on the host. An `inventory` subcommand reports what
   a store holds without touching it.
 
+  Nothing on disk is overwritten either. The dump is built in a temporary beside
+  the output and moved into place only once it has been read back and matched,
+  and that temporary is created exclusively: a file already sitting at its path
+  stops the run with a message naming it, rather than being overwritten and then
+  removed.
+
   Every table is read inside a single read transaction, so a dump is a
   consistent point-in-time view of the whole store. Reading each table
   separately would let a writer that commits an entry and then a link to it land

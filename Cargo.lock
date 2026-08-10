@@ -5296,6 +5296,7 @@ version = "0.9.7"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "rusqlite",
  "serde",
  "serde_json",

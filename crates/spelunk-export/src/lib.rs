@@ -86,10 +86,32 @@ pub fn export(store: &Path, out: &Path, generated_at: i64) -> Result<ExportOutco
 /// store is read inside one transaction, so a second read returns the same rows
 /// by construction. The comparison that can still fail, and therefore the only
 /// one worth making, is between the file and what was rendered.
+///
+/// The temporary is created exclusively, so anything already at that path stops
+/// the run instead of being overwritten and then unlinked on the way out. This
+/// is the one tool in the system whose contract is that it destroys nothing,
+/// and a file it did not create is a file it does not own, whatever its name.
 pub fn write_verified(text: &str, expected: &[String], out: &Path) -> Result<()> {
+    use std::io::Write as _;
+
     let temp = out.with_extension("partial");
-    std::fs::write(&temp, text.as_bytes())
-        .with_context(|| format!("writing {}", temp.display()))?;
+    let mut handle = std::fs::File::create_new(&temp).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "{} already exists; this run will not overwrite it. Move it aside, or \
+                 export to a different --out.",
+                temp.display()
+            )
+        } else {
+            anyhow::Error::new(e).context(format!("creating {}", temp.display()))
+        }
+    })?;
+    let put = handle.write_all(text.as_bytes());
+    drop(handle);
+    if let Err(e) = put {
+        let _ = std::fs::remove_file(&temp);
+        return Err(anyhow::Error::new(e).context(format!("writing {}", temp.display())));
+    }
 
     let checked = (|| -> Result<()> {
         let written = std::fs::read_to_string(&temp)

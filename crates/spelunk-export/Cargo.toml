@@ -29,3 +29,6 @@ sha2 = "0.11"
 # racing for it. It is not compiled into the binary.
 rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = { workspace = true }
+# The corpus of artifacts written by released binaries is stored gzipped,
+# because a captured database is mostly preallocated zeros.
+flate2 = "1"

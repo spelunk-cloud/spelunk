@@ -650,6 +650,94 @@ fn reading_a_write_ahead_log_store_adds_no_content_to_the_users_directory() {
     }
 }
 
+// Neither test above can fail if the store is opened for writing, and between
+// them they are why: the first checkpoints the log away before it measures, so
+// there is nothing left for a close-time checkpoint to flush, and the second
+// holds a second connection open for its whole length, which suppresses the
+// close-time checkpoint entirely. Both are right about what they test. Neither
+// reaches the state where opening for writing costs the user something.
+//
+// That state is a store whose owning process died with rows still committed to
+// the log: the log is hot and no connection is left. Closing the last
+// connection to a log-mode store checkpoints it, so a read-write open here
+// recovers the log and rewrites the database file, and deletes the log, purely
+// as a side effect of having read it. Read-only is what prevents that, and it
+// is one flag.
+#[test]
+fn a_store_left_hot_by_a_dead_process_is_not_checkpointed_by_reading_it() {
+    let dir = tmp();
+    let owned = dir.path().join("owned");
+    std::fs::create_dir(&owned).unwrap();
+    let conn = wal_memory_store_at(&owned.join("memory.db"), LATEST);
+    add_entry(&conn, LATEST, "committed to the log", 1_000);
+
+    // The schema was written before the switch to log mode, so the entry is the
+    // only thing in the log, and an export that ignored the log would come back
+    // with an empty store rather than a wrong one.
+    let owned_log = owned.join("memory.db-wal");
+    assert!(std::fs::metadata(&owned_log).unwrap().len() > 0);
+
+    // Copying the pair out from under a live connection reproduces what a dead
+    // process leaves, without killing one: the copies have a hot log and no
+    // owner, and dropping the connection below checkpoints the original rather
+    // than them.
+    let abandoned = dir.path().join("abandoned");
+    std::fs::create_dir(&abandoned).unwrap();
+    let store = abandoned.join("memory.db");
+    let log = abandoned.join("memory.db-wal");
+    std::fs::copy(owned.join("memory.db"), &store).unwrap();
+    std::fs::copy(&owned_log, &log).unwrap();
+    drop(conn);
+
+    let before_db = std::fs::read(&store).unwrap();
+    let before_log = std::fs::read(&log).unwrap();
+
+    // Run the binary, so the comparison below is made once every handle the
+    // export held has been closed by the operating system, not merely dropped.
+    let out = dir.path().join("dump.jsonl");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_spelunk-export"))
+        .arg("export")
+        .arg("--store")
+        .arg(&store)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "the export failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let titles: Vec<String> = entities(&records(&out), "memory_entry")
+        .iter()
+        .map(|e| e["title"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        titles,
+        ["committed to the log"],
+        "the entry lives only in the log, so anything else here means the log \
+         was not read at all"
+    );
+
+    // Compared with `assert!` rather than `assert_eq!`: these files are
+    // megabytes, and a failure here is about which file moved, not which byte.
+    assert!(
+        std::fs::read(&store).unwrap() == before_db,
+        "the database file was rewritten by reading it: the log was checkpointed \
+         into it on close"
+    );
+    assert!(
+        log.exists(),
+        "the log was deleted by reading it; the user's committed rows now exist \
+         only wherever the checkpoint put them"
+    );
+    assert!(
+        std::fs::read(&log).unwrap() == before_log,
+        "the log was rewritten by reading it"
+    );
+}
+
 // ── E26 to E31: refusal, emptiness, determinism ──────────────────────────────
 
 #[test]

@@ -7,7 +7,7 @@
 //! this format be written against the format alone, with no knowledge of the
 //! store that produced it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -292,6 +292,12 @@ pub struct ReadBack {
 /// A dump is refused whole or accepted whole. There is no partial read: the
 /// failure this guards against is silent partial loss, so anything less than a
 /// loud refusal defeats the purpose.
+///
+/// Unique references and resolvable endpoints are checked here rather than
+/// trusted to the writer that just ran. Both hold by construction today, which
+/// is exactly why the check belongs in the reader: a writer change that broke
+/// either would otherwise publish a dump whose relationships point at nothing,
+/// and the self-verification would call it proved.
 pub fn verify_rendered(text: &str) -> Result<ReadBack> {
     let mut lines = text.lines();
     let Some(header_line) = lines.next() else {
@@ -316,6 +322,8 @@ pub fn verify_rendered(text: &str) -> Result<ReadBack> {
     dig.push_line(header_line);
     let mut counts = Counts::default();
     let mut footer: Option<Footer> = None;
+    let mut refs: Vec<String> = Vec::new();
+    let mut endpoints: Vec<String> = Vec::new();
 
     for line in lines {
         if footer.is_some() {
@@ -332,6 +340,11 @@ pub fn verify_rendered(text: &str) -> Result<ReadBack> {
                     .get("type")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("entity record without a type"))?;
+                let reference = value
+                    .get("ref")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("entity record without a ref"))?;
+                refs.push(reference.to_string());
                 counts.add_entity(t);
                 dig.push_line(line);
             }
@@ -340,6 +353,13 @@ pub fn verify_rendered(text: &str) -> Result<ReadBack> {
                     .get("type")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("relationship record without a type"))?;
+                for end in ["from", "to"] {
+                    let r = value
+                        .get(end)
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("relationship record without a '{end}'"))?;
+                    endpoints.push(r.to_string());
+                }
                 counts.add_relationship(t);
                 dig.push_line(line);
             }
@@ -356,6 +376,22 @@ pub fn verify_rendered(text: &str) -> Result<ReadBack> {
     if footer.digest != dig.finish() {
         bail!("dump digest does not match its contents");
     }
+
+    // After the digest, deliberately. A dump that has lost a byte will often
+    // also have lost a reference, and reporting that as a broken link would
+    // send a reader looking at the writer instead of at the file.
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for r in &refs {
+        if !seen.insert(r) {
+            bail!("two entities share the reference '{r}'");
+        }
+    }
+    // Resolved over the whole file rather than as each link is read: the format
+    // places no ordering constraint between entities and relationships.
+    if let Some(dangling) = endpoints.iter().find(|r| !seen.contains(r.as_str())) {
+        bail!("a relationship names '{dangling}', which is not an entity in this dump");
+    }
+
     Ok(ReadBack {
         per_record: dig.per_record().to_vec(),
         counts,

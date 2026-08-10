@@ -149,16 +149,53 @@ fn an_unknown_record_kind_is_refused() {
     assert!(dump::verify_rendered(&text).is_err());
 }
 
+// The writer cannot currently produce either of the next two, which is the
+// reason to check them in the reader: the self-verification a run publishes on
+// is this function, so a writer change that broke a reference or an endpoint
+// would otherwise be certified rather than caught.
+
 #[test]
-fn references_are_unique_within_a_dump() {
+fn two_entities_sharing_a_reference_are_refused() {
+    let dump = Dump {
+        entries: vec![entry("e1", "first", 100), entry("e1", "second", 200)],
+        ..Dump::default()
+    };
+    let text = dump.render(1_700_000_000).unwrap().0;
+    let err = dump::verify_rendered(&text).unwrap_err().to_string();
+    assert!(err.contains("share the reference"), "got: {err}");
+}
+
+#[test]
+fn a_relationship_naming_an_absent_entity_is_refused() {
+    let dump = Dump {
+        entries: vec![entry("e1", "first", 100)],
+        relationships: vec![Relationship::new(
+            "supersedes",
+            "e2".into(),
+            "e1".into(),
+            None,
+        )],
+        ..Dump::default()
+    };
+    let text = dump.render(1_700_000_000).unwrap().0;
+    let err = dump::verify_rendered(&text).unwrap_err().to_string();
+    assert!(err.contains("not an entity in this dump"), "got: {err}");
+}
+
+#[test]
+fn a_relationship_may_precede_the_entity_it_names() {
     let text = rendered();
-    let refs: Vec<String> = text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| v.get("ref").and_then(|r| r.as_str()).map(str::to_string))
+    let lines: Vec<&str> = text.lines().collect();
+    let reordered: String = [lines[0], lines[3], lines[1], lines[2], lines[4]]
+        .iter()
+        .map(|l| format!("{l}\n"))
         .collect();
-    let unique: std::collections::BTreeSet<_> = refs.iter().collect();
-    assert_eq!(refs.len(), unique.len());
+    // The digest is order sensitive, so a reordered dump cannot verify either
+    // way. Failing on the digest rather than on the endpoint is the assertion:
+    // the format puts no ordering constraint between the two record kinds, so
+    // an endpoint check made while reading would reject a legal dump.
+    let err = dump::verify_rendered(&reordered).unwrap_err().to_string();
+    assert!(err.contains("digest"), "got: {err}");
 }
 
 #[test]
