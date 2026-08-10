@@ -108,7 +108,7 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
-      # The whole point of the container build: fail the release if either
+      # The whole point of the container build: fail the release if any
       # binary needs a glibc symbol newer than the 2.31 floor. Pinned forever,
       # not measured once: must keep failing even after toolchain bumps. A
       # missing, empty, or non-numeric ceiling is treated as a broken check,
@@ -119,7 +119,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for bin in spelunk spelunk-server; do
+          for bin in spelunk spelunk-server spelunk-export; do
             path="target/${{ matrix.target }}/release/${bin}"
             raw="$(objdump -T "$path")"
             ceiling="$(printf '%s\n' "$raw" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 || true)"
@@ -162,11 +162,50 @@ jobs:
           Compress-Archive -Path $binaries -DestinationPath $ARCHIVE
           "ARCHIVE=${ARCHIVE}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      # spelunk-export ships as its own archive rather than as a third member
+      # of the product archive above. It is fetched on its own, run against a
+      # store and deleted again; requiring a download of the whole product to
+      # obtain one read-only tool would defeat that. It depends on no other
+      # crate in this workspace and links no system SQLite (rusqlite
+      # `bundled`), so the asset is one binary with nothing to install
+      # alongside it.
+      - name: Package export tool archive (unix)
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          TARGET="${{ matrix.target }}"
+          EXPORT_ARCHIVE="spelunk-export-${VERSION}-${TARGET}.tar.gz"
+          tar -czf "${EXPORT_ARCHIVE}" \
+            -C "target/${TARGET}/release" \
+            spelunk-export
+          echo "EXPORT_ARCHIVE=${EXPORT_ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Package export tool archive (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $VERSION        = "${{ github.ref_name }}"
+          $TARGET         = "${{ matrix.target }}"
+          $EXPORT_ARCHIVE = "spelunk-export-${VERSION}-${TARGET}.zip"
+          Compress-Archive -Path "target\${TARGET}\release\spelunk-export.exe" -DestinationPath $EXPORT_ARCHIVE
+          "EXPORT_ARCHIVE=${EXPORT_ARCHIVE}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: spelunk-${{ github.ref_name }}-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
+
+      # A separate artifact name, not a second path on the step above, so the
+      # product artifact keeps holding exactly one file: the deb and
+      # tarball-smoke jobs download it by name and extract it whole.
+      - name: Upload export tool artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: spelunk-export-${{ github.ref_name }}-${{ matrix.target }}
+          path: ${{ env.EXPORT_ARCHIVE }}
 
   deb:
     name: Build Debian package (amd64)
@@ -300,6 +339,8 @@ jobs:
   # must also be executed on the support floor. libdbus-1-3 is a declared
   # runtime dependency of the CLI (the .deb pulls it in via shlibdeps; tarball
   # users need it present, as on any desktop/server with dbus installed).
+  # spelunk-export's own archive is smoke-tested in the same containers: it is
+  # published as a standalone download, so nothing else would ever run it.
   tarball-smoke:
     name: Run tarball binaries on the support floor (${{ matrix.target }})
     needs: build
@@ -320,14 +361,28 @@ jobs:
           name: spelunk-${{ github.ref_name }}-${{ matrix.target }}
           path: tarball
 
-      - name: Extract tarball
+      - name: Download export tool artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: spelunk-export-${{ github.ref_name }}-${{ matrix.target }}
+          path: tarball
+
+      - name: Extract tarballs
         run: |
-          tar -xzf tarball/spelunk-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
-            -C tarball
+          set -euo pipefail
+          for archive in spelunk spelunk-export; do
+            tar -xzf "tarball/${archive}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" \
+              -C tarball
+          done
 
       # Install-success proves nothing: apt is happy with a package whose
       # binary immediately fails to link or run. Exercise real subcommands
       # (a git-backed memory round trip included) on each floor/current image.
+      #
+      # spelunk-export is exercised against the store the round trip just
+      # wrote, not with `--version`: reading a real store is the only thing
+      # that proves the bundled SQLite it statically links actually works on
+      # the floor image, where no system libsqlite3 is installed at all.
       - name: Execute on floor and current images
         run: |
           set -euo pipefail
@@ -352,6 +407,12 @@ jobs:
               /t/spelunk init --no-index
               /t/spelunk memory add --kind note --title "tarball smoke" --body "runs on this image"
               /t/spelunk memory list | grep -q "tarball smoke"
+
+              store="$(find /w "$HOME" -name memory.db -print -quit 2>/dev/null || true)"
+              test -n "$store"
+              /t/spelunk-export inventory --store "$store"
+              /t/spelunk-export export --store "$store" --out /tmp/dump.jsonl
+              grep -q "tarball smoke" /tmp/dump.jsonl
             '
           done
 
@@ -371,6 +432,16 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # The `*.tar.gz` / `*.zip` globs cover the spelunk-export archives too:
+      # `merge-multiple` flattens every artifact into one directory.
+      #
+      # No checksum file is generated, here or anywhere else in this workflow.
+      # GitHub records a `digest` field shaped "sha256:<hex>" on every release
+      # asset at upload time, per asset, readable without downloading it
+      # (`gh release view <tag> --json assets --jq '.assets[].digest'`), and the
+      # Homebrew and Scoop jobs below already consume exactly that. A generated
+      # SHASUMS file would restate a platform guarantee in a form the platform
+      # does not verify.
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
