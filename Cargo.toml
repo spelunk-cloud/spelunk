@@ -3,6 +3,7 @@ members = [
     "crates/spelunk-core",
     "crates/spelunk-cli",
     "crates/spelunk-embed",
+    "crates/spelunk-export",
     "crates/spelunk-server",
 ]
 resolver = "2"

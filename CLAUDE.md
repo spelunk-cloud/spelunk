@@ -57,7 +57,7 @@ You search with spelunk, then reason over the results yourself.
 
 ## Workspace Structure
 
-This is a Cargo workspace with four crates:
+This is a Cargo workspace with five crates:
 
 ```
 Cargo.toml                    — workspace root; [workspace.dependencies] for shared versions
@@ -67,6 +67,8 @@ crates/
   spelunk-cli/                — `spelunk` binary; depends on spelunk-core
   spelunk-embed/              — library: native F2LLM-v2-330M embedder (candle); depends on spelunk-core
   spelunk-server/             — `spelunk-server` binary + lib; depends on spelunk-core + spelunk-embed
+  spelunk-export/             — `spelunk-export` binary: reads local stores and writes a portable
+                                dump; depends on no other crate in this workspace
 ```
 
 ## Module Map
