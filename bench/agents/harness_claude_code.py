@@ -17,7 +17,9 @@ Two endpoint modes for reaching DeepSeek from Claude Code:
       one caveat: the docs show ANTHROPIC_AUTH_TOKEN, not ANTHROPIC_API_KEY;
       using the wrong var name is a documented silent-failure mode elsewhere
       in this codebase's tooling, so both are exported defensively (see
-      _deepseek_anthropic_env below).
+      _deepseek_anthropic_env below). The subprocess also gets an isolated
+      CLAUDE_CONFIG_DIR so a host-machine login can't override the injected
+      token (same function).
 
   shim (fallback, --endpoint-kind shim)
       An Anthropic ->OpenAI proxy (e.g. LiteLLM) in front of the DeepSeek
@@ -93,7 +95,9 @@ def get_claude_version() -> str:
     return "unknown"
 
 
-def _deepseek_anthropic_env(api_key: str, model: str, base_url: str) -> dict:
+def _deepseek_anthropic_env(
+    api_key: str, model: str, base_url: str, claude_config_dir: Path
+) -> dict:
     """Env overrides that redirect Claude Code's Anthropic client at
     DeepSeek's Anthropic-compatible endpoint.
 
@@ -106,12 +110,21 @@ def _deepseek_anthropic_env(api_key: str, model: str, base_url: str) -> dict:
     picking the wrong one and falling through to the user's own Anthropic
     credentials would not be (it would misattribute a Claude-native run as
     a DeepSeek one).
+
+    Also points CLAUDE_CONFIG_DIR at an empty scratch directory. Without
+    this, a `claude` binary that is already logged in on the host sends its
+    stored OAuth credential instead of ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY
+    (reproduced directly: the ambient credential authenticates against
+    DeepSeek's endpoint as garbage and DeepSeek 401s), silently overriding
+    both env vars above. An empty config dir has no stored login to fall
+    back to, so the injected token is the only credential `claude` can find.
     """
     env = dict(os.environ)
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = api_key
     env["ANTHROPIC_API_KEY"] = api_key
     env["ANTHROPIC_MODEL"] = model
+    env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
     return env
 
 
@@ -313,7 +326,18 @@ def main() -> None:
         action="store_true",
         help="Request step-by-step thinking. Recorded in provenance (spec point 4).",
     )
-    parser.add_argument("--max-turns", type=int, default=20)
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=20,
+        help=(
+            "Recorded in provenance for cross-harness parity (see "
+            "harness_opencode.py). Not enforced here: `claude -p` has no "
+            "turn-cap flag in the installed CLI (checked `claude --help`); "
+            "--effort is the actual, enforced cost/quality knob for this "
+            "harness. Don't read max_turns as a ceiling for claude-code cells."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--save-patch",
@@ -332,6 +356,7 @@ def main() -> None:
     issue_text = read_issue_text(args.issue)
     claude_version = get_claude_version()
 
+    claude_config_dir = None
     if args.no_deepseek:
         env = dict(os.environ)
         endpoint_kind = "native"
@@ -350,7 +375,11 @@ def main() -> None:
             if args.endpoint_kind == "shim"
             else args.deepseek_base_url
         )
-        env = _deepseek_anthropic_env(api_key, args.model, base_url_used)
+        # Empty on purpose (see _deepseek_anthropic_env): a config dir with
+        # a stored login is exactly what lets `claude` ignore the token
+        # below and 401 against DeepSeek.
+        claude_config_dir = Path(tempfile.mkdtemp(prefix="spelunk-bench-claude-cfg-"))
+        env = _deepseek_anthropic_env(api_key, args.model, base_url_used, claude_config_dir)
         endpoint_kind = args.endpoint_kind
 
     scratch_dir = Path(tempfile.mkdtemp(prefix="spelunk-bench-mcp-"))
@@ -376,6 +405,8 @@ def main() -> None:
         telemetry = read_telemetry(telemetry_log)
     finally:
         shutil.rmtree(scratch_dir, ignore_errors=True)
+        if claude_config_dir is not None:
+            shutil.rmtree(claude_config_dir, ignore_errors=True)
 
     patch_path = extract_patch(repo_path, args.save_patch)
 
@@ -397,7 +428,7 @@ def main() -> None:
         ),
         "seed": args.seed,
         "run_seed": args.seed,
-        "max_turns": args.max_turns,
+        "max_turns": args.max_turns,  # recorded, not enforced, see --max-turns help
         "task_id": args.task_id,
         "patch_file": str(patch_path) if patch_path else None,
         # Populated later, once the corresponding infra lands (README §Provenance):
