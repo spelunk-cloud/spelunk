@@ -197,6 +197,8 @@ jobs:
         with:
           name: spelunk-${{ github.ref_name }}-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
+          # A silent miss here publishes a release with a platform absent.
+          if-no-files-found: error
 
       # A separate artifact name, not a second path on the step above, so the
       # product artifact keeps holding exactly one file: the deb and
@@ -206,6 +208,9 @@ jobs:
         with:
           name: spelunk-export-${{ github.ref_name }}-${{ matrix.target }}
           path: ${{ env.EXPORT_ARCHIVE }}
+          # No downstream job consumes the macOS or Windows export archive, so
+          # nothing else would notice its absence before the release is cut.
+          if-no-files-found: error
 
   deb:
     name: Build Debian package (amd64)
@@ -333,6 +338,7 @@ jobs:
         with:
           name: spelunk-${{ github.ref_name }}-amd64-deb
           path: spelunk_${{ env.DEB_VERSION }}_amd64.deb
+          if-no-files-found: error
 
   # The .deb is only one packaging of the Linux binaries; the raw tarballs
   # (served by install.sh and the Homebrew formula) ship the same files and
