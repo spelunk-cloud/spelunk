@@ -1,12 +1,12 @@
-//! Build a memory store at every shape the product has ever written, and prove
-//! the exporter reads all of them.
-//!
-//! The shapes here are the shipped schema statements, applied in the order
-//! the product applies them and stopped at a chosen step. They cover what the
-//! schema *is* at each version. What they cannot cover is what a real released
-//! binary put in the file: that needs artifacts captured by running those
-//! binaries, which is what the upgrade corpus exists for. These two are
-//! complements, not substitutes, and neither is sufficient alone.
+// Build a memory store at every shape the product has ever written, and prove
+// the exporter reads all of them.
+//
+// The shapes here are the shipped schema statements, applied in the order
+// the product applies them and stopped at a chosen step. They cover what the
+// schema *is* at each version. What they cannot cover is what a real released
+// binary put in the file: that needs artifacts captured by running those
+// binaries, which is what the upgrade corpus exists for. These two are
+// complements, not substitutes, and neither is sufficient alone.
 
 // One copy of this module is compiled into each test binary, and no single
 // binary needs every shape it can build.
@@ -16,13 +16,13 @@ use rusqlite::Connection;
 
 pub const LATEST: i32 = 10;
 
-/// Each step, verbatim from the corresponding shipped schema file.
-///
-/// The vector table is created as an ordinary table rather than the virtual
-/// table the product creates. The module backing it is linked into the product
-/// and not into a plain SQLite, and its contents are never read here anyway, so
-/// standing it in costs nothing and buys a second assertion: whatever shape it
-/// has, the export must ignore it.
+// Each step, verbatim from the corresponding shipped schema file.
+//
+// The vector table is created as an ordinary table rather than the virtual
+// table the product creates. The module backing it is linked into the product
+// and not into a plain SQLite, and its contents are never read here anyway, so
+// standing it in costs nothing and buys a second assertion: whatever shape it
+// has, the export must ignore it.
 fn step(conn: &Connection, version: i32) {
     let sql: &str = match version {
         1 => {
@@ -95,13 +95,13 @@ fn step(conn: &Connection, version: i32) {
     conn.execute_batch(sql).unwrap();
 }
 
-/// A memory store at `version`, with `user_version` stamped.
+// A memory store at `version`, with `user_version` stamped.
 pub fn memory_store_at(path: &std::path::Path, version: i32) -> Connection {
     stamped(path, version, true)
 }
 
-/// A memory store at `version` that never had its version stamped, which is
-/// every store written before the runner existed.
+// A memory store at `version` that never had its version stamped, which is
+// every store written before the runner existed.
 pub fn unstamped_memory_store_at(path: &std::path::Path, version: i32) -> Connection {
     stamped(path, version, false)
 }
@@ -131,7 +131,7 @@ fn stamped(path: &std::path::Path, version: i32, stamp: bool) -> Connection {
     conn
 }
 
-/// Insert one entry using only the columns that exist at `version`.
+// Insert one entry using only the columns that exist at `version`.
 pub fn add_entry(conn: &Connection, version: i32, title: &str, created_at: i64) -> i64 {
     conn.execute(
         "INSERT INTO notes (kind, title, body, tags, linked_files, created_at)

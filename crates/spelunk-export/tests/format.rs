@@ -1,8 +1,8 @@
-//! The dump format's own guarantees: a dump is whole or it is refused.
-//!
-//! Every case here is a way a dump could be wrong while still looking
-//! plausible. The point of the footer is that none of them can pass quietly,
-//! because the failure this format guards against is silent partial loss.
+// The dump format's own guarantees: a dump is whole or it is refused.
+//
+// Every case here is a way a dump could be wrong while still looking
+// plausible. The point of the footer is that none of them can pass quietly,
+// because the failure this format guards against is silent partial loss.
 
 use spelunk_export::dump::{self, Dump, MemoryEntry, Relationship};
 
