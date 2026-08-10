@@ -1,0 +1,34 @@
+[package]
+name = "spelunk-export"
+version = "0.9.7"
+edition = "2024"
+description = "spelunk: export local stores to a portable dump"
+license = "MIT"
+repository = "https://github.com/spelunk-cloud/spelunk"
+homepage = "https://github.com/spelunk-cloud/spelunk"
+
+[[bin]]
+name = "spelunk-export"
+path = "src/main.rs"
+
+# Deliberately depends on no other crate in this workspace. The point of a
+# standalone reader is that it opens stores with plain SQL and column probing
+# instead of the product's schema ladder, so it keeps working against every
+# shape ever written and carries none of the product's runtime.
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11"
+
+[dev-dependencies]
+# The authorizer callback is a test-only need: it is the only way to pin a
+# concurrent write to an exact point inside a multi-table read instead of
+# racing for it. It is not compiled into the binary.
+rusqlite = { workspace = true, features = ["hooks"] }
+tempfile = { workspace = true }
+# The corpus of artifacts written by released binaries is stored gzipped,
+# because a captured database is mostly preallocated zeros.
+flate2 = "1"

@@ -35,7 +35,26 @@
 # loopback can't be handed to a same-host proxy the way a bare-metal
 # process's can.
 
-# ── Stage 1: build ────────────────────────────────────────────────────────────
+# ── Stage 1: workspace skeleton ───────────────────────────────────────────────
+# Everything the dependency cache below needs to load the workspace, and nothing
+# else: every member's manifest, plus a placeholder source for the targets each
+# one declares. Reducing the real tree here, rather than naming each crate in a
+# COPY, is what keeps adding a workspace member from breaking this image. Docker
+# cannot copy `crates/*/Cargo.toml` while preserving the directory each came
+# from, so the tree is copied whole and pruned.
+FROM rust:1.97.1-slim AS skeleton
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+RUN find crates -mindepth 2 -maxdepth 2 ! -name Cargo.toml -exec rm -rf {} + && \
+    for c in crates/*/; do \
+        mkdir -p "$c/src" && \
+        : > "$c/src/lib.rs" && \
+        echo 'fn main(){}' > "$c/src/main.rs"; \
+    done
+
+# ── Stage 2: build ────────────────────────────────────────────────────────────
 FROM rust:1.97.1-slim AS builder
 
 WORKDIR /build
@@ -51,24 +70,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Cache dependency compilation separately from source changes. This is a
 # virtual Cargo workspace (no root package), so prime the cache from the
-# workspace manifests plus a placeholder source per member crate; the heavy
-# third-party deps (candle, etc.) then land in a layer that only busts when a
-# Cargo.toml / Cargo.lock changes. Every member manifest must be present and
-# its declared target source must exist, or cargo refuses to load the
-# workspace — even members the server bin doesn't depend on.
-COPY Cargo.toml Cargo.lock ./
-COPY crates/spelunk-core/Cargo.toml   crates/spelunk-core/Cargo.toml
-COPY crates/spelunk-cli/Cargo.toml    crates/spelunk-cli/Cargo.toml
-COPY crates/spelunk-embed/Cargo.toml  crates/spelunk-embed/Cargo.toml
-COPY crates/spelunk-server/Cargo.toml crates/spelunk-server/Cargo.toml
-RUN mkdir -p crates/spelunk-core/src crates/spelunk-cli/src \
-             crates/spelunk-embed/src crates/spelunk-server/src && \
-    : > crates/spelunk-core/src/lib.rs && \
-    : > crates/spelunk-embed/src/lib.rs && \
-    : > crates/spelunk-server/src/lib.rs && \
-    echo 'fn main(){}' > crates/spelunk-cli/src/main.rs && \
-    echo 'fn main(){}' > crates/spelunk-server/src/main.rs && \
-    cargo build --release --bin spelunk-server && \
+# skeleton above; the heavy third-party deps (candle, etc.) then land in a layer
+# that only busts when a manifest or Cargo.lock changes, because that is all the
+# skeleton contains. Every member manifest must be present and its declared
+# target source must exist, or cargo refuses to load the workspace, even members
+# the server bin doesn't depend on.
+COPY --from=skeleton /build /build
+RUN cargo build --release --bin spelunk-server && \
     rm -rf crates/*/src
 
 # Now copy the real source and build properly. BuildKit normalizes COPY mtimes
@@ -79,7 +87,7 @@ COPY . .
 RUN find crates -name '*.rs' -exec touch {} + && \
     cargo build --release --bin spelunk-server
 
-# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+# ── Stage 3: runtime ──────────────────────────────────────────────────────────
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
