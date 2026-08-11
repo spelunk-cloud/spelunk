@@ -7,6 +7,7 @@
 //! the binary directly, `--llm-key-file`).
 
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Trim `raw` and treat a blank result as "no key", so a set-but-empty
 /// `SPELUNK_LLM_KEY` reads as unauthenticated rather than as an empty-string
@@ -69,12 +70,88 @@ pub fn check_llm_transport(llm_url: &str, has_key: bool) -> Result<()> {
 /// explore) want the JSON answer, not the model's thinking, and an unbounded
 /// reasoning pass burns the whole `max_tokens` budget before any `content`
 /// arrives. `None` omits the field for endpoints that reject it.
+///
+/// `structured_mode` caches how this endpoint accepts a requested JSON schema.
+/// The first schema-bearing request tries strict `response_format.json_schema`;
+/// an endpoint that rejects it (DeepSeek answers HTTP 400 "This response_format
+/// type is unavailable now") is retried at the next-weaker mode, and the first
+/// mode that succeeds is remembered so later requests skip the doomed attempt.
+/// See [`StructuredMode`].
 pub struct ServerLlm {
     pub client: reqwest::Client,
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub structured_mode: AtomicU8,
+}
+
+/// How the endpoint is asked to constrain output to a requested JSON schema,
+/// strongest first. Weaker modes are the fallback for endpoints that reject a
+/// stronger one; every mode still gets the schema described in the prompt and
+/// is parsed by the same defensive JSON parser downstream.
+///
+/// * `JsonSchema`: OpenAI strict structured output, `response_format` =
+///   `{"type":"json_schema","json_schema":{…}}`. The exact shape is enforced
+///   server-side.
+/// * `JsonObject`: `response_format` = `{"type":"json_object"}`. The endpoint
+///   only guarantees valid JSON, not the schema; DeepSeek and older OpenAI-
+///   compatible servers accept this where they reject `json_schema`. Relies on
+///   the prompt (which names the schema and contains the word "json") for shape.
+/// * `Prompt`: no `response_format` at all. The last resort for endpoints that
+///   reject every `response_format`; JSON is requested by the prompt alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StructuredMode {
+    JsonSchema,
+    JsonObject,
+    Prompt,
+}
+
+impl StructuredMode {
+    /// Strongest first, so a cached ordinal is monotonic: a downgrade only ever
+    /// moves toward `Prompt`, never back.
+    const ORDERED: [StructuredMode; 3] = [
+        StructuredMode::JsonSchema,
+        StructuredMode::JsonObject,
+        StructuredMode::Prompt,
+    ];
+
+    fn from_ordinal(v: u8) -> StructuredMode {
+        Self::ORDERED
+            .get(usize::from(v))
+            .copied()
+            .unwrap_or(StructuredMode::Prompt)
+    }
+
+    fn ordinal(self) -> u8 {
+        match self {
+            StructuredMode::JsonSchema => 0,
+            StructuredMode::JsonObject => 1,
+            StructuredMode::Prompt => 2,
+        }
+    }
+
+    /// The `response_format` value for this mode given the requested schema, or
+    /// `None` when the field must be omitted.
+    fn response_format(self, schema: &serde_json::Value) -> Option<serde_json::Value> {
+        match self {
+            StructuredMode::JsonSchema => {
+                Some(serde_json::json!({ "type": "json_schema", "json_schema": schema }))
+            }
+            StructuredMode::JsonObject => Some(serde_json::json!({ "type": "json_object" })),
+            StructuredMode::Prompt => None,
+        }
+    }
+}
+
+/// Upstream statuses worth retrying the same request unchanged: rate limiting
+/// and transient server-side failures. Deliberately excludes 400/422, which
+/// mean the request itself is unacceptable and are handled by stepping down the
+/// structured-output mode instead. Harvest fires many batches back to back at a
+/// shared endpoint, so the occasional 429/503 that a brief backoff clears must
+/// not fail the batch outright.
+fn is_transient_status(code: u16) -> bool {
+    code == 408 || code == 425 || code == 429 || (500..=599).contains(&code)
 }
 
 #[async_trait::async_trait]
@@ -91,7 +168,7 @@ impl spelunk_core::llm::LlmBackend for ServerLlm {
         #[derive(serde::Serialize)]
         struct ChatReq<'a> {
             model: &'a str,
-            messages: Vec<ChatMsg<'a>>,
+            messages: &'a [ChatMsg<'a>],
             stream: bool,
             max_tokens: usize,
             temperature: f32,
@@ -132,34 +209,120 @@ impl spelunk_core::llm::LlmBackend for ServerLlm {
             })
             .collect();
 
-        let response_format =
-            json_schema.map(|s| serde_json::json!({ "type": "json_schema", "json_schema": s }));
-
-        let req = ChatReq {
-            model: &self.model,
-            messages: chat_messages,
-            stream: true,
-            max_tokens,
-            temperature: 0.7,
-            reasoning_effort: self.reasoning_effort.as_deref(),
-            response_format,
+        // A schema-bearing request tries the cached structured-output mode first
+        // and, on an HTTP 400/422 that rejects `response_format`, steps down to
+        // the next-weaker mode (json_schema -> json_object -> prompt-only),
+        // caching the first mode this endpoint accepts so later requests skip the
+        // rejected attempt. Without a schema there is nothing to constrain: one
+        // unconstrained request is made and any error is surfaced as-is.
+        let attempts: Vec<(Option<StructuredMode>, Option<serde_json::Value>)> = match &json_schema
+        {
+            Some(schema) => {
+                let start =
+                    StructuredMode::from_ordinal(self.structured_mode.load(Ordering::Relaxed));
+                StructuredMode::ORDERED
+                    .into_iter()
+                    .skip(usize::from(start.ordinal()))
+                    .map(|m| (Some(m), m.response_format(schema)))
+                    .collect()
+            }
+            None => vec![(None, None)],
         };
 
-        let mut builder = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.base_url));
-        if let Some(key) = &self.api_key {
-            builder = builder.bearer_auth(key);
+        let endpoint = format!("{}/v1/chat/completions", self.base_url);
+        let last = attempts.len() - 1;
+        // A transient upstream failure (429, 5xx, a dropped connection) is
+        // retried in place with capped exponential backoff before the batch is
+        // failed: harvest issues many batches at a shared endpoint and the
+        // occasional 429/503 clears on a brief retry. This is a separate axis
+        // from the structured-output downgrade below, which is for an endpoint
+        // that refuses the request's shape rather than one momentarily unable to
+        // serve it.
+        const MAX_TRANSIENT_RETRIES: u32 = 3;
+        let mut response = None;
+        'modes: for (i, (mode, response_format)) in attempts.into_iter().enumerate() {
+            let mut backoff = std::time::Duration::from_millis(300);
+            for attempt in 0..=MAX_TRANSIENT_RETRIES {
+                let has_retries_left = attempt < MAX_TRANSIENT_RETRIES;
+                let req = ChatReq {
+                    model: &self.model,
+                    messages: &chat_messages,
+                    stream: true,
+                    max_tokens,
+                    temperature: 0.7,
+                    reasoning_effort: self.reasoning_effort.as_deref(),
+                    response_format: response_format.clone(),
+                };
+
+                let mut builder = self.client.post(endpoint.as_str());
+                if let Some(key) = &self.api_key {
+                    builder = builder.bearer_auth(key);
+                }
+
+                let resp = match builder.json(&req).send().await {
+                    Ok(resp) => resp,
+                    Err(e) if has_retries_left => {
+                        tracing::warn!(error = %e, "LLM request send failed; retrying in {backoff:?}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(8));
+                        continue;
+                    }
+                    Err(e) => return Err(e).context("calling LLM server"),
+                };
+
+                let status = resp.status();
+                if status.is_success() {
+                    if let Some(mode) = mode {
+                        self.structured_mode
+                            .store(mode.ordinal(), Ordering::Relaxed);
+                    }
+                    response = Some(resp);
+                    break 'modes;
+                }
+
+                let code = status.as_u16();
+
+                if is_transient_status(code) && has_retries_left {
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        status = code,
+                        "LLM upstream transient error; retrying in {backoff:?}: {}",
+                        body.trim()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(8));
+                    continue;
+                }
+
+                // A 400/422 that is not the last mode is the endpoint refusing
+                // this `response_format`; step down. If it is wrong for another
+                // reason, the final prompt-only attempt carries no
+                // `response_format` and surfaces that true error instead.
+                if i < last && (code == 400 || code == 422) {
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        status = code,
+                        "LLM rejected the structured-output request; retrying at a weaker mode: {}",
+                        body.trim()
+                    );
+                    continue 'modes;
+                }
+
+                // Include the upstream status and body: "LLM server returned an
+                // error" alone is undiagnosable, and this path is exactly where a
+                // still-unexplained failure surfaces.
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "LLM server returned an error (HTTP {code}): {}",
+                    body.trim()
+                ));
+            }
         }
 
-        let mut stream = builder
-            .json(&req)
-            .send()
-            .await
-            .context("calling LLM server")?
-            .error_for_status()
-            .context("LLM server returned an error")?
-            .bytes_stream();
+        let mut stream = match response {
+            Some(resp) => resp.bytes_stream(),
+            None => anyhow::bail!("LLM request exhausted all attempts without a response"),
+        };
 
         let mut buffer = String::new();
         let mut saw_content = false;
@@ -378,6 +541,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key,
             reasoning_effort: Some("none".to_string()),
+            structured_mode: AtomicU8::new(0),
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         llm.generate(
@@ -441,6 +605,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: None,
             reasoning_effort,
+            structured_mode: AtomicU8::new(0),
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
         let collector = tokio::spawn(async move {
@@ -514,6 +679,251 @@ mod tests {
         assert_eq!(
             out, "{\"ok\":true}",
             "only content deltas may be forwarded; reasoning_content must be dropped"
+        );
+    }
+
+    // ── structured-output fallback ───────────────────────────────────────────
+
+    const CONTENT_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\":true}\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    // A single MockServer response can't vary on the request, so drive it from
+    // the request body: reject whatever `response_format` `reject` matches (as
+    // DeepSeek does with `json_schema`), otherwise stream real content.
+    struct RejectResponseFormat {
+        reject: &'static str,
+    }
+
+    impl wiremock::Respond for RejectResponseFormat {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body = String::from_utf8_lossy(&request.body);
+            if body.contains(self.reject) {
+                wiremock::ResponseTemplate::new(400).set_body_string(
+                    "{\"error\":{\"message\":\"This response_format type is unavailable now\",\
+                     \"code\":\"invalid_request_error\"}}",
+                )
+            } else {
+                wiremock::ResponseTemplate::new(200).set_body_raw(CONTENT_SSE, "text/event-stream")
+            }
+        }
+    }
+
+    async fn mount_rejecting(server: &wiremock::MockServer, reject: &'static str) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(RejectResponseFormat { reject })
+            .mount(server)
+            .await;
+    }
+
+    fn test_llm(base_url: String) -> ServerLlm {
+        ServerLlm {
+            client: reqwest::Client::new(),
+            base_url,
+            model: "test-model".to_string(),
+            api_key: None,
+            reasoning_effort: Some("none".to_string()),
+            structured_mode: AtomicU8::new(0),
+        }
+    }
+
+    fn test_schema() -> serde_json::Value {
+        serde_json::json!({ "name": "t", "strict": true, "schema": { "type": "object" } })
+    }
+
+    async fn drain(llm: &ServerLlm, schema: Option<serde_json::Value>) -> anyhow::Result<String> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let collector = tokio::spawn(async move {
+            let mut out = String::new();
+            while let Some(t) = rx.recv().await {
+                out.push_str(&t);
+            }
+            out
+        });
+        llm.generate(
+            &[spelunk_core::llm::Message {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            64,
+            tx,
+            schema,
+        )
+        .await?;
+        Ok(collector.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_json_schema_rejection_falls_back_to_json_object_and_streams_content() {
+        let server = wiremock::MockServer::start().await;
+        mount_rejecting(&server, "json_schema").await;
+
+        let llm = test_llm(server.uri());
+        let out = drain(&llm, Some(test_schema())).await.unwrap();
+
+        assert_eq!(
+            out, "{\"ok\":true}",
+            "the fallback attempt's content must reach the caller"
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "json_schema is rejected, then json_object is accepted"
+        );
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(first["response_format"]["type"], "json_schema");
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(second["response_format"]["type"], "json_object");
+    }
+
+    #[tokio::test]
+    async fn the_accepted_mode_is_cached_so_later_requests_skip_the_rejected_one() {
+        let server = wiremock::MockServer::start().await;
+        mount_rejecting(&server, "json_schema").await;
+
+        let llm = test_llm(server.uri());
+        drain(&llm, Some(test_schema())).await.unwrap();
+        drain(&llm, Some(test_schema())).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "first call probes then downgrades (2 requests); the second call starts at the cached mode (1 request)"
+        );
+        let third = String::from_utf8_lossy(&requests[2].body);
+        assert!(
+            !third.contains("json_schema"),
+            "a cached downgrade must not re-send the rejected json_schema mode: {third}"
+        );
+    }
+
+    // An endpoint that rejects every `response_format` must still complete via
+    // the prompt-only mode, which sends no `response_format` at all.
+    #[tokio::test]
+    async fn a_full_downgrade_ends_at_a_prompt_only_request_with_no_response_format() {
+        let server = wiremock::MockServer::start().await;
+        mount_rejecting(&server, "response_format").await;
+
+        let llm = test_llm(server.uri());
+        let out = drain(&llm, Some(test_schema())).await.unwrap();
+
+        assert_eq!(out, "{\"ok\":true}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "json_schema and json_object are both rejected before the prompt-only attempt"
+        );
+        let last: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+        assert!(
+            last.get("response_format").is_none(),
+            "the terminal attempt must omit response_format entirely"
+        );
+    }
+
+    // Without a schema there is no `response_format` to step down from, so a 400
+    // is a real error: it must surface after exactly one request, not trigger
+    // pointless identical retries.
+    #[tokio::test]
+    async fn a_schemaless_request_is_sent_once_and_its_error_is_surfaced() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&server)
+            .await;
+
+        let llm = test_llm(server.uri());
+        let err = drain(&llm, None).await.unwrap_err();
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("LLM server returned an error")
+                && rendered.contains("400")
+                && rendered.contains("bad request"),
+            "the surfaced error must carry the upstream status and body: {rendered}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a non-transient 400 with no schema is not retried"
+        );
+    }
+
+    // Returns `fail_status` for the first `fail_times` calls, then a 200 stream:
+    // a rate-limited or briefly-overloaded endpoint that recovers.
+    struct FlakyThenOk {
+        fail_times: usize,
+        fail_status: u16,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl wiremock::Respond for FlakyThenOk {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let n = self.seen.fetch_add(1, Ordering::Relaxed);
+            if n < self.fail_times {
+                wiremock::ResponseTemplate::new(self.fail_status).set_body_string("upstream busy")
+            } else {
+                wiremock::ResponseTemplate::new(200).set_body_raw(CONTENT_SSE, "text/event-stream")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_upstream_error_is_retried_then_succeeds() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(FlakyThenOk {
+                fail_times: 2,
+                fail_status: 503,
+                seen: std::sync::atomic::AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        let llm = test_llm(server.uri());
+        let out = drain(&llm, None).await.unwrap();
+
+        assert_eq!(
+            out, "{\"ok\":true}",
+            "content from the recovered attempt must reach the caller"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "two 503s are retried, the third attempt succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_transient_errors_are_surfaced_with_status_after_retries() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(429).set_body_string("rate limited"))
+            .mount(&server)
+            .await;
+
+        let llm = test_llm(server.uri());
+        let err = drain(&llm, None).await.unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("429"),
+            "an exhausted transient retry must surface the upstream status: {err:#}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "one initial attempt plus MAX_TRANSIENT_RETRIES (3) before giving up"
         );
     }
 }
