@@ -9,6 +9,18 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.9] — 2026-08-11
+
+### Fixed
+
+- **Binaries report their own version again.** The `v0.9.8` tag was created
+  before the version bump reached `main`, so every binary in that release
+  reports `0.9.7`. Nothing else about it is wrong — the code is the code at
+  that commit — but a tool that misreports its version is a poor thing to hand
+  someone mid-migration, and the dump format records the producing tool and
+  version in every file it writes. This release carries the same contents with
+  the version corrected. Prefer it over `v0.9.8`.
+
 ## [0.9.8] — 2026-08-11
 
 ### Added
