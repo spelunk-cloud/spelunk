@@ -2,3 +2,5 @@
 !.gitignore
 !examples/
 !examples/**
+!flash-harness-matrix/
+!flash-harness-matrix/**
