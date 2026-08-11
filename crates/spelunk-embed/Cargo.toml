@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-embed"
-version = "0.9.8"
+version = "0.9.9"
 edition = "2024"
 description = "Native F2LLM-v2-330M embedder (candle) for spelunk"
 license = "MIT"
