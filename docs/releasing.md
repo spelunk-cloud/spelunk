@@ -95,15 +95,23 @@ script has no code path that can create a GitHub release, push to the
 Run it before tagging; a failure here is cheaper to fix than one discovered
 after a tag is already pushed.
 
-### 1. Bump the version in `Cargo.toml`
+### 1. Bump the version in every crate manifest
 
-Edit the `version` field in `Cargo.toml`:
+The root `Cargo.toml` is a virtual workspace manifest — it has no `version`
+field, and no `[workspace.package]` section to inherit one from. The version
+lives in each member crate:
 
-```toml
-[package]
-name = "spelunk"
-version = "0.8.0"   # <-- update this
+```bash
+crates/spelunk-cli/Cargo.toml
+crates/spelunk-core/Cargo.toml
+crates/spelunk-embed/Cargo.toml
+crates/spelunk-export/Cargo.toml
+crates/spelunk-server/Cargo.toml
 ```
+
+Edit the `version` field in all five, then regenerate `Cargo.lock` with a cargo
+command rather than by hand. Editing the root manifest bumps nothing and the
+tag would ship binaries reporting the previous version.
 
 ### 1a. Check for hardcoded version references in docs
 
