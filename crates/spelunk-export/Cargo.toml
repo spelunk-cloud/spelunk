@@ -1,6 +1,6 @@
 [package]
 name = "spelunk-export"
-version = "0.9.7"
+version = "0.9.8"
 edition = "2024"
 description = "spelunk: export local stores to a portable dump"
 license = "MIT"

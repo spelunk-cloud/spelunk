@@ -9,6 +9,8 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.8] — 2026-08-11
+
 ### Added
 
 - **`spelunk-export`, a standalone tool that writes a portable dump of a local
