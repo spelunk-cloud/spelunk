@@ -1,5 +1,23 @@
 # spelunk
 
+> ## spelunk is now inkentry
+>
+> **`0.9.9` is the last spelunk release.** Development continues as
+> **[inkentry](https://github.com/inkentries/inkentry)** — the same project under a new name:
+> same people, same MIT licence, same memory format.
+>
+> ```bash
+> curl -fsSL https://get.inkentry.com/migrate.sh | sh
+> ```
+>
+> That installs inkentry, carries every spelunk memory store across, verifies each one, and only
+> then retires spelunk. It opens each existing `.spelunk` store read-only and never deletes one;
+> if a store fails to migrate or you decline it, spelunk is left installed. Add `--dry-run` to see
+> what it would do first.
+>
+> This repository, its releases and its history stay where they are, and an existing install keeps
+> working. It simply stops receiving updates. Everything below describes spelunk as it shipped.
+
 [![CI](https://github.com/spelunk-cloud/spelunk/actions/workflows/ci.yml/badge.svg)](https://github.com/spelunk-cloud/spelunk/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust edition 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
