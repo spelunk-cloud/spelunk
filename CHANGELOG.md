@@ -7,6 +7,32 @@ spelunk uses [Semantic Versioning](https://semver.org/).
 
 ---
 
+## spelunk is now inkentry
+
+**`0.9.9` is the last spelunk release.** Development continues as
+[inkentry](https://github.com/inkentries/inkentry), which is the same project
+under a new name: same people, same licence, same memory format.
+
+Nothing here is going away. This repository, its releases and its history stay
+where they are, and an existing install keeps working — it simply stops
+receiving updates.
+
+**To move across:**
+
+```bash
+curl -fsSL https://get.inkentry.com/migrate.sh | sh
+```
+
+That installs inkentry, carries every spelunk memory store over, verifies each
+one, and only then retires spelunk. It opens each existing `.spelunk` store
+read-only and never deletes one; if a store fails to migrate or you decline it,
+spelunk is left installed. Pass `--dry-run` to see what it would do first.
+
+Changes after this point are recorded in
+[inkentry's changelog](https://github.com/inkentries/inkentry/blob/main/CHANGELOG.md).
+
+---
+
 ## [Unreleased]
 
 ## [0.9.9] — 2026-08-11
