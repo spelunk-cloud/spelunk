@@ -42,7 +42,7 @@
 # COPY, is what keeps adding a workspace member from breaking this image. Docker
 # cannot copy `crates/*/Cargo.toml` while preserving the directory each came
 # from, so the tree is copied whole and pruned.
-FROM rust:1.97.1-slim AS skeleton
+FROM rust:1.98.0-slim AS skeleton
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -55,7 +55,7 @@ RUN find crates -mindepth 2 -maxdepth 2 ! -name Cargo.toml -exec rm -rf {} + && 
     done
 
 # ── Stage 2: build ────────────────────────────────────────────────────────────
-FROM rust:1.97.1-slim AS builder
+FROM rust:1.98.0-slim AS builder
 
 WORKDIR /build
 
