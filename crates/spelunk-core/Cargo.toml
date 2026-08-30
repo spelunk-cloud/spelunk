@@ -37,7 +37,7 @@ dirs = { workspace = true }
 # adds it), so registry paths match the plain paths the lookup side derives via gix.
 dunce = "1"
 
-gix = { version = "0.86.0", default-features = false, features = [
+gix = { version = "0.87.1", default-features = false, features = [
     "sha1",
     "status",
 ] }

@@ -51,7 +51,7 @@ percent-encoding = "2.3"
 blake3 = "1"
 regex = { version = "1", default-features = false, features = ["std"] }
 dirs = { workspace = true }
-gix = { version = "0.86.0", default-features = false, features = [
+gix = { version = "0.87.1", default-features = false, features = [
     "sha1",
     "status",
 ] }
